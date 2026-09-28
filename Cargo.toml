@@ -1,0 +1,37 @@
+[package]
+name = "agent-mail"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Durable, low-noise messaging for agents in Herdr"
+repository = "https://github.com/youssef-tharwat/agent-mail"
+authors = ["Youssef Tharwat"]
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "6"
+fs2 = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal", "process", "sync"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[build-dependencies]
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", features = ["rt"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+
+[profile.release]
+lto = "thin"
+strip = true

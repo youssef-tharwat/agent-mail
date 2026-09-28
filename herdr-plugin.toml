@@ -1,0 +1,33 @@
+id = "youssef-tharwat.agent-mail"
+name = "Agent Mail"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "Local durable mail and a compact work register for coding agents"
+platforms = ["macos", "linux"]
+
+[[build]]
+command = ["cargo", "install", "--path", ".", "--locked"]
+
+[[startup]]
+platforms = ["macos"]
+command = ["./target/release/agent-mail", "restore"]
+
+[[actions]]
+id = "setup"
+title = "Set up Mail"
+contexts = ["workspace"]
+platforms = ["macos"]
+command = ["./target/release/agent-mail", "setup", "--install-service"]
+
+[[actions]]
+id = "setup-linux"
+title = "Set up Mail state"
+contexts = ["workspace"]
+platforms = ["linux"]
+command = ["./target/release/agent-mail", "setup"]
+
+[[actions]]
+id = "status"
+title = "Mail status"
+contexts = ["workspace"]
+command = ["./target/release/agent-mail", "status"]
