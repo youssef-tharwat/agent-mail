@@ -1,6 +1,7 @@
 ---
 name: agent-mail
-description: Use Agent Mail to recover assigned work, exchange durable messages, and maintain linked work records from a bound Herdr agent pane when a task uses Agent Mail.
+description: >-
+  Use Agent Mail for durable handoffs in a configured Herdr group: resume assigned work after a context reset, handle pending requests and replies, and maintain linked work records. Apply when the task describes these needs even without naming Agent Mail.
 ---
 
 # Agent Mail
