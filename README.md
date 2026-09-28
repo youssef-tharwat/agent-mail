@@ -13,21 +13,20 @@ remaining release checks.
 
 ## Agent skill
 
-The optional [Agent Mail skill](skills/agent-mail/SKILL.md) tells agents how to
+The optional [Agent Mail skill](skills/agent-mail/SKILL.md) teaches agents to
 recover work and handle deliveries without loading whole conversations into
-context. Herdr plugin linking does not install agent skills. For Codex, from a
-stable checkout of this repository:
+context. Herdr plugin installation does not install agent skills. Install it
+separately with a skill manager:
+
+```sh
+npx skills add youssef-tharwat/agent-mail --skill agent-mail -g
+```
+
+For local development, link the skill from a stable checkout:
 
 ```sh
 mkdir -p ~/.codex/skills
 ln -s "$(pwd)/skills/agent-mail" ~/.codex/skills/agent-mail
-```
-
-Once this repository is published as `youssef-tharwat/agent-mail`, a skill
-manager can install just the skill:
-
-```sh
-npx skills add youssef-tharwat/agent-mail --skill agent-mail -g
 ```
 
 Then ask a bound agent to use `$agent-mail`, or let Codex select it for an
@@ -49,7 +48,7 @@ agents. Run `herdr pane list`, then bind each intended native agent session with
 `agent-mail bind --name NAME --target PANE_ID`. The agent skill is installed
 separately as described above.
 
-## Build and use on one machine
+## Build and link locally
 
 Requires Rust 1.85+ and Herdr 0.9.1+. On each host:
 
