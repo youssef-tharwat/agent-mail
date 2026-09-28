@@ -6,9 +6,9 @@ next action, pending mail, and sync backlog. Message bodies and full work
 records are fetched by ID. It is a general Herdr plugin; Fleet Campaign is one
 possible workflow using it.
 
-![Illustrated Agent Mail flow: send a linked request, recover work and pending mail, reply and resolve, then resume after a context reset](assets/agent-mail-demo.gif)
+![Agent Mail: send a request, recover after a context reset, then reply and resolve](assets/agent-mail-demo.gif)
 
-*Illustrative local flow with example agent names, IDs, and work records.*
+*Illustrated flow: send, recover, resolve.*
 
 This is an early public build. The local flow is tested; a real two-machine
 SSH smoke test remains open. The [architecture](ARCHITECTURE.md) defines ownership
