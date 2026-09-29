@@ -1,90 +1,111 @@
 # Agent Mail
 
-**Durable tasks and messages for coding agents, on your machine.**
+**Local, durable coordination for coding agents.**
 
-Keep assignments, next actions, evidence and unanswered requests across context
-resets and restarts. Agent Mail stores coordination state in local SQLite and
-supplies current context through Claude Code, Codex or Herdr integrations.
+Keep tasks, ownership, next actions, evidence and unanswered requests across
+context resets and restarts. Agent Mail stores them in SQLite and restores the
+relevant context when an agent resumes.
 
-One native CLI. No account or hosted service. Herdr and Fleet Campaign are optional.
+One native CLI. No account or hosted service. Works with Claude Code and Codex;
+Herdr and Fleet Campaign are optional.
 
-![Agent Mail: assign a task, recover after a reset, send a result, and accept it.](assets/agent-mail-demo.gif)
+![Assign a task, recover after a reset, send a result, and accept it.](assets/agent-mail-demo.gif)
 
 ## Install
-
-Install the CLI (the required agent skill is bundled):
 
 ```sh
 brew install youssef-tharwat/tap/agent-mail
 agent-mail --skill
 ```
 
-Prebuilt macOS and Linux binaries for ARM64 and x86-64. **No Cargo or Rust compiler
-required.** No Node/npm needed. Startup hooks supply the version-matched
-[skill](skills/agent-mail/SKILL.md); `--skill` prints it for other integrations.
-[Installation details](docs/usage.md#install).
+Prebuilt binaries support macOS and Linux on ARM64 and x86-64. No Cargo, Rust
+compiler or npm required. [Other installation options](docs/usage.md#install).
+
+The required operating skill is bundled in the binary. Managed launches supply
+it at startup and after context resets. It teaches assignment, blockers, review,
+correction, acceptance and safe retries. Routine updates do not repeat the guide.
 
 ## Quick start
 
-Create a group and two agents:
+Create a group, register agents, and start the delivery worker:
 
 ```sh
 agent-mail init project
 agent-mail agent add coordinator
 agent-mail agent add worker
+agent-mail service run
 ```
 
-Launch each agent in its own terminal:
+Leave the worker running. Launch each agent in a separate terminal:
 
 ```sh
 agent-mail run coordinator -- codex
 agent-mail run worker -- claude
 ```
 
-Mail supplies identity and recovery hooks automatically. Review the generated
-Codex hooks when prompted. The required skill teaches agents the commands below.
+Mail supplies identity and configures recovery hooks. Review native hook trust
+when prompted; existing agent permissions still apply. Interactive Codex gets a
+private local backend with automatic attachment. Claude uses its native inbox.
 
-Inside the coordinator’s session, assign a task:
+### Assign, report, accept
+
+Inside the coordinator's session:
 
 ```sh
 agent-mail task create api-review "Review API changes at abc123" --owner worker
 ```
 
-Inside the worker’s session, recover the assignment and send a result:
+The worker receives the assignment through the integration. After doing the work:
 
 ```sh
-agent-mail context
 agent-mail mail send coordinator "Reviewed abc123; evidence: reviews/api.md" \
   --task api-review --key api-review-result-v1
 ```
 
-The group is inferred from the credential. Task changes notify the relevant
-agents automatically. The writer decides whether to accept the result;
-receiving a message never marks a task complete.
-[Replies and task decisions](docs/usage.md#atomic-decisions).
-
-## Connect your agents
-
-Run the delivery worker in another terminal for automatic idle wake:
+The coordinator checks the result and evidence, then reads the current task and
+pending mail with `task show api-review` and `mail list`. Using the observed
+`VERSION` and incoming `MESSAGE_ID`, it can accept and resolve together:
 
 ```sh
-agent-mail service run
+agent-mail task update api-review --version VERSION --reason "Evidence verified" \
+  --state accepted --accepted-revision abc123 --evidence reviews/api.md \
+  --resolve MESSAGE_ID
 ```
 
-| Runtime | Setup |
-| --- | --- |
-| Claude Code | [Normal terminal with native inbox hooks](docs/usage.md#claude-code) |
-| Codex | [Managed local socket and lifecycle hooks](docs/usage.md#codex) |
-| Herdr | [Optional plugin and verified pane binding](docs/usage.md#optional-herdr-integration) |
+The task creator is its **writer**; only that identity can change it. The **owner**
+does the work and reports results. Changes publish notifications automatically.
+Your workflow decides what evidence is sufficient for acceptance.
 
-Mail keeps durable tasks, messages and bounded delivery retries. Your runtime owns
-agent execution and permissions; your workflow owns review and acceptance rules.
-Manual CLI use needs no running service or agent runtime.
+## Task lifecycle
+
+Tasks use `open`, `ready`, `active`, `blocked`, `review`, `done`, `accepted`, or
+`cancelled`. The last three close the task automatically—there is no separate
+close flag. `done` records completion; `accepted` records the writer's acceptance.
+
+Updates require the version you observed and a reason. A linked message can be
+resolved in the same transaction. Reading a message, delivering a notification,
+or ending an agent turn never completes a task.
+
+Tasks store evidence references. General resource attachments are not implemented.
+
+## Recovery and delivery
+
+Use injected context directly. If your integration has not supplied it, run
+`agent-mail context`. Fetch `task show ID` or `mail show ID` only for needed details.
+
+The delivery worker uses durable events and bounded retries. It survives restarts
+without relying on the agent to remember delivery bookkeeping. The agent or
+operator still makes business decisions explicitly.
 
 ```sh
 agent-mail status
 agent-mail status --check worker
 ```
+
+Diagnostics distinguish missing setup, observed hooks and delivery problems.
+Hook execution is evidence of integration activity, not proof of model consumption.
+Manual CLI use works without the delivery worker; automatic idle wake needs it.
+[Runtime setup and controls](docs/usage.md#automatic-recovery-and-delivery).
 
 ## Herdr plugin (optional)
 
@@ -92,28 +113,24 @@ agent-mail status --check worker
 herdr plugin install youssef-tharwat/agent-mail
 ```
 
-The plugin downloads a verified release binary; it does not require Cargo.
-For Herdr clients, install the discoverable skill or load `agent-mail --skill`
-at session startup; the instructions remain required.
-[Setup and binding](docs/usage.md#optional-herdr-integration).
+The plugin downloads a verified binary. Herdr owns agent sessions and pane identity;
+Mail owns durable coordination. Load `agent-mail --skill` at startup or install
+the discoverable skill. [Herdr setup](docs/usage.md#optional-herdr-integration).
 
-## Documentation and help
+## Upgrading to v0.6
 
-- [User guide](docs/usage.md): commands, runtime setup, delivery controls and upgrades.
+Stop clients and the delivery worker, back up your store, then follow the
+[upgrade guide](docs/usage.md#upgrading). Schema 14 introduces typed task states
+and rejects ambiguous legacy states. Writable `open`, `--close` and `--reopen`
+have been removed. The bundled skill matches the installed binary.
+
+## Documentation and contributing
+
+- [User guide](docs/usage.md): commands, integrations and troubleshooting.
+- [Agent operating skill](skills/agent-mail/SKILL.md): usage flows and decisions.
 - [Architecture](docs/ARCHITECTURE.md): ownership and delivery guarantees.
-- [CLI design](docs/CLI_REDESIGN.md): defaults and workflow decisions.
-- [Live runtime validation](docs/native-inbox-acceptance.md).
-- [Issues](https://github.com/youssef-tharwat/agent-mail/issues): bugs and feature requests.
+- [Live validation and limitations](docs/native-launch-acceptance.md).
+- [Development](docs/usage.md#development) · [Implementation plan](docs/IMPLEMENTATION_PLAN.md).
+- [Issues](https://github.com/youssef-tharwat/agent-mail/issues): bugs and proposals.
 
-v0.6 bundles the operating skill and derives task closure from typed states.
-Existing users should follow
-[the upgrade guide](docs/usage.md#upgrading) before updating their store.
-
-## Contributing
-
-See [development setup and checks](docs/usage.md#development). Keep changes focused
-and add regression coverage for behavior changes. Discuss larger changes in an
-issue first. [Implementation plan](docs/IMPLEMENTATION_PLAN.md).
-
-Maintained by [Youssef Tharwat](https://github.com/youssef-tharwat).
-Licensed under [MIT](LICENSE).
+Maintained by [Youssef Tharwat](https://github.com/youssef-tharwat). [MIT](LICENSE).
