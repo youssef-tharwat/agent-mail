@@ -211,7 +211,7 @@ impl Store {
             .await?
             .user_version
             .context("SQLite did not report its schema version")?;
-        ensure!(version <= 6, "database schema is newer than this binary");
+        ensure!(version <= 7, "database schema is newer than this binary");
         if setup {
             // Rebuilding a referenced table requires FK enforcement off outside
             // the migration transaction. The migration checks every FK before commit.
@@ -248,7 +248,7 @@ impl Store {
             .await?;
         } else {
             ensure!(
-                version == 6,
+                version == 7,
                 "database schema needs initialization or migration; run setup"
             );
         }
@@ -581,16 +581,29 @@ impl Store {
         reply: Option<(String, String)>,
         now: i64,
     ) -> Result<Option<i64>> {
-        bounded(note, SUMMARY_LIMIT, "resolution")?;
-        let resolution = serde_json::to_string(&(note, &reply))?;
         let mut tx = self.pool.begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
+        let result = Self::resolve_tx(&mut tx, actor, id, note, reply, now).await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    pub(crate) async fn resolve_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        actor: &Mailbox,
+        id: i64,
+        note: &str,
+        reply: Option<(String, String)>,
+        now: i64,
+    ) -> Result<Option<i64>> {
+        bounded(note, SUMMARY_LIMIT, "resolution")?;
+        let resolution = serde_json::to_string(&(note, &reply))?;
         let d = sqlx::query!(
             "SELECT state,resolution,reply_id FROM deliveries WHERE message=? AND recipient=?",
             id,
             actor.id
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?
         .context("message is not in this inbox")?;
         if d.state == "resolved" {
@@ -609,7 +622,7 @@ impl Store {
                 "SELECT b.name, m.work_id FROM messages m JOIN mailboxes b ON b.id=m.sender WHERE m.id=?",
                 id
             )
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?;
             let mut summary = body.lines().next().unwrap_or("Reply").to_string();
             while summary.len() > SUMMARY_LIMIT {
@@ -624,17 +637,17 @@ impl Store {
                 reply_to: Some(id),
                 work_id: sender.work_id,
             };
-            Some(Self::publish_tx(&mut tx, actor, &mut p, now).await?)
+            Some(Self::publish_tx(tx, actor, &mut p, now).await?)
         } else {
             None
         };
         sqlx::query!("UPDATE deliveries SET state='resolved',resolution=?,reply_id=? WHERE message=? AND recipient=?",
-            resolution, reply_id, id, actor.id).execute(&mut *tx).await?;
+            resolution, reply_id, id, actor.id).execute(&mut **tx).await?;
         let sender = sqlx::query!("SELECT m.global_id,b.remote_machine FROM messages m JOIN mailboxes b ON b.id=m.sender WHERE m.id=?", id)
-            .fetch_one(&mut *tx).await?;
+            .fetch_one(&mut **tx).await?;
         if let Some(machine) = sender.remote_machine {
             relay::enqueue(
-                &mut tx,
+                tx,
                 relay::machine(&machine)?,
                 Event::Resolution {
                     group: actor.group_name.clone(),
@@ -651,8 +664,7 @@ impl Store {
             )
             .await?;
         }
-        Self::reset_empty(&mut tx, &actor.group_name).await?;
-        tx.commit().await?;
+        Self::reset_empty(tx, &actor.group_name).await?;
         Ok(reply_id)
     }
 
@@ -699,27 +711,27 @@ impl Store {
         Ok(())
     }
 
-    async fn reset_empty(tx: &mut Transaction<'_, Sqlite>, group: &str) -> Result<()> {
-        sqlx::query!("UPDATE mailboxes SET attempts=0,next_wake=0,alerted=0 WHERE group_name=? AND NOT EXISTS(SELECT 1 FROM deliveries WHERE recipient=mailboxes.id AND state='pending')", group)
+    pub(crate) async fn reset_empty(tx: &mut Transaction<'_, Sqlite>, group: &str) -> Result<()> {
+        sqlx::query!("UPDATE mailboxes SET attempts=0,next_wake=0,alerted=0 WHERE group_name=? AND NOT EXISTS(SELECT 1 FROM deliveries WHERE recipient=mailboxes.id AND state='pending') AND NOT EXISTS(SELECT 1 FROM pending_work_events WHERE recipient=mailboxes.id)", group)
             .execute(&mut **tx).await?;
         Ok(())
     }
 
     pub async fn pending(&self) -> Result<Vec<Pending>> {
         Ok(sqlx::query_as!(Pending,
-            "SELECT b.id AS 'id!: i64',b.group_name AS 'group_name!: String',b.name AS 'name!: String',COUNT(*) AS 'pending!: i64',MIN(m.created) AS 'oldest!: i64',MIN(m.due) AS 'due!: i64',b.attempts AS 'attempts!: i64',b.next_wake AS 'next_wake!: i64',b.alerted AS 'alerted!: i64' FROM mailboxes b JOIN deliveries d ON d.recipient=b.id JOIN messages m ON m.id=d.message WHERE d.state='pending' AND b.remote_machine IS NULL GROUP BY b.id ORDER BY b.group_name,b.id")
+            "SELECT b.id AS 'id!: i64',b.group_name AS 'group_name!: String',b.name AS 'name!: String',COUNT(*) AS 'pending!: i64',MIN(m.created) AS 'oldest!: i64',MIN(m.due) AS 'due!: i64',b.attempts AS 'attempts!: i64',b.next_wake AS 'next_wake!: i64',b.alerted AS 'alerted!: i64' FROM mailboxes b JOIN (SELECT d.recipient,m.created,m.due FROM deliveries d JOIN messages m ON m.id=d.message WHERE d.state='pending' UNION ALL SELECT recipient,created,created+900 AS due FROM pending_work_events) m ON m.recipient=b.id WHERE b.remote_machine IS NULL GROUP BY b.id ORDER BY b.group_name,b.id")
             .fetch_all(&self.pool).await?)
     }
 
     pub async fn reserve(&self, actor: &Mailbox, now: i64) -> Result<bool> {
         let next = now.checked_add(300).context("clock overflow")?;
-        let result = sqlx::query!("UPDATE mailboxes SET attempts=attempts+1,next_wake=? WHERE id=? AND binding_version=? AND pane IS NOT NULL AND attempts<3 AND next_wake<=? AND EXISTS(SELECT 1 FROM groups WHERE name=mailboxes.group_name AND paused=0 AND auto_prompt=1) AND EXISTS(SELECT 1 FROM deliveries WHERE recipient=mailboxes.id AND state='pending')",
+        let result = sqlx::query!("UPDATE mailboxes SET attempts=attempts+1,next_wake=? WHERE id=? AND binding_version=? AND pane IS NOT NULL AND attempts<3 AND next_wake<=? AND EXISTS(SELECT 1 FROM groups WHERE name=mailboxes.group_name AND paused=0 AND auto_prompt=1) AND (EXISTS(SELECT 1 FROM deliveries WHERE recipient=mailboxes.id AND state='pending') OR EXISTS(SELECT 1 FROM pending_work_events WHERE recipient=mailboxes.id))",
             next, actor.id, actor.binding_version, now).execute(&self.pool).await?;
         Ok(result.rows_affected() == 1)
     }
 
     pub async fn reserve_alert(&self, id: i64, now: i64) -> Result<bool> {
-        let result = sqlx::query!("UPDATE mailboxes SET alerted=1 WHERE id=? AND alerted=0 AND EXISTS(SELECT 1 FROM deliveries d JOIN messages m ON m.id=d.message WHERE d.recipient=mailboxes.id AND d.state='pending' AND (m.due<=? OR mailboxes.attempts>=3))", id, now).execute(&self.pool).await?;
+        let result = sqlx::query!("UPDATE mailboxes SET alerted=1 WHERE id=? AND alerted=0 AND (EXISTS(SELECT 1 FROM deliveries d JOIN messages m ON m.id=d.message WHERE d.recipient=mailboxes.id AND d.state='pending' AND (m.due<=? OR mailboxes.attempts>=3)) OR EXISTS(SELECT 1 FROM pending_work_events WHERE recipient=mailboxes.id AND (created+900<=? OR mailboxes.attempts>=3)))", id, now, now).execute(&self.pool).await?;
         Ok(result.rows_affected() == 1)
     }
 

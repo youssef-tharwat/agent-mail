@@ -22,15 +22,46 @@ pub struct WorkDraft {
     pub evidence: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkPatch {
     pub owner: Option<String>,
     pub state: Option<String>,
     pub open: Option<bool>,
     pub next_action: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "nullable_update"
+    )]
     pub deadline: Option<Option<i64>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "nullable_update"
+    )]
     pub accepted_revision: Option<Option<String>>,
     pub evidence: Option<Vec<String>>,
+}
+
+// Missing means unchanged; JSON null explicitly clears nullable work fields.
+fn nullable_update<'de, D, T>(deserializer: D) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
+}
+
+/// One authorized work decision, including the related obligation to resolve.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkDecision {
+    pub key: String,
+    pub version: i64,
+    pub patch: WorkPatch,
+    pub reason: String,
+    pub resolve_message: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,11 +335,69 @@ impl Store {
         reason: &str,
         now: i64,
     ) -> Result<WorkItem> {
+        self.apply_work(
+            actor,
+            id,
+            WorkDecision {
+                key: String::new(),
+                version: expected,
+                patch,
+                reason: reason.to_owned(),
+                resolve_message: None,
+            },
+            now,
+        )
+        .await
+    }
+
+    pub async fn work_decide(
+        &self,
+        actor: &Mailbox,
+        id: &str,
+        decision: WorkDecision,
+        now: i64,
+    ) -> Result<WorkItem> {
+        name(&decision.key)?;
+        self.apply_work(actor, id, decision, now).await
+    }
+
+    async fn apply_work(
+        &self,
+        actor: &Mailbox,
+        id: &str,
+        decision: WorkDecision,
+        now: i64,
+    ) -> Result<WorkItem> {
+        let canonical = serde_json::to_string(&(id, &decision))?;
+        let WorkDecision {
+            key,
+            version: expected,
+            patch,
+            reason,
+            resolve_message,
+        } = decision;
         name(id)?;
-        bounded(reason, 512, "change reason")?;
+        bounded(&reason, 512, "change reason")?;
         ensure!(!reason.trim().is_empty(), "change reason is required");
         let mut tx = self.pool.begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
+        if !key.is_empty() {
+            if let Some(old) = sqlx::query!(
+                "SELECT canonical,result FROM work_decisions WHERE actor=? AND key=?",
+                actor.id,
+                key
+            )
+            .fetch_optional(&mut *tx)
+            .await?
+            {
+                ensure!(
+                    old.canonical == canonical,
+                    "decision key reused with different content"
+                );
+                return Ok(serde_json::from_str(&old.result)?);
+            }
+        }
+
         let home = sqlx::query!(
             "SELECT home_machine FROM groups WHERE name=?",
             actor.group_name
@@ -390,6 +479,29 @@ impl Store {
             item.group_name, item.id, item.version, actor.name, reason, snapshot, now)
             .execute(&mut *tx).await?;
         relay::enqueue_snapshot(&mut tx, &item, Some(&previous_owner), now).await?;
+
+        if let Some(message) = resolve_message {
+            let linked = sqlx::query!("SELECT work_id FROM messages WHERE id=?", message)
+                .fetch_optional(&mut *tx)
+                .await?;
+            ensure!(
+                linked.and_then(|r| r.work_id).as_deref() == Some(id),
+                "resolved message must reference this work item"
+            );
+            Self::resolve_tx(&mut tx, actor, message, &reason, None, now).await?;
+        }
+        if !key.is_empty() {
+            let result = serde_json::to_string(&item)?;
+            sqlx::query!(
+                "INSERT INTO work_decisions(actor,key,canonical,result) VALUES(?,?,?,?)",
+                actor.id,
+                key,
+                canonical,
+                result
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(item)
     }

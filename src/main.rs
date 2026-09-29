@@ -155,6 +155,26 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         mail_after: i64,
     },
+    /// Print lifecycle hook configuration; merge it into the client's existing hooks.
+    HooksConfig,
+    /// Runtime adapter: receive bounded JSON lifecycle input on stdin.
+    Hook {
+        #[arg(long, env = "AGENT_MAIL_GROUP", default_value = "default")]
+        group: String,
+    },
+    /// Read durable notifications. Reading does not acknowledge or resolve them.
+    Events {
+        #[arg(long, default_value = "default")]
+        group: String,
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+    },
+    /// Adapter: acknowledge one successfully delivered event for this binding.
+    Ack {
+        #[arg(long, default_value = "default")]
+        group: String,
+        event: i64,
+    },
     /// Maintain small versioned work records in the same store as mail.
     #[command(subcommand)]
     Work(WorkCommand),
@@ -211,6 +231,14 @@ enum Bridge {
 
 #[derive(Subcommand)]
 enum WorkCommand {
+    /// Apply a JSON decision and optionally resolve a linked request atomically.
+    Decide {
+        #[arg(long, default_value = "default")]
+        group: String,
+        id: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
     Create {
         #[arg(long, default_value = "default")]
         group: String,
@@ -300,6 +328,25 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    if matches!(cli.command, Command::HooksConfig) {
+        let command = "agent-mail hook";
+        let mut hooks = serde_json::Map::new();
+        for event in [
+            "SessionStart",
+            "PostCompact",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "Stop",
+        ] {
+            hooks.insert(
+                event.into(),
+                json!([{"hooks":[{"type":"command","command":command,"timeout":10}]}]),
+            );
+        }
+        println!("{}", serde_json::to_string_pretty(&json!({"hooks":hooks}))?);
+        return Ok(());
+    }
     let explicit_state = cli.state_dir.is_some();
     let root = supervision::state_root(cli.state_dir)?;
     if matches!(cli.command, Command::Restore) && !root.join("mail.db").exists() {
@@ -536,36 +583,35 @@ async fn run(cli: Cli) -> Result<()> {
             mail_after,
         } => {
             let actor = store.authenticate(&group, cli.session.as_ref()).await?;
-            let work = store.work_list(&actor, &work_after).await?;
-            let mail = store.inbox(&actor, mail_after).await?;
-            let mut works = Vec::new();
-            let mut mails = Vec::new();
-            let mut next_work = work_after;
-            let mut next_mail = mail_after;
-            for item in work.iter().take(5) {
-                works.push(item);
-                let candidate = json!({"group":group,"work":works,"mail":mails,"work_more":true,"mail_more":true,"next_work_after":item.id,"next_mail_after":next_mail});
-                if serde_json::to_vec(&candidate)?.len() > 3400 {
-                    works.pop();
-                    break;
-                }
-                next_work = item.id.clone();
-            }
-            for item in mail.iter().take(5) {
-                mails.push(item);
-                let candidate = json!({"group":group,"work":works,"mail":mails,"work_more":true,"mail_more":true,"next_work_after":next_work,"next_mail_after":item.id});
-                if serde_json::to_vec(&candidate)?.len() > 3400 {
-                    mails.pop();
-                    break;
-                }
-                next_mail = item.id;
-            }
-            let peers = store.peers_status().await?;
-            let stale_peers: Vec<_> = peers.iter().filter(|p| p.queued > 0 || p.last_error.is_some()).take(3).map(|p| json!({"machine_id":p.machine_id,"queued":p.queued,"last_sync":p.last_sync})).collect();
-            let (outbox_pending, outbox_oldest) = store.outbox_status().await?;
-            json!({"group":group,"work":works,"mail":mails,"work_more":work.len()>works.len(),"mail_more":mail.len()>mails.len(),"next_work_after":next_work,"next_mail_after":next_mail,"stale_peers":stale_peers,"outbox_pending":outbox_pending,"outbox_oldest":outbox_oldest})
+            store.context_value(&actor, work_after, mail_after).await?
+        }
+        Command::Hook { group } => {
+            let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+            let mut bytes = Vec::new();
+            std::io::stdin().take(65537).read_to_end(&mut bytes)?;
+            ensure!(bytes.len() <= 65536, "hook input exceeds 64 KiB");
+            let input = serde_json::from_slice(&bytes)?;
+            store.hook(&actor, input, now()?).await?
+        }
+        Command::Events { group, after } => {
+            let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+            let mut items = store.notifications(&actor, after).await?;
+            let more = items.len() > 5;
+            items.truncate(5);
+            let next = items.last().map_or(after, |item| item.id);
+            json!({"items":items,"more":more,"next_after":next,"binding_version":actor.binding_version})
+        }
+        Command::Ack { group, event } => {
+            let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+            store.acknowledge(&actor, event).await?;
+            json!({"event":event,"acknowledged":true,"resolved":false})
         }
         Command::Work(command) => match command {
+            WorkCommand::Decide { group, id, file } => {
+                let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+                let decision = serde_json::from_str(&read_body(&file)?)?;
+                serde_json::to_value(store.work_decide(&actor, &id, decision, now()?).await?)?
+            }
             WorkCommand::Create {
                 group,
                 id,
@@ -673,7 +719,7 @@ async fn run(cli: Cli) -> Result<()> {
                 Value::Null
             };
             let (outbox_pending, outbox_oldest) = store.outbox_status().await?;
-            json!({"service_running":service::running(&root),"now":now()?,"groups":store.groups().await?,"inboxes":store.pending().await?,"peers":store.peers_status().await?,"outbox_pending":outbox_pending,"outbox_oldest":outbox_oldest,"last_scan":diagnostics})
+            json!({"service_running":service::running(&root),"now":now()?,"groups":store.groups().await?,"inboxes":store.pending().await?,"notifications":store.notification_status().await?,"peers":store.peers_status().await?,"outbox_pending":outbox_pending,"outbox_oldest":outbox_oldest,"last_scan":diagnostics})
         }
         Command::Pause { group } => {
             store.pause(&group, true).await?;
@@ -702,7 +748,9 @@ async fn run(cli: Cli) -> Result<()> {
             service::run(&store, once).await?;
             return Ok(());
         }
-        Command::Service(_) | Command::Restore => unreachable!("handled before opening database"),
+        Command::Service(_) | Command::Restore | Command::HooksConfig => {
+            unreachable!("handled before opening database")
+        }
     };
     println!("{}", serde_json::to_string(&output)?);
     store.pool.close().await;

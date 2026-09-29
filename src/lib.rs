@@ -35,3 +35,8 @@ pub fn bounded(value: &str, limit: usize, label: &str) -> anyhow::Result<()> {
     anyhow::ensure!(!value.contains('\0'), "{label} contains a NUL byte");
     Ok(())
 }
+
+pub mod events;
+
+pub mod hooks;
+pub mod recovery;

@@ -13,7 +13,7 @@ context, a periodic wake worker, an SSH relay with opt-in sync, and a macOS laun
 installer. Process-boundary tests use a fake Herdr socket. The full suite and
 clippy pass. A real local Herdr smoke test passed: plugin link, setup/status
 actions, binding, linked mail, context, resolution, work closure, and the safe
-prompt hold. A two-machine SSH smoke test and release packaging remain open.
+prompt hold. A two-machine SSH smoke test remains open. Release v0.2.0 supplies macOS and Linux binaries for Intel and ARM.
 Herdr lacks a safe empty-draft signal, so automatic agent prompts are disabled
 by default. Automatic SSH sync requires per-peer operator opt-in, and changing
 the configured SSH target disables it. Manual `sync` remains available.
@@ -126,7 +126,7 @@ in [ARCHITECTURE.md](ARCHITECTURE.md) are met. Publication is a separate step.
 ## What stays outside this project
 
 Herdr remains the source for agent inventory, lifecycle, and prompts. Mail
-keeps only mailbox routing bindings. Fleet Campaign or another caller defines
+owns durable participant identities and mailbox routing bindings. Fleet Campaign or another caller defines
 review rules, acceptance gates, and authority to reassign work. Git and CI
 hold the underlying evidence. V1 does not schedule agent tool calls, replay
 agent reasoning, or automatically retry side effects.
@@ -150,3 +150,65 @@ lifecycle observations, and wake prompts for its bindings.
 
 **Exit:** standalone participants exchange mail and recover work with Herdr
 absent; existing Herdr behavior and delivery guarantees continue to pass.
+
+## 6. Remove dependence on agent memory
+
+In progress in unreleased v0.3 source; not implemented by v0.2.0. Follow the forgetful-agent
+contract in ARCHITECTURE.md. Keep standalone manual operation available, but
+label its weaker delivery capability explicitly.
+
+1. Add transactionally committed events and scoped durable subscriptions for
+   mail and work changes, including reassignments. Add stable event IDs, receipt
+   state, and bounded reconciliation using the existing worker and database.
+2. Add typed atomic decision operations with version/authority checks and retry
+   keys. Agents must not separately update a register and notify the next actor.
+   Preserve the existing distinction between submitted evidence and acceptance.
+3. Verify each supported client's actual hook and safe queue contract. Implement
+   bounded context injection on start/resume/compaction and safe turn boundaries;
+   use a safe wake path for idle agents. Expose unsupported capabilities clearly.
+4. Keep unresolved obligations recoverable regardless of prior notification
+   receipts. Tie notification delivery to binding generation; reject stale
+   acknowledgments. Coalesce hints, bound retries, and avoid stop-hook loops.
+5. Exercise a real assignment -> submission -> review -> correction -> acceptance
+   cycle without a prompt telling agents to poll or update a separate register.
+   Interrupt it with compaction, session replacement, worker restart, duplicate
+   events, failed injection, and crashes around commit/ack boundaries.
+
+**Exit:** committed changes produce recoverable notifications automatically;
+registered integrations restore bounded context without model-initiated polling;
+retries cannot duplicate state transitions; missing decisions stay visibly pending;
+blocked or unavailable agents do not cause infinite prompts. Report token/context
+volume and distinguish real client tests from protocol fixtures.
+
+### Section 6 implementation witness
+
+Implemented in source:
+
+- Schema 7 event publication in the domain transaction; fixed owner/writer,
+  previous-owner, and mail subscriptions; bounded replay and generation-scoped
+  individual acknowledgments. Existing obligations are seeded on upgrade.
+- `work decide`: static checked SQL, writer/version checks, a stable retry key,
+  atomic linked-request resolution, history, and event publication.
+- `hook` and `hooks-config`: shared Codex/Claude lifecycle JSON contract,
+  start/resume/compaction recovery, tool/prompt boundary injection, bounded
+  retry state, and one Stop continuation per recovery epoch.
+- Work-only notifications feed the existing Herdr worker. `status` separates
+  unacknowledged events from hook attempts; emitting stdout is never a receipt.
+
+Verification includes process-boundary assignment/review/correction/acceptance,
+failed-decision rollback, duplicate decisions, old credentials, recipient isolation,
+reassignment, dropped hook output, reopened store, bounded retries, reset recovery,
+and the existing fake-Herdr wake suite. These are deterministic protocol tests,
+not evidence that live model clients have loaded and consumed trusted hooks.
+
+Live witness: in an isolated Codex 0.157 session, hooks supplied an assignment
+without a model tool call, recovered a changed assignment after manual compaction,
+and recovered a new assignment after resume. PostCompact invalidation was needed
+because this client did not invoke SessionStart(compact); the next prompt supplied
+recovery. The test used the normal hook trust UI and left existing Mail state alone.
+
+Remaining acceptance: live two-agent behavior, immediate mid-turn compaction
+recovery across supported client versions, and live Claude Code validation; safe idle standalone wake support. Codex skips untrusted hooks until
+its native `/hooks` review is completed. No user hook configuration or live Mail
+store has been changed automatically. Do not advertise autonomous progress or
+mark the section's full exit criteria complete until those checks pass.

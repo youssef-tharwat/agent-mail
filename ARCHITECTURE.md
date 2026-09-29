@@ -111,6 +111,64 @@ succeeded. A failed commit never returns success. Missing or incompatible state
 fails visibly instead of silently creating a fresh database. The implementation
 uses compile-time checked SQLx queries and no dynamic SQL.
 
+## Forgetful-agent contract (required next increment)
+
+Status: v0.3 source implements transactional event subscriptions, generation-scoped
+receipts, atomic writer decisions, bounded client hook output, and work-event
+wake reconciliation. v0.2.0 lacks these features. Trusted Codex 0.157 prompt/resume recovery and the post-compaction fallback
+have been exercised; broader client acceptance and safe idle standalone waking remain open; checkpoint polling is
+an incomplete fallback, not the target reliability contract.
+
+Fixed subscriptions are derived from recipients and work ownership. SQLite
+triggers persist events in the mutation transaction, including relay imports;
+no process-local callback can omit a committed change. The hook adapter tracks
+emission attempts rather than claiming confirmed delivery. A reset restores
+current obligations even after the previous emission budget was exhausted.
+Programmatic subscribers acknowledge individual events only after confirmed
+transport delivery. Receipt state is scoped to the binding generation.
+
+Agents must not remember coordination bookkeeping. A domain operation commits
+its state change and an event together in SQLite. Relevant subscriptions create
+durable pending notifications for affected participants (owner and designated
+writer, scoped by group and work item). Changing an assignment must notify both
+previous and new owners. Retrying an operation or replaying an event must not
+repeat its logical effect. Notification delivery is at least once, with stable
+IDs and idempotent consumers; it is not exactly-once agent execution.
+
+A small runtime adapter consumes those notifications and supplies bounded
+context at supported session start, resume, post-compaction, and safe turn
+boundaries. An idle agent needs a verified safe wake/queue mechanism; hooks alone
+cannot awaken an agent when no client event occurs. No model call is used to
+poll. The local worker reconciles committed events after restart, so an in-memory
+socket hint is only a latency optimization, never the source of truth.
+
+Delivery, presentation, and business resolution are different facts. A cursor
+or successful context injection never resolves a request or accepts work.
+Session recovery reconstructs unresolved obligations from current durable state,
+even when an earlier session already received their notifications. Per-binding
+notification acknowledgments cannot hide obligations from a replacement session.
+Only acknowledge a delivery after the adapter confirms it; ambiguous outcomes
+may repeat a bounded hint. Coalesce notifications and suppress unchanged context
+within a session, but restore it after a reset. Failed adapters remain visibly
+pending, with bounded retries and a visible stalled state, never silent loss.
+
+The model or authorized operator still supplies semantic decisions: submit a
+result, request changes, accept a revision, or reassign work. Provide one typed,
+idempotent operation for each supported decision, so recording its evidence,
+updating permitted state, resolving the associated obligation, and notifying
+subscribers happen in one transaction. The active workflow supplies authority
+and transition policy; Mail must not infer success from free-form text, tool exit,
+an idle pane, or a stop hook. A decision not submitted remains visibly pending.
+
+Before a session ends, a supported hook surfaces outstanding actionable
+obligations. It must not force an endless continuation for blocked work, human
+approval, or another participant's response. Clients without the necessary hooks
+or safe wake mechanism expose a manual delivery mode explicitly; they cannot be
+advertised as satisfying automatic progress or recovery guarantees.
+
+Keep this local: one binary, SQLite events and subscription receipts, a bounded
+worker, and small client adapters. No external broker or workflow language.
+
 ## Delivery and reconnect
 
 For a group spanning machines, **the home node is the only authority** for the

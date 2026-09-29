@@ -186,7 +186,7 @@ async fn wake(
     }
     // Group names are validated ASCII identifiers; no message content enters the prompt.
     let text = format!(
-        "Agent Mail: pending messages. Run agent-mail inbox --group {}. Handle relevant items; resolve after handling.",
+        "Agent Mail: work or mail changed. Run agent-mail context --group {}. Handle relevant obligations.",
         binding.group_name
     );
     anyhow::ensure!(text.len() <= 160, "wake-up exceeds size limit");
@@ -208,7 +208,7 @@ pub async fn tick(store: &Store, time: i64) -> Result<Vec<Observation>> {
             let state = if item.due <= time {
                 "overdue; standalone availability unknown; check context"
             } else {
-                "standalone availability unknown; awaiting context checkpoint"
+                "standalone availability unknown; delivery requires client hooks or an explicit adapter"
             };
             observations.push(Observation::for_inbox(&item, state));
         } else {

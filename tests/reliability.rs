@@ -771,3 +771,31 @@ async fn standalone_and_herdr_share_mail_without_sharing_session_authority() -> 
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn work_only_changes_wake_without_separate_mail_and_keep_retry_budget() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.store
+        .work_create(
+            &f.a,
+            WorkDraft {
+                id: "assignment".into(),
+                scope: "Review changes".into(),
+                owner: f.b.name.clone(),
+                state: "active".into(),
+                next_action: "Inspect evidence".into(),
+                deadline: None,
+                evidence: vec![],
+            },
+            1000,
+        )
+        .await?;
+    assert!(f.store.inbox(&f.b, 0).await?.is_empty());
+    service::tick(&f.store, 1000).await?;
+    let initial = f.host.lock().await.prompts.len();
+    assert_eq!(initial, 2); // Both the designated writer and owner subscribe.
+    service::tick(&f.store, 1001).await?;
+    assert_eq!(f.host.lock().await.prompts.len(), initial);
+    assert!(f.host.lock().await.prompts[0].contains("context"));
+    Ok(())
+}

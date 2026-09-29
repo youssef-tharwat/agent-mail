@@ -131,6 +131,105 @@ ln -s "$(pwd)/skills/agent-mail" ~/.codex/skills/agent-mail
 Then ask a bound or registered agent to use `$agent-mail`, or let Codex select it for an
 Agent Mail task. Other agent tools can read the same `SKILL.md` directly.
 
+## Automatic recovery and change notifications (unreleased v0.3)
+
+This section describes the source checkout. The published v0.2.0 binaries do
+not include these commands. Build this revision with `cargo install --path . --locked`.
+Stop existing Mail workers and run `setup` to migrate a backed-up store to schema 7;
+v0.2.0 cannot open the upgraded database.
+
+Mail and work changes automatically publish recipient-scoped events in the same
+SQLite transaction. The owner and designated writer receive work changes;
+reassignment also notifies the previous owner. No separate notification send is
+needed. Work changes participate in the existing bounded Herdr wake policy.
+
+### Enable lifecycle hooks
+
+Launch each client with its assigned `AGENT_MAIL_SESSION` (standalone) or its
+verified Herdr pane binding, plus `AGENT_MAIL_GROUP` and, for a custom store,
+`AGENT_MAIL_STATE_DIR`. The `agent-mail` binary must be on the client's `PATH`.
+
+```sh
+agent-mail hooks-config > /tmp/agent-mail-hooks.json
+```
+
+Merge the generated `hooks` entries into your client's existing configuration:
+
+- **Codex:** `.codex/hooks.json` in the intended project, or `~/.codex/hooks.json`.
+  Review and trust the new entries through `/hooks`; untrusted hooks are skipped.
+- **Claude Code:** the `hooks` object in `.claude/settings.json` in the intended
+  project. Follow the client's hook approval/setup flow.
+
+Do not overwrite unrelated hooks. Configure only sessions assigned a Mail
+identity; a missing/invalid identity fails visibly instead of borrowing another
+participant's mailbox.
+
+The common adapter reads lifecycle JSON on stdin and emits the documented hook
+response. `SessionStart` restores state on startup/resume/compaction;
+`UserPromptSubmit`, `PreToolUse`, and `PostToolUse` surface changes.
+`PostCompact` invalidates cached emission state for clients that do not call
+`SessionStart(compact)`, restoring context at the next supported boundary. `Stop` may request one
+continuation for new obligations per recovery epoch, and never recursively
+continues a stop-hook turn. No model call polls SQLite. Unchanged state emits no
+context except up to two retries, spaced five minutes apart, after an emission
+whose consumption cannot be confirmed. Reset always reconstructs current state.
+Context text is capped at 6,000 UTF-8 bytes and contains summaries plus change IDs.
+
+**Live check:** Codex 0.157 received assigned work through trusted hooks, recovered
+changed work after manual compaction, and recovered changes after session resume,
+without model tool calls. In that version, manual compaction needed the
+`PostCompact` invalidation plus next-prompt fallback; immediate post-compaction
+`SessionStart` injection was not observed. Claude Code is protocol-tested only.
+
+**Limits:** each installed client must load and trust its hooks. A successful stdout write does not prove model
+consumption: hook attempts never manufacture delivery receipts. `status` shows
+unacknowledged notifications and emission attempts. Hooks need client lifecycle
+activity; they cannot wake an idle standalone session. Herdr's optional wake
+path retains its existing safety hold. Neither mode guarantees agent progress.
+
+Hook contracts: [Codex](https://learn.chatgpt.com/docs/hooks),
+[Claude Code](https://code.claude.com/docs/en/hooks).
+
+### Submit one work decision
+
+The designated writer can update work and resolve a linked request atomically:
+
+```json
+{
+  "key": "accept-api-v2",
+  "version": 2,
+  "reason": "Evidence verified",
+  "patch": {
+    "state": "accepted",
+    "open": false,
+    "accepted_revision": "abc123",
+    "evidence": ["ci/run/42"]
+  },
+  "resolve_message": 12
+}
+```
+
+```sh
+agent-mail work decide --group project api-review --file decision.json
+```
+
+Use the current work version and your actual message ID. `resolve_message` is
+optional; when supplied, the request must be in the writer's inbox and linked
+to this work item. A failed step rolls back the decision, resolution, history,
+and events. Retrying the same key and content returns the original result;
+changed content is rejected. Workflow policy still determines acceptance.
+Workers submit evidence using linked mail; they cannot accept their own work
+unless they are its designated writer.
+
+### Programmatic subscribers
+
+`agent-mail events` returns a bounded page with a cursor and binding generation.
+After an adapter confirms delivery of an individual event, it may call
+`agent-mail ack EVENT_ID`. Acknowledgment never resolves mail or closes work.
+Replacement sessions replay events independently of old binding receipts.
+The built-in hooks deliberately track emission attempts separately from these
+confirmed receipts. Detailed events and underlying obligations remain durable.
+
 ## Optional Herdr integration
 
 Herdr supplies live agent identity, lifecycle observations, and wake hints.

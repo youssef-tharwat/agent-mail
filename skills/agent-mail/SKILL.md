@@ -12,6 +12,16 @@ Agent Mail stores messages and small work records outside agent context. Mail ow
 
 Use the assigned group and identity. A Herdr pane uses its verified binding with `AGENT_MAIL_SESSION` unset. A standalone agent receives its own `AGENT_MAIL_SESSION` from the operator or launcher; `--session` is an explicit override. Never borrow another participant's credential. An invalid credential fails rather than falling back to Herdr. If it expires through explicit replacement, ask the operator for the new registration. `participants` lists bindings, not live availability.
 
+## Automatic recovery when configured
+
+On v0.3 source builds with trusted lifecycle hooks, use the supplied Agent Mail
+recovery context directly. Do not run another `context` merely to repeat it.
+Fetch details by ID when the supplied view is insufficient. Hook delivery and
+`ack` receipts never mean a request was handled; acknowledgment is the runtime
+adapter's responsibility. Do not acknowledge events on behalf of an adapter.
+If hooks are unavailable, use the manual recovery path below and tell the
+operator that automatic recovery is not configured.
+
 ## Resume with bounded context
 
 - Use the task's group name; `default` is appropriate only when that is the configured group. Run `agent-mail context --group <group>` when starting or resuming Mail-backed work, after a context reset, or after a Mail wake hint. Do not poll it every turn.
@@ -26,7 +36,8 @@ Use the assigned group and identity. A Herdr pane uses its verified binding with
 
 ## Maintain work deliberately
 
-- The designated home writer creates or updates work records. Inspect the current version first, then update with `agent-mail work update --group <group> <work-id> --version <version> --reason <reason>` and the intended fields. On a version conflict, reread the record and reconsider the change.
+- On v0.3, the designated writer uses `work decide <id> --file <json>` for an authorized decision. Supply a stable `key`, current `version`, `reason`, and `patch`; include `resolve_message` when the decision handles a linked request in your inbox. This commits the state, resolution, history, and notifications together. Reuse the key only for identical retries. Work changes notify subscribers automatically; do not send duplicate bookkeeping messages.
+- On v0.2 or for initial creation, the designated home writer creates or updates work records. Inspect the current version first, then update with `agent-mail work update --group <group> <work-id> --version <version> --reason <reason>` and the intended fields. On a version conflict, reread the record and reconsider the change.
 - Other participants send results or correction requests through Mail. A reply, an idle agent, or a passing test does not itself accept work or change its owner or state. Follow the active workflow's acceptance rules.
 
-Automatic prompts are off by default; use the bounded context command at real checkpoints.
+Herdr prompts remain off by default. Trusted client hooks supply recovery automatically; manual checkpoints are the fallback when hooks are unavailable.
