@@ -355,13 +355,15 @@ needs no separate skill installer. Print the exact installed instructions with:
 agent-mail --skill
 ```
 
-For clients without Mail lifecycle hooks, load that output at startup/reset, or
-install the discoverable skill:
+`--skill` prints instructions; it does not install or register a discoverable
+skill with your agent client. For clients without Mail lifecycle hooks, load that
+output at startup/reset, or install the discoverable skill:
 
 ```sh
 npx skills add youssef-tharwat/agent-mail --skill agent-mail -g
 ```
 
+Select your agent clients in the installer, then start a new agent session.
 Only that optional installation mechanism requires Node/npm. Keep external skill
 copies matched to the binary; the embedded copy is always version-matched.
 

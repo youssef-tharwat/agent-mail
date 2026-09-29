@@ -15,15 +15,38 @@ Herdr and Fleet Campaign are optional.
 
 ```sh
 brew install youssef-tharwat/tap/agent-mail
+```
+
+Prebuilt binaries support macOS and Linux on ARM64 and x86-64. No Cargo or Rust
+compiler required. [Other installation options](docs/usage.md#install).
+
+## Agent skill
+
+Agents need the [operating skill](skills/agent-mail/SKILL.md) to use Mail correctly.
+It teaches assignment, blockers, review, correction, acceptance and safe retries.
+
+**Managed Codex/Claude launches:** `agent-mail run NAME -- codex` (or `claude`)
+supplies the bundled, version-matched instructions at startup and after context
+resets. Routine updates do not repeat them. No separate skill installation or
+Node/npm is needed for this flow.
+
+**Discoverable skill:** to let your client discover and invoke `$agent-mail`,
+install it with the skills CLI (requires Node/npm):
+
+```sh
+npx skills add youssef-tharwat/agent-mail --skill agent-mail -g
+```
+
+Select your agent clients in the installer, then start a new agent session.
+Keep separately installed skills updated alongside the binary.
+
+**Inspect the bundled instructions:**
+
+```sh
 agent-mail --skill
 ```
 
-Prebuilt binaries support macOS and Linux on ARM64 and x86-64. No Cargo, Rust
-compiler or npm required. [Other installation options](docs/usage.md#install).
-
-The required operating skill is bundled in the binary. Managed launches supply
-it at startup and after context resets. It teaches assignment, blockers, review,
-correction, acceptance and safe retries. Routine updates do not repeat the guide.
+This prints the skill; it does **not** install or register it with your client.
 
 ## Quick start
 
@@ -114,8 +137,8 @@ herdr plugin install youssef-tharwat/agent-mail
 ```
 
 The plugin downloads a verified binary. Herdr owns agent sessions and pane identity;
-Mail owns durable coordination. Load `agent-mail --skill` at startup or install
-the discoverable skill. [Herdr setup](docs/usage.md#optional-herdr-integration).
+Mail owns durable coordination. Load the output of `agent-mail --skill` at startup
+or [install the discoverable skill](#agent-skill). [Herdr setup](docs/usage.md#optional-herdr-integration).
 
 ## Upgrading to v0.6
 
