@@ -5,6 +5,7 @@
 //! lock is released. [`tick`] accepts Unix seconds for deterministic retry decisions.
 //! Wake attempts reserve their durable budget before external delivery.
 
+use crate::states::DeliveryState;
 use crate::{
     herdr,
     identity::Binding,
@@ -78,16 +79,24 @@ pub struct Observation {
     pub group: String,
     /// Name of the participant addressed by this result.
     pub participant: String,
-    /// Stored business state; it does not imply transport delivery.
-    pub state: String,
+    /// Delivery scan outcome; it never resolves business obligations.
+    pub state: DeliveryState,
+    /// Diagnostic context for an unsuccessful attempt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 impl Observation {
-    fn for_inbox(item: &Pending, state: impl Into<String>) -> Self {
+    fn with_detail(mut self, detail: String) -> Self {
+        self.detail = Some(detail);
+        self
+    }
+    fn for_inbox(item: &Pending, state: DeliveryState) -> Self {
         Self {
             group: item.group_name.clone(),
             participant: item.name.clone(),
-            state: state.into(),
+            state,
+            detail: None,
         }
     }
 }
@@ -103,7 +112,9 @@ async fn session_tick(
         Ok(states) => states,
         Err(error) => pending
             .iter()
-            .map(|p| Observation::for_inbox(p, format!("held: {error:#}")))
+            .map(|p| {
+                Observation::for_inbox(p, DeliveryState::Held).with_detail(format!("{error:#}"))
+            })
             .collect(),
     }
 }
@@ -118,7 +129,7 @@ async fn session_tick_inner(
     if !herdr::plugin_enabled(socket).await? {
         return Ok(pending
             .iter()
-            .map(|p| Observation::for_inbox(p, "plugin disabled or unlinked"))
+            .map(|p| Observation::for_inbox(p, DeliveryState::PluginDisabled))
             .collect());
     }
     let agents = herdr::agents(socket).await?;
@@ -127,20 +138,18 @@ async fn session_tick_inner(
         let mut alerts = 0;
         for item in pending.iter().filter(|p| p.group_name == group.name) {
             if group.paused != 0 {
-                observations.push(Observation::for_inbox(item, "paused"));
+                observations.push(Observation::for_inbox(item, DeliveryState::Paused));
                 continue;
             }
             if group.auto_prompt == 0 {
-                observations.push(Observation::for_inbox(
-                    item,
-                    "held: automatic agent prompts disabled; use inbox or explicitly opt in",
-                ));
+                observations.push(Observation::for_inbox(item, DeliveryState::PromptDisabled));
                 if store.reserve_alert(item.id, time).await? {
                     alerts += 1;
                 }
                 continue;
             }
             let binding = store.mailbox(&group.name, &item.name).await?;
+            let mut detail = None;
             let state = if let Some(agent) = agents.iter().find(|a| {
                 binding
                     .binding
@@ -148,22 +157,27 @@ async fn session_tick_inner(
                     .is_some_and(|bound| a.pane_id == bound.pane)
             }) {
                 if !agent.matches(&binding) {
-                    "binding mismatch; rebind explicitly".to_string()
+                    DeliveryState::BindingMismatch
                 } else if !agent.ready() {
-                    format!("queued: {}", agent.agent_status)
+                    DeliveryState::Busy
                 } else if item.attempts >= 3 {
-                    "reminders exhausted".to_string()
+                    DeliveryState::Exhausted
                 } else if item.next_wake > time {
-                    "waiting for reminder deadline".to_string()
+                    DeliveryState::Waiting
                 } else {
                     wake(store, socket, &binding, time)
                         .await
-                        .unwrap_or_else(|e| format!("wake uncertain: {e:#}"))
+                        .unwrap_or_else(|e| {
+                            detail = Some(format!("{e:#}"));
+                            DeliveryState::Uncertain
+                        })
                 }
             } else {
-                "participant absent; rebind explicitly".to_string()
+                DeliveryState::Unavailable
             };
-            observations.push(Observation::for_inbox(item, state));
+            let mut observation = Observation::for_inbox(item, state);
+            observation.detail = detail;
+            observations.push(observation);
             if store.reserve_alert(item.id, time).await? {
                 alerts += 1;
             }
@@ -174,7 +188,8 @@ async fn session_tick_inner(
                 observations.push(Observation {
                     group: group.name,
                     participant: String::new(),
-                    state: format!("operator notification uncertain: {e:#}"),
+                    state: DeliveryState::NotificationFailed,
+                    detail: Some(format!("{e:#}")),
                 });
             }
         }
@@ -187,19 +202,19 @@ async fn wake(
     socket: &Path,
     binding: &crate::store::Mailbox,
     time: i64,
-) -> Result<String> {
+) -> Result<DeliveryState> {
     let Some(target) = binding.binding.herdr() else {
-        return Ok("standalone participant; availability unknown; use context".into());
+        return Ok(DeliveryState::Unavailable);
     };
     let live = herdr::agent(socket, &target.pane).await?;
     if !live.matches(binding) || !live.ready() {
-        return Ok("state changed; queued".into());
+        return Ok(DeliveryState::StateChanged);
     }
     if !herdr::plugin_enabled(socket).await? {
-        return Ok("plugin disabled or unlinked".into());
+        return Ok(DeliveryState::PluginDisabled);
     }
     if !store.reserve(binding, time).await? {
-        return Ok("reservation no longer eligible".into());
+        return Ok(DeliveryState::Ineligible);
     }
     // Group names are validated ASCII identifiers; no message content enters the prompt.
     let text = format!(
@@ -213,7 +228,7 @@ async fn wake(
         json!({"target": target.pane, "text": text}),
     )
     .await?;
-    Ok("wake-up submitted; messages remain pending".into())
+    Ok(DeliveryState::Queued)
 }
 
 /// Check native and Herdr delivery eligibility at the supplied Unix timestamp.
@@ -230,9 +245,9 @@ pub async fn tick(store: &Store, time: i64) -> Result<Vec<Observation>> {
                 continue;
             }
             let state = if item.due.is_some_and(|due| due <= time) {
-                "overdue; standalone availability unknown; check context"
+                DeliveryState::Overdue
             } else {
-                "standalone availability unknown; delivery requires client hooks or an explicit adapter"
+                DeliveryState::Unavailable
             };
             observations.push(Observation::for_inbox(&item, state));
         } else {

@@ -2,9 +2,9 @@
 //!
 //! Creation and updates are restricted to the group's home machine. Decisions
 //! validate actor generations and expected versions, and may resolve a related
-//! message in the same transaction. Work states are caller-defined names; `open`
-//! controls whether an assignment remains actionable. Times are Unix seconds.
+//! message in the same transaction. Task actionability is derived from its typed lifecycle status. Times are Unix seconds.
 
+use crate::states::TaskState;
 use crate::{
     bounded, name, relay,
     store::{Mailbox, Store},
@@ -18,6 +18,7 @@ const EVIDENCE_LIMIT: usize = 16;
 
 /// Initial work fields before versioning and actor metadata are assigned.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkDraft {
     /// Persistent identifier for this record.
     pub id: String,
@@ -26,7 +27,7 @@ pub struct WorkDraft {
     /// Participant responsible for the assignment.
     pub owner: String,
     /// Stored business state; it does not imply transport delivery.
-    pub state: String,
+    pub state: TaskState,
     /// Next business action expected from the owner.
     pub next_action: String,
     /// Deadline in Unix seconds; in patches, Some(None) explicitly clears it.
@@ -42,9 +43,7 @@ pub struct WorkPatch {
     /// Participant responsible for the assignment.
     pub owner: Option<String>,
     /// Stored business state; it does not imply transport delivery.
-    pub state: Option<String>,
-    /// Whether the assignment remains actionable.
-    pub open: Option<bool>,
+    pub state: Option<TaskState>,
     /// Next business action expected from the owner.
     pub next_action: Option<String>,
     #[serde(
@@ -106,6 +105,7 @@ struct WorkDecision {
 
 /// A versioned work record with ownership, progress, and synchronization metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkItem {
     /// Enrolled group containing this record.
     pub group_name: String,
@@ -118,9 +118,7 @@ pub struct WorkItem {
     /// Participant that originally created the work record.
     pub writer: String,
     /// Stored business state; it does not imply transport delivery.
-    pub state: String,
-    /// Whether the assignment remains actionable.
-    pub open: bool,
+    pub state: TaskState,
     /// Next business action expected from the owner.
     pub next_action: String,
     /// Deadline in Unix seconds; in patches, Some(None) explicitly clears it.
@@ -151,7 +149,7 @@ pub struct WorkSummary {
     /// Participant responsible for the assignment.
     pub owner: String,
     /// Stored business state; it does not imply transport delivery.
-    pub state: String,
+    pub state: TaskState,
     /// Next business action expected from the owner.
     pub next_action: String,
     /// Deadline in Unix seconds; in patches, Some(None) explicitly clears it.
@@ -185,8 +183,7 @@ struct WorkRow {
     scope: String,
     owner: String,
     writer: String,
-    state: String,
-    open: i64,
+    state: TaskState,
     next_action: String,
     deadline: Option<i64>,
     accepted_revision: Option<String>,
@@ -206,7 +203,6 @@ impl TryFrom<WorkRow> for WorkItem {
             owner: row.owner,
             writer: row.writer,
             state: row.state,
-            open: row.open != 0,
             next_action: row.next_action,
             deadline: row.deadline,
             accepted_revision: row.accepted_revision,
@@ -235,7 +231,6 @@ fn validate_fields(item: &WorkItem) -> Result<()> {
     name(&item.id)?;
     name(&item.owner)?;
     name(&item.writer)?;
-    name(&item.state)?;
     bounded(&item.scope, SCOPE_LIMIT, "scope")?;
     ensure!(!item.scope.trim().is_empty(), "scope is required");
     bounded(&item.next_action, ACTION_LIMIT, "next action")?;
@@ -272,7 +267,6 @@ impl Store {
             owner: draft.owner,
             writer: actor.name.clone(),
             state: draft.state,
-            open: true,
             next_action: draft.next_action,
             deadline: draft.deadline,
             accepted_revision: None,
@@ -338,9 +332,11 @@ impl Store {
             .is_some(),
             "work owner is not bound in this group"
         );
+        let state = item.state.as_str();
+        let open = item.state.is_open();
         sqlx::query!("INSERT INTO work_items(group_name,id,scope,owner,writer,state,open,next_action,deadline,accepted_revision,evidence,version,updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            item.group_name, item.id, item.scope, item.owner, item.writer, item.state,
-            item.open, item.next_action, item.deadline, item.accepted_revision, evidence,
+            item.group_name, item.id, item.scope, item.owner, item.writer, state,
+            open, item.next_action, item.deadline, item.accepted_revision, evidence,
             item.version, item.updated).execute(&mut *tx).await?;
         sqlx::query!("INSERT INTO work_changes(group_name,work_id,version,actor,reason,snapshot,changed) VALUES (?,?,?,?,?,?,?)",
             item.group_name, item.id, item.version, actor.name, "created", snapshot, now)
@@ -361,7 +357,7 @@ impl Store {
         let mut tx = self.pool().begin().await?;
         Self::check_actor(&mut tx, actor).await?;
         let row = sqlx::query_as!(WorkRow,
-            "SELECT group_name,id,scope,owner,writer,state,open,next_action,deadline,accepted_revision,evidence,version,updated FROM work_items WHERE group_name=? AND id=?",
+            "SELECT group_name,id,scope,owner,writer,state AS 'state: TaskState',next_action,deadline,accepted_revision,evidence,version,updated FROM work_items WHERE group_name=? AND id=?",
             actor.group_name, id)
             .fetch_optional(&mut *tx).await?;
         let mut item = if let Some(row) = row {
@@ -397,7 +393,7 @@ impl Store {
         let mut tx = self.pool().begin().await?;
         Self::check_actor(&mut tx, actor).await?;
         let locals = sqlx::query_as!(WorkRow,
-            "SELECT group_name,id,scope,owner,writer,state,open,next_action,deadline,accepted_revision,evidence,version,updated FROM work_items WHERE group_name=? AND (owner=? OR writer=?) AND open=1 AND id>? ORDER BY id LIMIT 6",
+            "SELECT group_name,id,scope,owner,writer,state AS 'state: TaskState',next_action,deadline,accepted_revision,evidence,version,updated FROM work_items WHERE group_name=? AND (owner=? OR writer=?) AND open=1 AND id>? ORDER BY id LIMIT 6",
             actor.group_name, actor.name, actor.name, after)
             .fetch_all(&mut *tx).await?;
         let mut rows: Vec<WorkSummary> = locals
@@ -418,7 +414,7 @@ impl Store {
             actor.group_name, actor.name, after).fetch_all(&mut *tx).await?;
         for snapshot in snapshots {
             let item: WorkItem = serde_json::from_str(&snapshot.snapshot)?;
-            if item.open {
+            if item.state.is_open() {
                 rows.push(WorkSummary {
                     id: item.id,
                     scope: item.scope,
@@ -500,7 +496,7 @@ impl Store {
             "work records are writable only on the home machine"
         );
         let row = sqlx::query_as!(WorkRow,
-            "SELECT group_name,id,scope,owner,writer,state,open,next_action,deadline,accepted_revision,evidence,version,updated FROM work_items WHERE group_name=? AND id=?",
+            "SELECT group_name,id,scope,owner,writer,state AS 'state: TaskState',next_action,deadline,accepted_revision,evidence,version,updated FROM work_items WHERE group_name=? AND id=?",
             actor.group_name, id)
             .fetch_optional(&mut *tx).await?.context("work item not found in this group")?;
         let mut item: WorkItem = row.try_into()?;
@@ -536,9 +532,6 @@ impl Store {
         if let Some(state) = patch.state {
             item.state = state;
         }
-        if let Some(open) = patch.open {
-            item.open = open;
-        }
         if let Some(next_action) = patch.next_action {
             item.next_action = next_action;
         }
@@ -570,8 +563,10 @@ impl Store {
         );
         let evidence = serde_json::to_string(&item.evidence)?;
         let snapshot = serde_json::to_string(&item)?;
+        let state = item.state.as_str();
+        let open = item.state.is_open();
         let result = sqlx::query!("UPDATE work_items SET owner=?,state=?,open=?,next_action=?,deadline=?,accepted_revision=?,evidence=?,version=?,updated=? WHERE group_name=? AND id=? AND version=?",
-            item.owner, item.state, item.open, item.next_action, item.deadline,
+            item.owner, state, open, item.next_action, item.deadline,
             item.accepted_revision, evidence, item.version, item.updated, item.group_name, item.id,
             expected).execute(&mut *tx).await?;
         ensure!(

@@ -232,7 +232,7 @@ enum WorkCommand {
         id: String,
         scope: String,
         owner: String,
-        state: String,
+        state: agent_mail::states::TaskState,
         next_action: String,
         deadline: Option<i64>,
         evidence: Vec<String>,
@@ -585,21 +585,26 @@ async fn run(cli: RunArgs) -> Result<()> {
             let mut bytes = Vec::new();
             std::io::stdin().take(65537).read_to_end(&mut bytes)?;
             ensure!(bytes.len() <= 65536, "hook input exceeds 64 KiB");
+            observe_hook(&store, &actor, &bytes).await?;
             let input: agent_mail::claude_inbox::Input = serde_json::from_slice(&bytes)?;
-            let socket = std::env::var("CLAUDE_CODE_MESSAGING_SOCKET").context(
-                "Claude inbox unavailable; requires supported Claude Code with messaging enabled",
-            )?;
-            let token = std::env::var("CLAUDE_CODE_MESSAGING_TOKEN")
-                .context("Claude messaging token missing")?;
-            match store
-                .claude_inbox_hook(
-                    &actor,
-                    &input,
-                    std::path::Path::new(socket.strip_prefix("uds:").unwrap_or(&socket)),
-                    &token,
-                )
-                .await?
-            {
+            let receipt = match (
+                std::env::var("CLAUDE_CODE_MESSAGING_SOCKET").ok(),
+                std::env::var("CLAUDE_CODE_MESSAGING_TOKEN").ok(),
+            ) {
+                (Some(socket), Some(token)) => {
+                    store
+                        .claude_inbox_hook(
+                            &actor,
+                            &input,
+                            std::path::Path::new(socket.strip_prefix("uds:").unwrap_or(&socket)),
+                            &token,
+                        )
+                        .await?
+                }
+                (None, None) => None, // Headless clients can still recover via hooks.
+                _ => anyhow::bail!("incomplete Claude messaging environment"),
+            };
+            match receipt {
                 Some(receipt_context) => {
                     store
                         .reserve_hook(&actor, &input.session_id.to_string(), false, false, now()?)
@@ -626,7 +631,25 @@ async fn run(cli: RunArgs) -> Result<()> {
             let mut bytes = Vec::new();
             std::io::stdin().take(65537).read_to_end(&mut bytes)?;
             ensure!(bytes.len() <= 65536, "hook input exceeds 64 KiB");
-            let input = serde_json::from_slice(&bytes)?;
+            let current_launch = observe_hook(&store, &actor, &bytes).await?;
+            let input: agent_mail::hooks::HookInput = serde_json::from_slice(&bytes)?;
+            if let Some(socket) = std::env::var_os("AGENT_MAIL_CODEX_SOCKET") {
+                if current_launch && store.runtime_enabled(&actor).await? {
+                    // The client owns the thread; the hook provides its identity.
+                    let thread = uuid::Uuid::parse_str(&input.session_id)?;
+                    if let Err(error) = store
+                        .attach_codex_from_hook(
+                            &actor,
+                            std::path::Path::new(&socket),
+                            thread,
+                            &std::env::var("AGENT_MAIL_LAUNCH")?,
+                        )
+                        .await
+                    {
+                        eprintln!("agent-mail: idle delivery attachment pending: {error:#}");
+                    }
+                }
+            }
             store.hook(&actor, input, now()?).await?
         }
         Command::Events { group, after } => {
@@ -760,4 +783,29 @@ async fn run(cli: RunArgs) -> Result<()> {
     println!("{}", serde_json::to_string(&output)?);
     store.close().await;
     Ok(())
+}
+
+async fn observe_hook(
+    store: &Store,
+    actor: &agent_mail::store::Mailbox,
+    bytes: &[u8],
+) -> Result<bool> {
+    if let Ok(launch) = std::env::var("AGENT_MAIL_LAUNCH") {
+        let input: serde_json::Value = serde_json::from_slice(bytes)?;
+        return store
+            .observe_hook(
+                actor,
+                &launch,
+                input["session_id"]
+                    .as_str()
+                    .context("hook session missing")?,
+                input["hook_event_name"]
+                    .as_str()
+                    .context("hook event missing")?
+                    .parse()?,
+                now()?,
+            )
+            .await;
+    }
+    Ok(false)
 }

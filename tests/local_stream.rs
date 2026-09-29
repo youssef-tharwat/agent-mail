@@ -26,7 +26,7 @@ fn draft(id: &str) -> WorkDraft {
         id: id.into(),
         scope: "Review change".into(),
         owner: "owner".into(),
-        state: "custom-state".into(),
+        state: agent_mail::states::TaskState::Active,
         next_action: "Review evidence".into(),
         deadline: None,
         evidence: vec![],
@@ -136,7 +136,7 @@ async fn attention_does_not_infer_waiting_or_completion() -> Result<()> {
             agent_mail::work::WorkUpdate {
                 version: 1,
                 patch: WorkPatch {
-                    open: Some(false),
+                    state: Some(agent_mail::states::TaskState::Cancelled),
                     ..Default::default()
                 },
                 reason: ("Accepted").to_owned(),
@@ -163,7 +163,7 @@ async fn doctor_missing_state_is_read_only_and_reports_unknown_trust() -> Result
         report
             .checks
             .iter()
-            .any(|c| c.check == "hook_trust" && c.status == Level::Unknown)
+            .any(|c| c.check == "recovery" && c.status == Level::Unknown)
     );
     assert!(
         report

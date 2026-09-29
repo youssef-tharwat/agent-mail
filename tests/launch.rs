@@ -203,3 +203,24 @@ fn claude_preserves_explicit_settings_and_custom_hooks() -> Result<()> {
     decode(output)?;
     Ok(())
 }
+
+#[test]
+fn bundled_skill_needs_no_state_and_rejects_combined_mutation() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-mail"))
+        .current_dir(temp.path())
+        .arg("--skill")
+        .env("AGENT_MAIL_STATE_DIR", temp.path().join("absent"))
+        .output()?;
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout)?, agent_mail::SKILL);
+    assert!(!temp.path().join("absent").exists());
+    assert!(
+        !Command::new(env!("CARGO_BIN_EXE_agent-mail"))
+            .args(["--skill", "init", "oops"])
+            .output()?
+            .status
+            .success()
+    );
+    Ok(())
+}

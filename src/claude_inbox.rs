@@ -3,6 +3,7 @@
 //! Startup hooks register the session's exported socket. Socket writes are only
 //! attempts: a matching UserPromptSubmit hook confirms receipt and supplies fresh
 //! bounded context. No model acknowledgment, terminal client or permission relay.
+use crate::states::InboxActivity;
 use crate::{
     identity::Binding,
     store::{Mailbox, Store},
@@ -20,26 +21,7 @@ use uuid::Uuid;
 
 const PREFIX: &str = "Agent Mail delivery ";
 
-/// Lifecycle boundaries supported by the native inbox adapter.
-#[derive(Deserialize, PartialEq, Eq)]
-pub enum Event {
-    /// Start, resume or compact the native session.
-    SessionStart,
-    /// End the native session.
-    SessionEnd,
-    /// Native input was admitted to the prompt pipeline.
-    UserPromptSubmit,
-    /// A tool call is about to run.
-    PreToolUse,
-    /// A tool call completed.
-    PostToolUse,
-    /// Compaction invalidated previously supplied context.
-    PostCompact,
-    /// Claude is considering ending its current turn.
-    Stop,
-    /// The turn ended with a runtime failure.
-    StopFailure,
-}
+pub use crate::states::HookEvent as Event;
 
 /// Native lifecycle input. Unknown client fields are intentionally ignored.
 #[derive(Deserialize)]
@@ -56,7 +38,7 @@ pub struct Input {
 pub(crate) struct Endpoint {
     pub token: String,
     pub socket_identity: String,
-    pub activity: String,
+    pub activity: InboxActivity,
 }
 
 fn socket_identity(path: &Path, owner: u32) -> Result<String> {
@@ -71,7 +53,7 @@ fn socket_identity(path: &Path, owner: u32) -> Result<String> {
 
 impl Store {
     pub(crate) async fn claude_inbox(&self, actor: &Mailbox) -> Result<Option<Endpoint>> {
-        Ok(sqlx::query!("SELECT token,socket_identity,activity FROM claude_inboxes i JOIN runtime_wakes w ON w.recipient=i.recipient WHERE i.recipient=? AND w.binding_version=? AND w.runtime='claude'", actor.id, actor.binding_version)
+        Ok(sqlx::query!("SELECT token,socket_identity,activity AS 'activity: InboxActivity' FROM claude_inboxes i JOIN runtime_wakes w ON w.recipient=i.recipient WHERE i.recipient=? AND w.binding_version=? AND w.runtime='claude'", actor.id, actor.binding_version)
             .fetch_optional(self.pool()).await?.map(|r| Endpoint {token:r.token,socket_identity:r.socket_identity,activity:r.activity}))
     }
 
@@ -167,10 +149,11 @@ impl Store {
         }
         let endpoint = sqlx::query!("SELECT i.pending_id,i.pending_event FROM claude_inboxes i JOIN runtime_wakes w ON w.recipient=i.recipient WHERE i.recipient=? AND w.binding_version=? AND w.socket=? AND w.thread=? AND i.token=? AND i.socket_identity=?",actor.id,actor.binding_version,socket,session,token,identity).fetch_optional(&mut *tx).await?.context("Claude inbox is not registered for this session; restart with its startup hook")?;
         let activity = match input.hook_event_name {
-            Event::Stop | Event::StopFailure => "idle",
-            Event::SessionEnd => "ended",
-            _ => "active",
+            Event::Stop | Event::StopFailure => InboxActivity::Idle,
+            Event::SessionEnd => InboxActivity::Ended,
+            _ => InboxActivity::Active,
         };
+        let activity = activity.as_str();
         sqlx::query!(
             "UPDATE claude_inboxes SET activity=? WHERE recipient=?",
             activity,
@@ -217,7 +200,7 @@ fn notification(id: &str) -> String {
 /// Check the registered socket identity without injecting a message.
 pub(crate) fn verify(store: &Store, socket: &Path, endpoint: &Endpoint) -> Result<()> {
     ensure!(
-        endpoint.activity != "ended",
+        endpoint.activity != InboxActivity::Ended,
         "Claude session ended; resume it normally"
     );
     ensure!(

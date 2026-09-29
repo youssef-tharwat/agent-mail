@@ -5,6 +5,7 @@
 //! Both subprocess output streams are bounded while reading, and exchange failures
 //! kill and reap the child. Business operations accept Unix seconds from their caller.
 
+use crate::states::MessageState;
 use crate::{BODY_LIMIT, SUMMARY_LIMIT, bounded, name, store::Store, work::WorkItem};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -824,8 +825,8 @@ async fn apply_event(
             let id = message.to_string();
             let result = sqlx::query!("UPDATE deliveries SET state='resolved',resolution=? WHERE message=(SELECT id FROM messages WHERE global_id=?) AND recipient=(SELECT id FROM mailboxes WHERE group_name=? AND name=?) AND state='pending'",
                 resolution, id, group, recipient).execute(&mut **tx).await?;
-            ensure!(result.rows_affected() == 1 || sqlx::query!("SELECT d.state FROM deliveries d JOIN messages m ON m.id=d.message JOIN mailboxes b ON b.id=d.recipient WHERE m.global_id=? AND b.group_name=? AND b.name=?", id, group, recipient)
-                .fetch_optional(&mut **tx).await?.is_some_and(|r| r.state == "resolved"), "resolution has no pending delivery");
+            ensure!(result.rows_affected() == 1 || sqlx::query!("SELECT d.state AS 'state: MessageState' FROM deliveries d JOIN messages m ON m.id=d.message JOIN mailboxes b ON b.id=d.recipient WHERE m.global_id=? AND b.group_name=? AND b.name=?", id, group, recipient)
+                .fetch_optional(&mut **tx).await?.is_some_and(|r| r.state == MessageState::Resolved), "resolution has no pending delivery");
         }
         Event::Withdrawal {
             group,

@@ -68,7 +68,7 @@ async fn claude_uses_shared_delivery_recovery_cancellation_and_retry_rules() -> 
                 id: "task".into(),
                 scope: "Review".into(),
                 owner: "owner".into(),
-                state: "custom".into(),
+                state: agent_mail::states::TaskState::Active,
                 next_action: "Inspect".into(),
                 deadline: Some(1001),
                 evidence: vec![],
@@ -82,7 +82,7 @@ async fn claude_uses_shared_delivery_recovery_cancellation_and_retry_rules() -> 
     active.store(false, Ordering::SeqCst);
     service::tick(&store, 1001).await?;
     assert_eq!(delivered.load(Ordering::SeqCst), 1);
-    assert!(store.work_show(&owner, "task").await?.open);
+    assert!(store.work_show(&owner, "task").await?.state.is_open());
     assert!(store.notifications(&owner, 0).await?.is_empty());
     store.close().await;
     let store = Store::open(dir.path(), false).await?;
@@ -96,7 +96,7 @@ async fn claude_uses_shared_delivery_recovery_cancellation_and_retry_rules() -> 
             agent_mail::work::WorkUpdate {
                 version: 1,
                 patch: WorkPatch {
-                    open: Some(false),
+                    state: Some(agent_mail::states::TaskState::Cancelled),
                     ..Default::default()
                 },
                 reason: ("Cancel").to_owned(),
@@ -116,7 +116,7 @@ async fn claude_uses_shared_delivery_recovery_cancellation_and_retry_rules() -> 
             agent_mail::work::WorkUpdate {
                 version: 2,
                 patch: WorkPatch {
-                    open: Some(true),
+                    state: Some(agent_mail::states::TaskState::Active),
                     ..Default::default()
                 },
                 reason: ("Reopen").to_owned(),

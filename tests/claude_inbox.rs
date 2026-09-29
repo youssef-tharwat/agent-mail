@@ -16,10 +16,10 @@ use tokio::{
 };
 use uuid::Uuid;
 
-fn input(session_id: Uuid, event: &str, prompt: String) -> Input {
+fn input(session_id: Uuid, event: agent_mail::states::HookEvent, prompt: String) -> Input {
     Input {
         session_id,
-        hook_event_name: serde_json::from_value(Value::String(event.into())).unwrap(),
+        hook_event_name: event,
         prompt,
     }
 }
@@ -55,7 +55,11 @@ async fn socket_write_is_unconfirmed_until_matching_hook_and_cancellation_uses_p
     store
         .claude_inbox_hook(
             &actor,
-            &input(session, "SessionStart", String::new()),
+            &input(
+                session,
+                agent_mail::states::HookEvent::SessionStart,
+                String::new(),
+            ),
             &socket,
             "fixture-token",
         )
@@ -67,7 +71,7 @@ async fn socket_write_is_unconfirmed_until_matching_hook_and_cancellation_uses_p
                 id: "task".into(),
                 scope: "Review".into(),
                 owner: "worker".into(),
-                state: "active".into(),
+                state: agent_mail::states::TaskState::Active,
                 next_action: "Inspect evidence".into(),
                 deadline: None,
                 evidence: vec![],
@@ -96,7 +100,11 @@ async fn socket_write_is_unconfirmed_until_matching_hook_and_cancellation_uses_p
         store
             .claude_inbox_hook(
                 &actor,
-                &input(Uuid::new_v4(), "UserPromptSubmit", prompt.clone()),
+                &input(
+                    Uuid::new_v4(),
+                    agent_mail::states::HookEvent::UserPromptSubmit,
+                    prompt.clone()
+                ),
                 &socket,
                 "fixture-token"
             )
@@ -107,7 +115,11 @@ async fn socket_write_is_unconfirmed_until_matching_hook_and_cancellation_uses_p
         store
             .claude_inbox_hook(
                 &actor,
-                &input(session, "UserPromptSubmit", "unrelated".into()),
+                &input(
+                    session,
+                    agent_mail::states::HookEvent::UserPromptSubmit,
+                    "unrelated".into()
+                ),
                 &socket,
                 "fixture-token"
             )
@@ -118,7 +130,11 @@ async fn socket_write_is_unconfirmed_until_matching_hook_and_cancellation_uses_p
     let context = store
         .claude_inbox_hook(
             &actor,
-            &input(session, "UserPromptSubmit", prompt.clone()),
+            &input(
+                session,
+                agent_mail::states::HookEvent::UserPromptSubmit,
+                prompt.clone(),
+            ),
             &socket,
             "fixture-token",
         )
@@ -126,12 +142,16 @@ async fn socket_write_is_unconfirmed_until_matching_hook_and_cancellation_uses_p
         .unwrap();
     assert!(context.to_string().contains("Inspect evidence"));
     assert!(store.notifications(&actor, 0).await?.is_empty());
-    assert!(store.work_show(&actor, "task").await?.open);
+    assert!(store.work_show(&actor, "task").await?.state.is_open());
     assert!(
         store
             .claude_inbox_hook(
                 &actor,
-                &input(session, "UserPromptSubmit", prompt),
+                &input(
+                    session,
+                    agent_mail::states::HookEvent::UserPromptSubmit,
+                    prompt
+                ),
                 &socket,
                 "fixture-token"
             )
@@ -145,7 +165,7 @@ async fn socket_write_is_unconfirmed_until_matching_hook_and_cancellation_uses_p
             agent_mail::work::WorkUpdate {
                 version: 1,
                 patch: WorkPatch {
-                    open: Some(false),
+                    state: Some(agent_mail::states::TaskState::Cancelled),
                     ..Default::default()
                 },
                 reason: ("Cancel").to_owned(),
@@ -188,7 +208,11 @@ async fn lost_hooks_keep_bounded_attempts_across_resume_and_identity_rotation() 
     store
         .claude_inbox_hook(
             &actor,
-            &input(session, "SessionStart", String::new()),
+            &input(
+                session,
+                agent_mail::states::HookEvent::SessionStart,
+                String::new(),
+            ),
             &socket,
             "fixture-token",
         )
@@ -200,7 +224,7 @@ async fn lost_hooks_keep_bounded_attempts_across_resume_and_identity_rotation() 
                 id: "task".into(),
                 scope: "Review".into(),
                 owner: "worker".into(),
-                state: "active".into(),
+                state: agent_mail::states::TaskState::Active,
                 next_action: "Inspect".into(),
                 deadline: None,
                 evidence: vec![],
@@ -214,7 +238,11 @@ async fn lost_hooks_keep_bounded_attempts_across_resume_and_identity_rotation() 
     store
         .claude_inbox_hook(
             &actor,
-            &input(session, "SessionStart", String::new()),
+            &input(
+                session,
+                agent_mail::states::HookEvent::SessionStart,
+                String::new(),
+            ),
             &socket,
             "fixture-token",
         )
@@ -236,7 +264,11 @@ async fn lost_hooks_keep_bounded_attempts_across_resume_and_identity_rotation() 
         store
             .claude_inbox_hook(
                 &actor,
-                &input(Uuid::new_v4(), "SessionStart", String::new()),
+                &input(
+                    Uuid::new_v4(),
+                    agent_mail::states::HookEvent::SessionStart,
+                    String::new()
+                ),
                 &socket,
                 "fixture-token"
             )
@@ -248,7 +280,11 @@ async fn lost_hooks_keep_bounded_attempts_across_resume_and_identity_rotation() 
         store
             .claude_inbox_hook(
                 &actor,
-                &input(session, "SessionStart", String::new()),
+                &input(
+                    session,
+                    agent_mail::states::HookEvent::SessionStart,
+                    String::new()
+                ),
                 &socket,
                 "fixture-token"
             )
@@ -275,7 +311,11 @@ async fn replaced_socket_is_rejected_and_exit_authenticates_after_unlink() -> Re
     store
         .claude_inbox_hook(
             &actor,
-            &input(session, "SessionStart", String::new()),
+            &input(
+                session,
+                agent_mail::states::HookEvent::SessionStart,
+                String::new(),
+            ),
             &socket,
             "fixture-token",
         )
@@ -288,7 +328,7 @@ async fn replaced_socket_is_rejected_and_exit_authenticates_after_unlink() -> Re
         store
             .claude_inbox_hook(
                 &actor,
-                &input(session, "Stop", String::new()),
+                &input(session, agent_mail::states::HookEvent::Stop, String::new()),
                 &socket,
                 "fixture-token"
             )
@@ -301,7 +341,11 @@ async fn replaced_socket_is_rejected_and_exit_authenticates_after_unlink() -> Re
         store
             .claude_inbox_hook(
                 &actor,
-                &input(Uuid::new_v4(), "SessionEnd", String::new()),
+                &input(
+                    Uuid::new_v4(),
+                    agent_mail::states::HookEvent::SessionEnd,
+                    String::new()
+                ),
                 &socket,
                 "fixture-token"
             )
@@ -312,7 +356,11 @@ async fn replaced_socket_is_rejected_and_exit_authenticates_after_unlink() -> Re
         store
             .claude_inbox_hook(
                 &actor,
-                &input(session, "SessionEnd", String::new()),
+                &input(
+                    session,
+                    agent_mail::states::HookEvent::SessionEnd,
+                    String::new()
+                ),
                 &socket,
                 "wrong-token"
             )
@@ -322,7 +370,11 @@ async fn replaced_socket_is_rejected_and_exit_authenticates_after_unlink() -> Re
     store
         .claude_inbox_hook(
             &actor,
-            &input(session, "SessionEnd", String::new()),
+            &input(
+                session,
+                agent_mail::states::HookEvent::SessionEnd,
+                String::new(),
+            ),
             &socket,
             "fixture-token",
         )
@@ -352,7 +404,11 @@ async fn detach_survives_startup_hooks_until_explicit_enable() -> Result<()> {
     store
         .claude_inbox_hook(
             &actor,
-            &input(session, "SessionStart", String::new()),
+            &input(
+                session,
+                agent_mail::states::HookEvent::SessionStart,
+                String::new(),
+            ),
             &socket,
             "fixture-token",
         )
@@ -363,7 +419,11 @@ async fn detach_survives_startup_hooks_until_explicit_enable() -> Result<()> {
     store
         .claude_inbox_hook(
             &actor,
-            &input(session, "SessionStart", String::new()),
+            &input(
+                session,
+                agent_mail::states::HookEvent::SessionStart,
+                String::new(),
+            ),
             &socket,
             "fixture-token",
         )
@@ -373,7 +433,11 @@ async fn detach_survives_startup_hooks_until_explicit_enable() -> Result<()> {
     store
         .claude_inbox_hook(
             &actor,
-            &input(session, "SessionStart", String::new()),
+            &input(
+                session,
+                agent_mail::states::HookEvent::SessionStart,
+                String::new(),
+            ),
             &socket,
             "fixture-token",
         )

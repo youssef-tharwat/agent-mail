@@ -117,3 +117,25 @@ pub async fn probe(socket: &Path, thread: Uuid) -> Result<serde_json::Value> {
         Ok(json!({"client":client.server_version,"persistent":true,"state":match live.status {ThreadStatus::Idle=>"idle",ThreadStatus::Active=>"active",ThreadStatus::NotLoaded=>"not_loaded",ThreadStatus::SystemError=>"system_error"},"safe_queue":true,"receipt":"queue_accepted"}))
     }).await.context("Codex probe timed out")?
 }
+
+/// Find the sole loaded thread on a launcher-owned private server.
+/// Multiple loaded threads are ambiguous and are never guessed.
+pub async fn sole_loaded_thread(socket: &Path) -> Result<Option<Uuid>> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut client = Client::connect(socket).await?;
+        let result = client
+            .call("thread/loaded/list", json!({"limit":2}))
+            .await?;
+        let ids = result["data"]
+            .as_array()
+            .context("loaded thread list missing data")?;
+        if ids.len() != 1 || !result["nextCursor"].is_null() {
+            return Ok(None);
+        }
+        Ok(Some(Uuid::parse_str(
+            ids[0].as_str().context("loaded thread ID")?,
+        )?))
+    })
+    .await
+    .context("loaded thread lookup timed out")?
+}

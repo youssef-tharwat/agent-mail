@@ -12,17 +12,17 @@ One native CLI. No account or hosted service. Herdr and Fleet Campaign are optio
 
 ## Install
 
-Install both the CLI and the required agent skill:
+Install the CLI (the required agent skill is bundled):
 
 ```sh
 brew install youssef-tharwat/tap/agent-mail
-npx skills add youssef-tharwat/agent-mail --skill agent-mail -g
+agent-mail --skill
 ```
 
 Prebuilt macOS and Linux binaries for ARM64 and x86-64. **No Cargo or Rust compiler
-required.** The skill installer uses Node/npm; select every agent client that
-will use Mail. The [skill](skills/agent-mail/SKILL.md) supplies the handoff and
-decision rules agents need. [Installation details](docs/usage.md#install).
+required.** No Node/npm needed. Startup hooks supply the version-matched
+[skill](skills/agent-mail/SKILL.md); `--skill` prints it for other integrations.
+[Installation details](docs/usage.md#install).
 
 ## Quick start
 
@@ -65,7 +65,7 @@ receiving a message never marks a task complete.
 
 ## Connect your agents
 
-For automatic recovery and idle wake, configure a runtime and run the Mail worker:
+Run the delivery worker in another terminal for automatic idle wake:
 
 ```sh
 agent-mail service run
@@ -74,7 +74,7 @@ agent-mail service run
 | Runtime | Setup |
 | --- | --- |
 | Claude Code | [Normal terminal with native inbox hooks](docs/usage.md#claude-code) |
-| Codex | [Lifecycle hooks and app-server attachment](docs/usage.md#codex) |
+| Codex | [Managed local socket and lifecycle hooks](docs/usage.md#codex) |
 | Herdr | [Optional plugin and verified pane binding](docs/usage.md#optional-herdr-integration) |
 
 Mail keeps durable tasks, messages and bounded delivery retries. Your runtime owns
@@ -93,7 +93,8 @@ herdr plugin install youssef-tharwat/agent-mail
 ```
 
 The plugin downloads a verified release binary; it does not require Cargo.
-Install the required agent skill above for the clients running inside Herdr too.
+For Herdr clients, install the discoverable skill or load `agent-mail --skill`
+at session startup; the instructions remain required.
 [Setup and binding](docs/usage.md#optional-herdr-integration).
 
 ## Documentation and help
@@ -104,7 +105,8 @@ Install the required agent skill above for the clients running inside Herdr too.
 - [Live runtime validation](docs/native-inbox-acceptance.md).
 - [Issues](https://github.com/youssef-tharwat/agent-mail/issues): bugs and feature requests.
 
-v0.5 renames `participant` to `agent` and adds `run`. Existing users should follow
+v0.6 bundles the operating skill and derives task closure from typed states.
+Existing users should follow
 [the upgrade guide](docs/usage.md#upgrading) before updating their store.
 
 ## Contributing

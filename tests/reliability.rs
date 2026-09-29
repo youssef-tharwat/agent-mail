@@ -49,10 +49,10 @@ fn agent(pane: &str) -> Agent {
         agent: Some("codex".into()),
         agent_session: Some(Session {
             agent: "codex".into(),
-            kind: "id".into(),
+            kind: agent_mail::states::SessionKind::Id,
             value: format!("session-{pane}"),
         }),
-        agent_status: "idle".into(),
+        agent_status: agent_mail::herdr::AgentStatus::Idle,
         interactive_ready: true,
         launch_pending: false,
         cwd: None,
@@ -253,7 +253,10 @@ async fn reply_and_resolution_are_atomic_and_idempotent() -> Result<()> {
             .await
             .is_err()
     );
-    assert_eq!(f.store.message(&f.b, bad).await?.state, "pending");
+    assert_eq!(
+        f.store.message(&f.b, bad).await?.state,
+        agent_mail::states::MessageState::Pending
+    );
     Ok(())
 }
 
@@ -264,7 +267,10 @@ async fn withdrawal_does_not_erase_history() -> Result<()> {
     assert!(f.store.withdraw(&f.b, id, 1_000).await.is_err());
     f.store.withdraw(&f.a, id, 1_000).await?;
     assert!(f.store.inbox(&f.b, 0).await?.is_empty());
-    assert_eq!(f.store.message(&f.b, id).await?.state, "withdrawn");
+    assert_eq!(
+        f.store.message(&f.b, id).await?.state,
+        agent_mail::states::MessageState::Withdrawn
+    );
     assert_eq!(f.send("withdraw").await?, id);
     assert!(
         f.store
@@ -345,10 +351,11 @@ async fn blocked_working_missing_and_disabled_agents_are_not_prompted() -> Resul
     let f = Fixture::new().await?;
     f.send("held").await?;
     for status in ["working", "blocked", "unknown"] {
-        f.host.lock().await.agents[1].agent_status = status.into();
+        f.host.lock().await.agents[1].agent_status =
+            serde_json::from_value(serde_json::json!(status))?;
         service::tick(&f.store, 1000).await?;
     }
-    f.host.lock().await.agents[1].agent_status = "idle".into();
+    f.host.lock().await.agents[1].agent_status = agent_mail::herdr::AgentStatus::Idle;
     f.host.lock().await.agents[1].agent_session = None;
     service::tick(&f.store, 1000).await?;
     f.host.lock().await.agents[1] = agent("w1:p2");
@@ -541,7 +548,7 @@ async fn work_writer_versions_and_mail_links_survive_restart() -> Result<()> {
                 id: "lane-api".into(),
                 scope: "Implement the API".into(),
                 owner: "b".into(),
-                state: "implementing".into(),
+                state: agent_mail::states::TaskState::Active,
                 next_action: "Produce evidence".into(),
                 deadline: Some(2000),
                 evidence: vec!["commit:abc".into()],
@@ -574,7 +581,7 @@ async fn work_writer_versions_and_mail_links_survive_restart() -> Result<()> {
             agent_mail::work::WorkUpdate {
                 version: 1,
                 patch: WorkPatch {
-                    state: Some("review".into()),
+                    state: Some(agent_mail::states::TaskState::Review),
                     next_action: Some("Review commit abc".into()),
                     ..WorkPatch::default()
                 },
@@ -611,8 +618,8 @@ async fn work_writer_versions_and_mail_links_survive_restart() -> Result<()> {
     f.store.resolve(&f.b, id, "reviewed", None, 1004).await?;
     let reopened = Store::open(f.store.root(), false).await?;
     let current = reopened.work_show(&f.b, "lane-api").await?;
-    assert_eq!(current.state, "review");
-    assert!(current.open);
+    assert_eq!(current.state, agent_mail::states::TaskState::Review);
+    assert!(current.state.is_open());
     assert_eq!(current.accepted_revision, None);
     assert_eq!(reopened.work_history(&f.a, "lane-api").await?.len(), 2);
     Ok(())
@@ -629,7 +636,7 @@ async fn context_is_bounded_and_reveals_owned_work_and_mail() -> Result<()> {
                     id: format!("lane-{i}"),
                     scope: "A bounded scope".into(),
                     owner: "b".into(),
-                    state: "active".into(),
+                    state: agent_mail::states::TaskState::Active,
                     next_action: "Produce the next revision".into(),
                     deadline: None,
                     evidence: vec![],
@@ -675,7 +682,7 @@ async fn safe_default_holds_unguarded_prompts_without_losing_mail() -> Result<()
     assert!(
         observations
             .iter()
-            .any(|o| o.state.contains("automatic agent prompts disabled"))
+            .any(|o| o.state == agent_mail::states::DeliveryState::PromptDisabled)
     );
     Ok(())
 }
@@ -713,11 +720,8 @@ async fn standalone_and_herdr_share_mail_without_sharing_session_authority() -> 
             .success()
     );
     let observed = service::tick(&f.store, 1001).await?;
-    assert!(
-        observed
-            .iter()
-            .any(|o| o.participant == "standalone" && o.state.contains("unknown"))
-    );
+    assert!(observed.iter().any(|o| o.participant == "standalone"
+        && o.state == agent_mail::states::DeliveryState::Unavailable));
     assert!(f.host.lock().await.prompts.is_empty());
     assert_eq!(f.store.inbox(&standalone, 0).await?.len(), 1);
     let rotated = f.store.register("g", "standalone", true).await?;
@@ -800,7 +804,7 @@ async fn work_only_changes_wake_without_separate_mail_and_keep_retry_budget() ->
                 id: "assignment".into(),
                 scope: "Review changes".into(),
                 owner: f.b.name.clone(),
-                state: "active".into(),
+                state: agent_mail::states::TaskState::Active,
                 next_action: "Inspect evidence".into(),
                 deadline: None,
                 evidence: vec![],

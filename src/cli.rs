@@ -1,5 +1,6 @@
 //! Public workflow-oriented command grammar and validation before mutation.
 use super::{Bridge, Command, RunArgs, Service, WorkCommand, read_body};
+use agent_mail::states::{NativeRuntime, TaskState};
 use agent_mail::{
     store::Store,
     supervision,
@@ -33,8 +34,11 @@ pub(super) struct Cli {
         hide_env_values = true
     )]
     session: Option<Uuid>,
+    /// Print the bundled, version-matched agent skill.
+    #[arg(long)]
+    skill: bool,
     #[command(subcommand)]
-    command: Action,
+    command: Option<Action>,
 }
 #[derive(Subcommand)]
 enum Action {
@@ -148,9 +152,9 @@ enum Task {
         /// Initial next action when it differs from the task scope.
         #[arg(long)]
         next_action: Option<String>,
-        /// Workflow-defined initial state.
+        /// Initial task lifecycle status.
         #[arg(long, default_value = "open")]
-        state: String,
+        state: TaskState,
         /// UTC deadline, e.g. 2026-10-01T12:00:00Z.
         #[arg(long,value_parser=parse_deadline)]
         deadline: Option<i64>,
@@ -189,18 +193,12 @@ struct Changes {
     /// New responsible agent.
     #[arg(long)]
     owner: Option<String>,
-    /// Workflow-defined state label.
+    /// Task status; done, accepted and cancelled close the assignment.
     #[arg(long)]
-    state: Option<String>,
+    state: Option<TaskState>,
     /// Next business action expected from the owner.
     #[arg(long)]
     next_action: Option<String>,
-    /// Mark the assignment closed; does not infer acceptance.
-    #[arg(long, conflicts_with = "reopen")]
-    close: bool,
-    /// Reopen the assignment without inferring a workflow state.
-    #[arg(long)]
-    reopen: bool,
     /// UTC RFC3339 deadline; use JSON null to clear it.
     #[arg(long,value_parser=parse_deadline)]
     deadline: Option<i64>,
@@ -243,11 +241,6 @@ enum Agent {
     },
 }
 #[derive(ValueEnum, Clone, Copy)]
-enum Client {
-    Claude,
-    Codex,
-}
-#[derive(ValueEnum, Clone, Copy)]
 enum HerdrPolicy {
     Notify,
     Unguarded,
@@ -257,7 +250,7 @@ enum Runtime {
     /// Generate a separate hook settings file without changing global settings.
     Configure {
         #[arg(value_enum)]
-        client: Client,
+        client: NativeRuntime,
         #[arg(long)]
         output: PathBuf,
     },
@@ -390,13 +383,22 @@ fn parse_deadline(value: &str) -> std::result::Result<i64, String> {
 
 impl Cli {
     pub(super) async fn prepare(self) -> Result<Option<RunArgs>> {
+        if self.skill {
+            ensure!(
+                self.command.is_none(),
+                "--skill cannot be combined with a command"
+            );
+            print!("{}", agent_mail::SKILL);
+            return Ok(None);
+        }
+        let command = self.command.context("provide a command or --skill")?;
         let root = supervision::state_root(self.state_dir.clone())?;
-        if let Action::Runtime(Runtime::Configure { client, output }) = &self.command {
+        if let Action::Runtime(Runtime::Configure { client, output }) = &command {
             configure(*client, output)?;
             return Ok(None);
         }
         let scoped = !matches!(
-            &self.command,
+            &command,
             Action::Init { .. }
                 | Action::Service(_)
                 | Action::Status { check: None }
@@ -413,7 +415,7 @@ impl Cli {
         let group = if scoped {
             let store = Store::open(&root, false).await?;
             let agent = matches!(
-                &self.command,
+                &command,
                 Action::Context { .. } | Action::Mail(_) | Action::Task(_) | Action::Adapter(_)
             );
             let selected = store
@@ -424,11 +426,11 @@ impl Cli {
         } else {
             self.group.clone().unwrap_or_default()
         };
-        if let Action::Run { name, command } = &self.command {
+        if let Action::Run { name, command } = &command {
             super::launch::launch(&root, &group, name, command).await?;
             return Ok(None);
         }
-        let command = match self.command {
+        let command = match command {
             Action::Run { .. } => unreachable!("handled before dispatch"),
             Action::Init { name } => {
                 ensure!(
@@ -583,7 +585,7 @@ impl Cli {
                             serde_json::from_str::<WorkUpdate>(&read_body(&path)?)?
                         } else {
                             WorkUpdate{version:c.version.context("supply --version from task show, or --file with a complete update")?,reason:c.reason.context("supply --reason for the change")?,resolve_message:c.resolve,
-                        patch:WorkPatch{owner:c.owner,state:c.state,next_action:c.next_action,open:if c.close{Some(false)}else if c.reopen{Some(true)}else{None},deadline:c.deadline.map(Some),accepted_revision:c.accepted_revision.map(Some),evidence:if c.evidence.is_empty(){None}else{Some(c.evidence)}}}
+                        patch:WorkPatch{owner:c.owner,state:c.state,next_action:c.next_action,deadline:c.deadline.map(Some),accepted_revision:c.accepted_revision.map(Some),evidence:if c.evidence.is_empty(){None}else{Some(c.evidence)}}}
                         };
                         WorkCommand::Decide { group, id, update }
                     }
@@ -667,8 +669,8 @@ impl Cli {
     }
 }
 
-fn configure(client: Client, path: &std::path::Path) -> Result<()> {
-    let claude = matches!(client, Client::Claude);
+fn configure(client: NativeRuntime, path: &std::path::Path) -> Result<()> {
+    let claude = matches!(client, NativeRuntime::Claude);
     let content = serde_json::to_vec_pretty(&super::launch::hook_settings(claude, "agent-mail"))?;
     if path.exists() {
         ensure!(

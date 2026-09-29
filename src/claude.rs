@@ -23,6 +23,18 @@ use tokio::{
 };
 use uuid::Uuid;
 
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CommandState {
+    Queued,
+    Started,
+    Completed,
+    Cancelled,
+    Failed,
+    #[serde(other)]
+    Unknown,
+}
+
 const FRAME_LIMIT: usize = 4 * 1024 * 1024;
 /// Observed Claude bridge identity, capabilities, and activity generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,19 +230,21 @@ impl RuntimeState {
             let id = value["command_uuid"]
                 .as_str()
                 .context("Claude lifecycle has no command UUID")?;
-            match value["state"].as_str() {
-                Some("queued") => {
+            match serde_json::from_value::<CommandState>(value["state"].clone())
+                .unwrap_or(CommandState::Unknown)
+            {
+                CommandState::Queued => {
                     self.active.insert(id.into());
                     return Ok(Uuid::parse_str(id).ok());
                 }
-                Some("started") => {
+                CommandState::Started => {
                     self.active.insert(id.into());
                 }
-                Some("completed" | "cancelled" | "failed") => {
+                CommandState::Completed | CommandState::Cancelled | CommandState::Failed => {
                     self.active.remove(id);
                     self.epoch += 1;
                 }
-                _ => {
+                CommandState::Unknown => {
                     self.ready = false;
                 }
             }

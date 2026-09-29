@@ -140,7 +140,7 @@ The runtime registry and Mail agent registry continue to have separate owners.
   Pagination cursors remain available when a response says there is more.
 - Keep `--version` and `--reason` on work changes. Never silently fetch the latest
   version and overwrite a decision based on stale context.
-- Business state names stay workflow-defined. Do not add built-in `accept`,
+- Task states use the fixed lifecycle enum; transition policy stays workflow-defined. Do not add built-in `accept`,
   `review`, `approve` or Fleet-specific transitions merely to shorten commands.
 
 ## 3. One work mutation, with automatic retry identity
@@ -240,7 +240,6 @@ acceptance with one update, using the version actually observed:
   "reason": "Reviewed corrected evidence",
   "patch": {
     "state": "accepted",
-    "open": false,
     "accepted_revision": "def456",
     "evidence": ["ci/run/42"]
   },

@@ -23,7 +23,7 @@ SCENES = (
      'Result saved. Waiting for a decision.', 'The message stays pending until explicitly resolved.'),
     ('Accept and resolve', 'coordinator',
      ['agent-mail task update api --version 1 --reason "Reviewed" \\',
-      '  --state accepted --close --accepted-revision abc123 \\',
+      '  --state accepted --accepted-revision abc123 \\',
       '  --resolve 1'],
      'api  /  accepted  /  abc123', 'Task closed and linked message resolved together.'),
 )

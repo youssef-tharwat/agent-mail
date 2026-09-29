@@ -169,12 +169,7 @@ fn standalone_identity_is_scoped_and_never_infers_liveness() -> Result<()> {
         &["mail", "send", "b", "Check mail", "--key", "one"],
     )?;
     let status = d.ok(None, &["service", "run", "--once"])?;
-    assert!(
-        status["observations"][0]["state"]
-            .as_str()
-            .unwrap()
-            .contains("unknown")
-    );
+    assert_eq!(status["observations"][0]["state"], "unavailable");
     let list = d.ok(None, &["agent", "list", "--group", "default"])?;
     assert!(!list.to_string().contains(&a));
     assert!(!list.to_string().contains(&b));
@@ -230,7 +225,8 @@ fn natural_retries_and_short_replies_preserve_one_logical_change() -> Result<()>
                 "1",
                 "--reason",
                 "Different",
-                "--close"
+                "--state",
+                "accepted"
             ]
         )?
         .status

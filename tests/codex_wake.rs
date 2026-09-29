@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 struct Server {
     received: Arc<AtomicUsize>,
+    loaded: Arc<std::sync::Mutex<Value>>,
     lose: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
     unloaded: Arc<AtomicBool>,
@@ -24,6 +25,10 @@ impl Drop for Server {
     }
 }
 fn server(listener: UnixListener, thread: Uuid) -> Server {
+    let loaded = Arc::new(std::sync::Mutex::new(
+        json!({"data":[thread],"nextCursor":null}),
+    ));
+    let loaded_response = loaded.clone();
     let received = Arc::new(AtomicUsize::new(0));
     let lose = Arc::new(AtomicBool::new(false));
     let active = Arc::new(AtomicBool::new(false));
@@ -33,6 +38,7 @@ fn server(listener: UnixListener, thread: Uuid) -> Server {
     let task = tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let absent = absent.clone();
+            let loaded = loaded_response.clone();
             let (count, loss, busy) = (count.clone(), loss.clone(), busy.clone());
             tokio::spawn(async move {
                 let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
@@ -45,6 +51,7 @@ fn server(listener: UnixListener, thread: Uuid) -> Server {
                     };
                     let result = match r["method"].as_str().unwrap() {
                         "initialize" => json!({}),
+                        "thread/loaded/list" => loaded.lock().unwrap().clone(),
                         "thread/read" => {
                             json!({"thread":{"id":thread,"ephemeral":false,"turns":[{"id":"turn-active","status":"inProgress"}],"status":{"type":if absent.load(Ordering::SeqCst){"notLoaded"}else if busy.load(Ordering::SeqCst){"active"}else{"idle"}}}})
                         }
@@ -91,6 +98,7 @@ fn server(listener: UnixListener, thread: Uuid) -> Server {
         }
     });
     Server {
+        loaded,
         received,
         lose,
         active,
@@ -117,7 +125,7 @@ async fn delivery_survives_restart_and_never_accepts_work_or_targets_a_replaceme
                 id: "task".into(),
                 scope: "Review".into(),
                 owner: "worker".into(),
-                state: "active".into(),
+                state: agent_mail::states::TaskState::Active,
                 next_action: "Inspect evidence".into(),
                 deadline: None,
                 evidence: vec![],
@@ -136,7 +144,7 @@ async fn delivery_survives_restart_and_never_accepts_work_or_targets_a_replaceme
     service::tick(&store, 1000).await?;
     assert_eq!(server.received.load(Ordering::SeqCst), 1);
     assert!(store.notifications(&actor, 0).await?.is_empty());
-    assert!(store.work_show(&actor, "task").await?.open);
+    assert!(store.work_show(&actor, "task").await?.state.is_open());
     store.close().await;
     let store = Store::open(dir.path(), false).await?;
     service::tick(&store, 1400).await?;
@@ -171,7 +179,7 @@ async fn lost_receipts_use_durable_bounded_retries_and_pause_is_respected() -> R
                 id: "task".into(),
                 scope: "Review".into(),
                 owner: "worker".into(),
-                state: "active".into(),
+                state: agent_mail::states::TaskState::Active,
                 next_action: "Inspect evidence".into(),
                 deadline: None,
                 evidence: vec![],
@@ -188,7 +196,7 @@ async fn lost_receipts_use_durable_bounded_retries_and_pause_is_respected() -> R
     }
     assert_eq!(server.received.load(Ordering::SeqCst), 3);
     assert!(!store.notifications(&actor, 0).await?.is_empty());
-    assert!(store.work_show(&actor, "task").await?.open);
+    assert!(store.work_show(&actor, "task").await?.state.is_open());
     store.rearm("g", "worker").await?;
     server.lose.store(false, Ordering::SeqCst);
     service::tick(&store, 2000).await?;
@@ -203,7 +211,7 @@ async fn lost_receipts_use_durable_bounded_retries_and_pause_is_respected() -> R
             agent_mail::work::WorkUpdate {
                 version: 1,
                 patch: agent_mail::work::WorkPatch {
-                    state: Some("review".into()),
+                    state: Some(agent_mail::states::TaskState::Review),
                     ..Default::default()
                 },
                 reason: ("Review").to_owned(),
@@ -221,7 +229,7 @@ async fn lost_receipts_use_durable_bounded_retries_and_pause_is_respected() -> R
             agent_mail::work::WorkUpdate {
                 version: 2,
                 patch: agent_mail::work::WorkPatch {
-                    state: Some("active".into()),
+                    state: Some(agent_mail::states::TaskState::Active),
                     ..Default::default()
                 },
                 reason: ("New evidence").to_owned(),
@@ -261,7 +269,7 @@ async fn cancellation_reaches_active_owner_but_idle_closure_does_not_wake() -> R
                     id: "task".into(),
                     scope: "Review".into(),
                     owner: "worker".into(),
-                    state: "active".into(),
+                    state: agent_mail::states::TaskState::Active,
                     next_action: "Inspect evidence".into(),
                     deadline: Some(1100),
                     evidence: vec![],
@@ -283,7 +291,7 @@ async fn cancellation_reaches_active_owner_but_idle_closure_does_not_wake() -> R
                 agent_mail::work::WorkUpdate {
                     version: 1,
                     patch: agent_mail::work::WorkPatch {
-                        open: (!reassigned).then_some(false),
+                        state: (!reassigned).then_some(agent_mail::states::TaskState::Cancelled),
                         owner: reassigned.then(|| "new-owner".into()),
                         ..Default::default()
                     },
@@ -298,7 +306,10 @@ async fn cancellation_reaches_active_owner_but_idle_closure_does_not_wake() -> R
             server.received.load(Ordering::SeqCst),
             if active { 2 } else { 1 }
         );
-        assert_eq!(store.work_show(&writer, "task").await?.open, reassigned);
+        assert_eq!(
+            store.work_show(&writer, "task").await?.state.is_open(),
+            reassigned
+        );
         // Passive records remain available after a reset even without a courtesy turn.
         assert!(
             store
@@ -332,5 +343,65 @@ async fn doctor_rejects_an_unloaded_thread_even_when_its_socket_responds() -> Re
             .any(|c| c.check == "endpoint" && c.status == agent_mail::doctor::Level::Fail)
     );
     assert_eq!(server.received.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn automatic_attachment_requires_current_launch_and_preserves_pause() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let socket = dir.path().join("codex.sock");
+    let thread = Uuid::new_v4();
+    let _server = server(UnixListener::bind(&socket)?, thread);
+    let store = Store::open(dir.path(), true).await?;
+    store.enroll("g", None).await?;
+    store.register("g", "worker", false).await?;
+    let actor = store.mailbox("g", "worker").await?;
+    store
+        .begin_launch(&actor, "new", agent_mail::states::NativeRuntime::Codex)
+        .await?;
+    store
+        .observe_hook(
+            &actor,
+            "new",
+            &thread.to_string(),
+            agent_mail::states::HookEvent::SessionStart,
+            100,
+        )
+        .await?;
+    store
+        .attach_codex_from_hook(&actor, &socket, thread, "old")
+        .await?;
+    assert!(store.native_status().await?.as_array().unwrap().is_empty());
+    store
+        .attach_codex_from_hook(&actor, &socket, thread, "new")
+        .await?;
+    assert_eq!(store.native_status().await?.as_array().unwrap().len(), 1);
+    store.set_runtime_enabled(&actor, false).await?;
+    store
+        .attach_codex_from_hook(&actor, &socket, thread, "new")
+        .await?;
+    assert!(!store.runtime_enabled(&actor).await?);
+    assert!(store.native_status().await?.as_array().unwrap().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn discovery_never_guesses_between_loaded_threads() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let socket = dir.path().join("codex.sock");
+    let thread = Uuid::new_v4();
+    let server = server(UnixListener::bind(&socket)?, thread);
+    assert_eq!(
+        agent_mail::codex::sole_loaded_thread(&socket).await?,
+        Some(thread)
+    );
+    for result in [
+        json!({"data":[]}),
+        json!({"data":[thread,Uuid::new_v4()]}),
+        json!({"data":[thread],"nextCursor":"more"}),
+    ] {
+        *server.loaded.lock().unwrap() = result;
+        assert_eq!(agent_mail::codex::sole_loaded_thread(&socket).await?, None);
+    }
     Ok(())
 }

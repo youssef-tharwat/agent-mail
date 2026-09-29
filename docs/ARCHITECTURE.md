@@ -423,13 +423,43 @@ group and the canonical state path only to the child. Normal registration output
 contains no credential. There is no current-agent file or global identity switch.
 
 For Claude, the launcher prepares a credential-free local hook plugin and passes
-its directory without changing existing settings. For Codex, it adds inline hook
-configuration and disables the shared daemon for that invocation, keeping the
-identity attached to the launched process. Native hook trust and client permissions
-remain enforced. Runtime hooks recover state; the launcher does not infer task
-acceptance, supervise the client, or start the delivery service. Herdr still owns
-its pane-bound launches; `run` refuses those bindings and remote bindings.
+its directory without changing existing settings. Interactive Codex uses a private
+app-server and its native UI over a Unix socket. The launcher discovers the sole
+loaded thread, pins it to this launch and attaches delivery automatically. Empty
+or ambiguous discovery cannot select another thread. Headless Codex disables the
+shared daemon and retains direct execution. Native trust and permissions remain
+enforced. Herdr owns pane-bound launches; `run` refuses those and remote bindings.
 
-Client arguments, terminal streams, signals and exit status survive Unix `exec`.
-An explicit identity replacement invalidates old credentials; the next launch
-reads the replacement while retaining the agent’s tasks and mailbox.
+The interactive Codex launcher owns its two child processes and reaps the private
+backend when the UI exits; termination during startup or discovery also cleans up.
+It does not decide task acceptance or install/start the delivery service. Other
+commands retain Unix `exec` behavior. An explicit identity replacement invalidates
+old credentials while retaining tasks and mail.
+
+### Launch evidence and bundled instructions (schema 13, unreleased)
+
+`runtime_readiness` records the current launch, binding generation, pinned client
+session and last observed hook. Starting a native client clears prior evidence;
+stale-launch or secondary-session hooks cannot establish readiness or replace its
+endpoint. Attaching automatically preserves a persisted delivery pause. Diagnostics
+report historical hook execution separately from live endpoint health and never
+claim model consumption from a hook receipt.
+
+The required skill is compiled into the binary and printed by `--skill` without
+opening state. Recovery supplies it on startup/resume and the first boundary after
+compaction. Ordinary hook emissions retain the existing bounded state payload;
+the fixed skill is not repeated each turn. No separate npm installation is required
+for managed launches. Other integrations may load `--skill` or install a discoverable
+copy. See [live acceptance](native-launch-acceptance.md) for measured behavior.
+
+## Typed state contracts
+
+Task lifecycle is `open`, `ready`, `active`, `blocked`, `review`, `done`,
+`accepted`, or `cancelled`. Actionability is derived from that enum; the SQLite
+`open` column is a checked projection used by event and attention queries.
+The writer still owns transition decisions and evidence requirements.
+Message disposition, coordination event kind, native runtime, session identity
+kind, hook event, inbox activity, recovery evidence and delivery outcomes are
+typed enums. Delivery outcomes carry optional error detail separately. Unknown
+Herdr statuses are conservatively unavailable. Task input rejects unknown states
+and obsolete writable fields before committing any effects.

@@ -16,7 +16,7 @@ async fn concurrent_creation_and_update_retries_commit_once() -> Result<()> {
         id: "task".into(),
         scope: "Review".into(),
         owner: "writer".into(),
-        state: "open".into(),
+        state: agent_mail::states::TaskState::Open,
         next_action: "Review".into(),
         deadline: None,
         evidence: vec![],

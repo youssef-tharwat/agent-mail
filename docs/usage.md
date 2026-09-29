@@ -1,24 +1,22 @@
 # User guide
 
-[README](../README.md) · Agent Mail v0.5
+[README](../README.md) · Agent Mail v0.6
 
 ## Install
 
-Setup requires the CLI and the Agent Mail skill in each participating agent client.
+The binary bundles the required Agent Mail skill.
 With Homebrew:
 
 ```sh
 brew install youssef-tharwat/tap/agent-mail
-npx skills add youssef-tharwat/agent-mail --skill agent-mail -g
+agent-mail --skill
 agent-mail --version
 ```
 
 No Cargo or Rust compiler is required. Prebuilt binaries support macOS 14+ and Linux
 (glibc 2.35+), on Apple Silicon/ARM64 and Intel/x86-64.
 
-The skill installer uses Node/npm. Select every participating client and start
-a new agent session after installation. See [required agent skill](#agent-skill)
-for manual installation.
+Managed launch hooks supply the bundled skill at SessionStart, once per startup/resume and after compaction. Other integrations can load `agent-mail --skill`. No Node/npm is required.
 
 ### Direct download
 
@@ -26,7 +24,7 @@ Download the archive and its checksum from [GitHub Releases](https://github.com/
 For Apple Silicon:
 
 ```sh
-version=0.5.1
+version=0.6.0
 target=aarch64-apple-darwin
 archive="agent-mail-v${version}-${target}.tar.gz"
 base="https://github.com/youssef-tharwat/agent-mail/releases/download/v${version}"
@@ -77,8 +75,9 @@ agent-mail run worker -- claude --resume SESSION_ID
 agent-mail run coordinator -- codex resume SESSION_ID
 ```
 
-The launcher preserves terminal input/output, exit status and signals. It replaces
-itself with the client; it is not a supervisor and does not start the Mail service.
+The launcher preserves terminal input/output, exit status and signals. Interactive
+Codex launches supervise a private backend and terminal client; other commands
+replace the launcher process. Neither mode starts the Mail service.
 For one operator command, the same identity handling works with any executable:
 
 ```sh
@@ -185,7 +184,6 @@ Simple changes use flags; complex changes use a typed JSON document:
   "reason": "Reviewed corrected evidence",
   "patch": {
     "state": "accepted",
-    "open": false,
     "accepted_revision": "def456",
     "evidence": ["ci/run/42"]
   },
@@ -199,15 +197,18 @@ agent-mail task update api-review --file acceptance.json
 ```
 
 The file contains `version`, `reason`, `patch` and optional `resolve_message`.
-Patch fields: `owner`, `state`, `open`, `next_action`, `deadline`,
+Patch fields: `owner`, `state`, `next_action`, `deadline`,
 `accepted_revision`, `evidence`. Omitted fields retain their values; use JSON null
 to clear deadline or accepted revision, and `[]` to clear evidence. JSON deadlines
 are Unix seconds; CLI deadline flags accept UTC timestamps. Unknown fields and
 mixed file/flag updates are rejected.
 
 A linked resolution must refer to a request in the writer's inbox for this task.
-The update, resolution, history and events all commit or all roll back. State names
-are workflow-defined; closing a task does not itself establish acceptance criteria.
+The update, resolution, history and events all commit or all roll back. Task states are `open`, `ready`, `active`, `blocked`, `review`, `done`,
+`accepted` and `cancelled`. The last three are terminal; actionability is derived
+from state. The designated writer chooses transitions and may reopen a task by
+setting an actionable state. `done` records completion; `accepted` records an
+explicit acceptance decision. Workflow rules still define the evidence required.
 Stored/API records retain the field names `work_id` and `work` for task associations
 and recovery summaries; the public command is `task`.
 
@@ -254,15 +255,18 @@ agent-mail run worker -- codex
 
 Mail adds lifecycle hooks through launch-specific Codex configuration. Review and
 trust those hooks in Codex’s native prompt or `/hooks`; untrusted hooks do not run.
-The launcher never bypasses hook trust or sandbox permissions. It uses
-`--no-daemon` so the agent’s identity cannot leak through a shared runtime process.
+The launcher never bypasses hook trust or sandbox permissions. For interactive sessions it starts a private local app-server, connects the native
+UI over a Unix socket, and attaches the sole loaded thread automatically, with hooks confirming recovery. Both
+processes receive only this agent's identity. The backend is reaped when the UI
+exits. Headless/utility commands retain direct execution with `--no-daemon`.
 Existing configuration and hook sources remain active. Tested with Codex 0.157.0.
 
 `runtime configure codex --output PATH` remains available for manual integration.
 Remove separately installed Mail hooks before switching to `run`.
 
-For idle wake, attach the agent to a persistent thread on an existing local
-Codex app-server:
+Managed interactive launches discover and attach their sole loaded thread; keep
+`agent-mail service run` active for delivery. To integrate an independently managed
+Codex app-server, explicit attachment remains available:
 
 ```sh
 agent-mail runtime attach worker codex \
@@ -273,6 +277,7 @@ Use the actual socket and thread; Mail verifies the endpoint. It does not create
 or resume the Codex session. Hooks supply reset/compaction recovery independently
 of the queue. Tested with Codex 0.157.0's experimental app-server API.
 [Codex acceptance evidence](local-codex-acceptance.md).
+[Managed launch and real engineering cycle](native-launch-acceptance.md).
 
 ### Delivery controls
 
@@ -342,22 +347,29 @@ v0.4 before exchanging messages without deadlines.
 
 ## Agent skill
 
-The skill is required for agents using Mail, including agents running in Herdr.
-Binary installation alone does not complete agent setup.
+The skill is required for agents using Mail, including Herdr. It is embedded in
+the binary and supplied by recovery hooks at SessionStart. Normal managed launch
+needs no separate skill installer. Print the exact installed instructions with:
+
+```sh
+agent-mail --skill
+```
+
+For clients without Mail lifecycle hooks, load that output at startup/reset, or
+install the discoverable skill:
 
 ```sh
 npx skills add youssef-tharwat/agent-mail --skill agent-mail -g
 ```
 
-This installs workflow instructions, not the binary. This installer uses Node/npm;
-the CLI and Homebrew installation do not require Node. The bundled skill targets
-v0.5 and must be upgraded alongside the CLI.
+Only that optional installation mechanism requires Node/npm. Keep external skill
+copies matched to the binary; the embedded copy is always version-matched.
 
-For manual installation without Node, copy the repository’s `skills/agent-mail/`
-directory into each client’s discoverable skills directory. Start a new session
-and confirm `agent-mail` is listed among its available skills. Install the skill
-for coordinators and workers alike; it teaches ownership, resolution and retry
-rules. Hooks still supply current state automatically when configured.
+`status --check NAME` distinguishes `awaiting_hook`, `hook_observed`, and
+`not_observed`. Evidence includes session, event and timestamp. A hook observation
+proves adapter execution, not model consumption or ongoing process health. Endpoint
+probing separately checks current delivery capability. Restarting a managed client
+clears prior launch evidence; an old session cannot establish new readiness.
 
 ## Upgrading
 
@@ -365,7 +377,11 @@ v0.5 replaces `participant` with `agent` and adds `run`. Update the required ski
 and any operator scripts. Normal registration no longer prints a credential;
 manual integrations can explicitly request one with `agent add NAME --show-session`
 or `agent replace NAME --show-session`. Normal use needs neither this flag nor a
-manual `AGENT_MAIL_SESSION` export. The existing schema 12 store is unchanged.
+manual `AGENT_MAIL_SESSION` export. v0.6 adds launch-scoped hook evidence and a typed task lifecycle (schema 14).
+Stop the delivery worker and clients, back up the store, then run
+`agent-mail init GROUP` to migrate before restarting. See
+[task-state migration](#upgrading-task-state-storage) for legacy-state validation
+and the removal of `open`, `--close` and `--reopen`.
 
 When upgrading from pre-v0.4, also update scripts to use `task`, `mail`, `runtime`
 and `adapter`; regenerate hooks before restarting clients. When using `run`, remove
@@ -409,3 +425,14 @@ omit credentials and private message contents.
 The README animation is reproducible with `python3 scripts/render-demo.py` on
 macOS with Pillow installed. It illustrates current CLI commands and labels its
 output as state summaries.
+
+### Upgrading task state storage
+
+Schema 14 removes writable `open`, `--close` and `--reopen`. Use a terminal state
+to close a task, or an actionable state to reopen it. Existing records, snapshots,
+history and retry results are validated before migration. Unknown legacy states
+or contradictions between state and `open` stop the migration atomically; resolve
+them explicitly in a backed-up copy before upgrading. Mail does not guess their
+business meaning. Upgrade relay peers together. Old update retry documents that
+used `open` must not be replayed with different content; inspect the recorded
+result and current version before issuing a new decision.

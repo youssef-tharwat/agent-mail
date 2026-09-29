@@ -6,6 +6,7 @@
 //! All clones must be dropped before migration; [`Store::close`] first drains the pool.
 //! Socket paths use OS path types, with UTF-8 encoding required by the SQLite schema.
 
+use crate::states::{Availability, MessageState};
 use crate::{
     BODY_LIMIT, SUMMARY_LIMIT, bounded,
     identity::{Binding, Participant},
@@ -237,7 +238,7 @@ pub struct Message {
     /// Deadline timestamp in Unix seconds.
     pub due: Option<i64>,
     /// Stored business state; it does not imply transport delivery.
-    pub state: String,
+    pub state: MessageState,
     /// Identifier of the reply created while resolving this delivery, if any.
     pub reply_id: Option<i64>,
     /// Optional work identifier associated with this message.
@@ -315,7 +316,7 @@ impl Store {
             .await?
             .user_version
             .context("SQLite did not report its schema version")?;
-        ensure!(version <= 12, "database schema is newer than this binary");
+        ensure!(version <= 14, "database schema is newer than this binary");
         if setup {
             // Rebuilding a referenced table requires FK enforcement off outside
             // the migration transaction. The migration checks every FK before commit.
@@ -328,7 +329,7 @@ impl Store {
             sqlx::query!("PRAGMA foreign_keys = ON")
                 .execute(&mut *connection)
                 .await?;
-            migrated?;
+            migrated.context("schema migration failed; legacy task states must use the supported lifecycle with a matching open flag (see docs/usage.md)")?;
             drop(connection);
             if sqlx::query!("SELECT id FROM node LIMIT 1")
                 .fetch_optional(&pool)
@@ -352,7 +353,7 @@ impl Store {
             .await?;
         } else {
             ensure!(
-                version == 12,
+                version == 14,
                 "database schema needs initialization or migration; run agent-mail init GROUP"
             );
         }
@@ -547,7 +548,7 @@ impl Store {
                     name: mailbox.name,
                     runtime: mailbox.binding.runtime(),
                     pane: mailbox.binding.herdr().map(|binding| binding.pane.clone()),
-                    availability: "unknown",
+                    availability: Availability::Unknown,
                 })
             })
             .collect()
@@ -747,7 +748,7 @@ impl Store {
         let mut tx = self.pool().begin().await?;
         Self::check_actor(&mut tx, actor).await?;
         let item = sqlx::query_as!(Message,
-            "SELECT m.id,b.name AS sender,m.summary,m.body,m.created,m.deadline AS due,d.state,d.reply_id,m.work_id FROM messages m JOIN deliveries d ON d.message=m.id JOIN mailboxes b ON b.id=m.sender WHERE m.id=? AND d.recipient=?",
+            "SELECT m.id,b.name AS sender,m.summary,m.body,m.created,m.deadline AS due,d.state AS 'state: MessageState',d.reply_id,m.work_id FROM messages m JOIN deliveries d ON d.message=m.id JOIN mailboxes b ON b.id=m.sender WHERE m.id=? AND d.recipient=?",
             id, actor.id).fetch_optional(&mut *tx).await?.context("message is not in this inbox")?;
         tx.commit().await?;
         Ok(item)
@@ -784,14 +785,14 @@ impl Store {
         bounded(note, SUMMARY_LIMIT, "resolution")?;
         let resolution = serde_json::to_string(&(note, &reply))?;
         let d = sqlx::query!(
-            "SELECT state,resolution,reply_id FROM deliveries WHERE message=? AND recipient=?",
+            "SELECT state AS 'state: MessageState',resolution,reply_id FROM deliveries WHERE message=? AND recipient=?",
             id,
             actor.id
         )
         .fetch_optional(&mut **tx)
         .await?
         .context("message is not in this inbox")?;
-        if d.state == "resolved" {
+        if d.state == MessageState::Resolved {
             ensure!(
                 d.resolution.as_deref() == Some(resolution.as_str()),
                 "message already resolved with a different disposition"
@@ -799,7 +800,7 @@ impl Store {
             return Ok(d.reply_id);
         }
         ensure!(
-            d.state == "pending",
+            d.state == MessageState::Pending,
             "message was withdrawn; it cannot be resolved"
         );
         let reply_id = if let Some((key, body)) = reply {

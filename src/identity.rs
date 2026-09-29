@@ -5,6 +5,7 @@
 //! [`Store::authenticate`] verifies the explicit credential or current Herdr identity;
 //! invalid standalone credentials never fall back to environment-based identity.
 
+use crate::states::{Availability, BindingKind};
 use crate::{
     herdr::HerdrBinding,
     store::{Mailbox, Store},
@@ -33,11 +34,11 @@ pub enum Binding {
 
 impl Binding {
     /// Return the stable serialization name of this binding’s runtime.
-    pub fn runtime(&self) -> &'static str {
+    pub fn runtime(&self) -> BindingKind {
         match self {
-            Self::Herdr(_) => "herdr",
-            Self::Standalone { .. } => "standalone",
-            Self::Remote { .. } => "remote",
+            Self::Herdr(_) => BindingKind::Herdr,
+            Self::Standalone { .. } => BindingKind::Standalone,
+            Self::Remote { .. } => BindingKind::Remote,
         }
     }
     /// Borrow the Herdr identity when this binding targets Herdr.
@@ -69,11 +70,11 @@ pub struct Participant {
     /// Name within the enclosing registration or group.
     pub name: String,
     /// Stable name of the participant’s runtime association.
-    pub runtime: &'static str,
+    pub runtime: BindingKind,
     /// Herdr pane identifier associated with the registration, when applicable.
     pub pane: Option<String>,
     /// Observed availability; standalone registrations do not prove liveness.
-    pub availability: &'static str,
+    pub availability: Availability,
 }
 
 impl Store {

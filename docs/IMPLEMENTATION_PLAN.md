@@ -152,3 +152,24 @@ Homebrew tap: https://github.com/youssef-tharwat/homebrew-tap
 - [x] Publish v0.5.1 after 70 tests, one doctest, strict Clippy and all four
   platform release gates. Verify direct installation and the Homebrew upgrade
   with agent registration, automatic identity, task/mail flow and native exit status.
+
+## Approved launch reliability and bundled skill pass
+
+- [x] Bundle the required skill in the binary (`agent-mail --skill`) and supply it
+  at session startup, without an npm dependency or repeated per-turn injection.
+- [x] Report readiness from observed lifecycle hooks, scoped to the latest launch
+  and current identity. Configuration and hook execution are distinct from model consumption.
+- [x] For native interactive Codex, start a private local app-server and attach the
+  sole loaded thread automatically; preserve native approvals and delivery pause.
+- [x] Exercise real implementation, review, correction and acceptance with Claude
+  and Codex, restarting mid-task. Record missed handoffs, interventions and context overhead.
+- [x] Validate isolation, migration, shutdown and bounded retry behavior.
+
+Acceptance and observed limitations: [managed launch](native-launch-acceptance.md).
+
+## Typed lifecycle contracts
+
+- [x] Replace free-form task states with a lifecycle enum; derive actionability.
+- [x] Type finite mail, event, identity, runtime, lifecycle and delivery states.
+- [x] Validate legacy states and snapshots atomically before migration.
+- [x] Verify invalid input, migration rollback, terminal/reopen events and full suite (77 tests + 1 doc test).

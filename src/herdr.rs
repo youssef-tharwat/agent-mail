@@ -16,6 +16,7 @@ use tokio::{
     net::UnixStream,
 };
 
+use crate::states::SessionKind;
 use crate::{
     PLUGIN_ID,
     identity::Binding,
@@ -32,7 +33,7 @@ pub struct HerdrBinding {
     /// Native agent name reported by Herdr.
     pub agent: String,
     /// Native identity format, either id or path.
-    pub session_kind: String,
+    pub session_kind: SessionKind,
     /// Native identity value in the format specified by session_kind.
     pub session_value: String,
     /// Working directory reported by Herdr, if available.
@@ -45,9 +46,22 @@ pub struct Session {
     /// Native agent name reported by Herdr.
     pub agent: String,
     /// Native identity format, either id or path.
-    pub kind: String,
+    pub kind: SessionKind,
     /// Native identity value in the advertised format.
     pub value: String,
+}
+
+/// Readiness signals from Herdr; future statuses are conservatively unavailable.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatus {
+    /// Agent is idle.
+    Idle,
+    /// Agent finished its turn.
+    Done,
+    /// Any other upstream status does not prove readiness.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A live Herdr agent snapshot used to verify identity and readiness.
@@ -62,7 +76,7 @@ pub struct Agent {
     /// Native session details, if Herdr has observed them.
     pub agent_session: Option<Session>,
     /// Runtime status advertised by Herdr.
-    pub agent_status: String,
+    pub agent_status: AgentStatus,
     /// Whether the live agent is ready for interactive input.
     #[serde(default)]
     pub interactive_ready: bool,
@@ -90,10 +104,6 @@ impl Agent {
             self.agent.as_deref() == Some(session.agent.as_str()),
             "agent and native session identity disagree"
         );
-        ensure!(
-            matches!(session.kind.as_str(), "id" | "path"),
-            "unsupported agent identity kind"
-        );
         Ok(session)
     }
 
@@ -115,7 +125,7 @@ impl Agent {
     pub fn ready(&self) -> bool {
         self.interactive_ready
             && !self.launch_pending
-            && matches!(self.agent_status.as_str(), "idle" | "done")
+            && matches!(self.agent_status, AgentStatus::Idle | AgentStatus::Done)
     }
 }
 
@@ -225,7 +235,7 @@ impl Store {
             pane: agent.pane_id.clone(),
             terminal: agent.terminal_id.clone(),
             agent: session.agent.clone(),
-            session_kind: session.kind.clone(),
+            session_kind: session.kind,
             session_value: session.value.clone(),
             cwd: agent.cwd.clone(),
         });

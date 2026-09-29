@@ -99,3 +99,12 @@ pub mod native;
 
 /// Native Claude inbox registration and automatic hook receipts.
 pub mod claude_inbox;
+
+/// Version-matched operating instructions bundled with the binary.
+pub const SKILL: &str = include_str!("../skills/agent-mail/SKILL.md");
+
+/// Observed launcher and lifecycle-hook readiness.
+pub mod readiness;
+
+/// Closed coordination state vocabularies.
+pub mod states;

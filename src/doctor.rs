@@ -131,7 +131,12 @@ pub async fn inspect(
     let actor = match actor {
         Ok(actor) if name.is_none_or(|n| n == actor.name) => actor,
         _ => {
-            report.add("identity",Level::Fail,"No matching current participant identity",Some("Select --name PARTICIPANT as operator, or supply its current AGENT_MAIL_SESSION"));
+            report.add(
+                "identity",
+                Level::Fail,
+                "No matching current agent identity",
+                Some("Use agent-mail status --check NAME as operator"),
+            );
             return report;
         }
     };
@@ -192,7 +197,7 @@ pub async fn inspect(
                 }
                 Err(error) => Err(error),
                 Ok(None) => match Uuid::parse_str(&e.thread) {
-                    Ok(thread) => match crate::native::Kind::parse(&e.runtime) {
+                    Ok(thread) => match e.runtime.parse::<crate::states::NativeRuntime>() {
                         Ok(kind) => crate::native::probe(kind, Path::new(&e.socket), thread).await,
                         Err(error) => Err(error),
                     },
@@ -234,11 +239,18 @@ pub async fn inspect(
             Some("Inspect database health"),
         ),
     }
-    report.add(
-        "hook_trust",
-        Level::Unknown,
-        "Hook trust is controlled by the agent client; configuration alone cannot prove it",
-        Some("Verify hooks through the client's normal trust flow and a real recovery boundary"),
-    );
+    match store.launch_readiness(&actor).await {
+        Ok(info) => {
+            let observed = info.state == crate::states::RecoveryState::HookObserved;
+            report.add("recovery", if observed { Level::Pass } else { Level::Unknown }, json!(info),
+                if observed { None } else { Some("Launch the agent and review hooks through the client's normal trust flow; no hook has been observed for this launch") });
+        }
+        Err(_) => report.add(
+            "recovery",
+            Level::Fail,
+            "Cannot read hook evidence",
+            Some("Inspect database health"),
+        ),
+    }
     report
 }

@@ -182,14 +182,15 @@ fn decisions_resolve_and_publish_once_or_roll_back_everything() -> Result<()> {
         false,
     )?;
     let before = d.events(&d.worker)?;
-    let invalid = json!({"version":1,"reason":"Accept","patch":{"state":"accepted","open":false},"resolve_message":9999});
+    let invalid =
+        json!({"version":1,"reason":"Accept","patch":{"state":"accepted"},"resolve_message":9999});
     d.decide(invalid, true)?;
     assert_eq!(d.events(&d.worker)?, before);
     assert_eq!(
         d.call(Some(&d.writer), &["task", "show", "task"], None, false)?["version"],
         1
     );
-    let decision = json!({"version":1,"reason":"Evidence verified","patch":{"state":"accepted","open":false,"accepted_revision":"abc123"},"resolve_message":sent["id"]});
+    let decision = json!({"version":1,"reason":"Evidence verified","patch":{"state":"accepted","accepted_revision":"abc123"},"resolve_message":sent["id"]});
     let first = d.decide(decision.clone(), false)?;
     let events = d.events(&d.worker)?;
     assert_eq!(d.decide(decision.clone(), false)?, first);
@@ -198,7 +199,7 @@ fn decisions_resolve_and_publish_once_or_roll_back_everything() -> Result<()> {
         d.call(Some(&d.writer), &["mail", "list"], None, false)?["items"],
         json!([])
     );
-    let reopened=d.decide(json!({"version":2,"reason":"New evidence","patch":{"state":"active","open":true,"accepted_revision":null}}),false)?;
+    let reopened=d.decide(json!({"version":2,"reason":"New evidence","patch":{"state":"active","accepted_revision":null}}),false)?;
     assert_eq!(reopened["accepted_revision"], Value::Null);
     assert_eq!(reopened["version"], 3);
     let mut changed = decision;
@@ -218,7 +219,15 @@ fn hooks_restore_after_reset_suppress_repeats_and_bound_stop_continuations() -> 
             .unwrap()
             .contains("Inspect revision")
     );
-    assert!(serde_json::to_vec(&start)?.len() < 6144);
+    // Recovery state has its own 6 KiB budget; startup adds the fixed bundled guide once.
+    let startup = start["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    let state = startup
+        .strip_suffix(agent_mail::SKILL)
+        .expect("startup includes the complete bundled skill");
+    assert!(state.trim_end().len() <= 6000);
+    assert_eq!(startup.matches(agent_mail::SKILL).count(), 1);
     assert_eq!(d.hook("PostToolUse", false)?, json!({}));
     // New state is injected automatically at the next tool boundary.
     d.decide(
@@ -227,6 +236,14 @@ fn hooks_restore_after_reset_suppress_repeats_and_bound_stop_continuations() -> 
     )?;
     let update = d.hook("PostToolUse", false)?;
     assert!(update.to_string().contains("Check changed contract"));
+    let routine = update["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(
+        !routine.contains(agent_mail::SKILL),
+        "routine updates must not repeat the guide"
+    );
+    assert!(routine.len() <= 6000);
     assert_eq!(d.hook("Stop", false)?, json!({}));
     d.decide(
         json!({"version":2,"reason":"Clarify again","patch":{"next_action":"Check tests"}}),
@@ -241,11 +258,14 @@ fn hooks_restore_after_reset_suppress_repeats_and_bound_stop_continuations() -> 
     assert_eq!(d.hook("Stop", false)?, json!({}));
     // Older clients invalidate at PostCompact, then restore at the next boundary.
     assert_eq!(d.hook("PostCompact", false)?, json!({}));
+    let recovered = d.hook("PreToolUse", false)?;
     assert!(
-        d.hook("PreToolUse", false)?
-            .to_string()
-            .contains("Check diff")
+        recovered["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .ends_with(agent_mail::SKILL)
     );
+    assert!(recovered.to_string().contains("Check diff"));
     // Compaction/restart always restores durable state; emissions never acknowledge events.
     assert!(
         d.hook("SessionStart", false)?
@@ -275,7 +295,7 @@ async fn lost_hook_output_retries_with_a_persisted_budget_and_reset_restores() -
                 id: "task".into(),
                 scope: "Review".into(),
                 owner: "worker".into(),
-                state: "active".into(),
+                state: agent_mail::states::TaskState::Active,
                 next_action: "Inspect".into(),
                 deadline: None,
                 evidence: vec![],
@@ -362,7 +382,7 @@ fn assignment_review_correction_and_acceptance_surface_without_manual_context() 
             .to_string()
             .contains("Submitted evidence")
     );
-    d.decide(json!({"version":2,"reason":"Evidence passed","patch":{"state":"accepted","open":false,"accepted_revision":"abc123"},"resolve_message":second["id"]}),false)?;
+    d.decide(json!({"version":2,"reason":"Evidence passed","patch":{"state":"accepted","accepted_revision":"abc123"},"resolve_message":second["id"]}),false)?;
     let final_hook = d.hook("PostToolUse", false)?;
     assert!(final_hook.to_string().contains("work_changed"));
     let text = final_hook["hookSpecificOutput"]["additionalContext"]
