@@ -413,3 +413,23 @@ while the nullable `deadline` column is authoritative for new readers and writes
 Homebrew, direct installation and the Herdr installer use checksum-verified release
 binaries. The CLI remains a single local executable with SQLite. See the
 [CLI design](CLI_REDESIGN.md) and [user guide](usage.md).
+
+
+## Agent launch context (v0.5)
+
+`agent` is the public identity command. `run NAME -- COMMAND` reads a standalone
+agent’s existing credential from private Mail state and passes it, the selected
+group and the canonical state path only to the child. Normal registration output
+contains no credential. There is no current-agent file or global identity switch.
+
+For Claude, the launcher prepares a credential-free local hook plugin and passes
+its directory without changing existing settings. For Codex, it adds inline hook
+configuration and disables the shared daemon for that invocation, keeping the
+identity attached to the launched process. Native hook trust and client permissions
+remain enforced. Runtime hooks recover state; the launcher does not infer task
+acceptance, supervise the client, or start the delivery service. Herdr still owns
+its pane-bound launches; `run` refuses those bindings and remote bindings.
+
+Client arguments, terminal streams, signals and exit status survive Unix `exec`.
+An explicit identity replacement invalidates old credentials; the next launch
+reads the replacement while retaining the agent’s tasks and mailbox.

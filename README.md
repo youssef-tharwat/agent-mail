@@ -26,35 +26,40 @@ decision rules agents need. [Installation details](docs/usage.md#install).
 
 ## Quick start
 
-Create a group and two participants:
+Create a group and two agents:
 
 ```sh
 agent-mail init project
-agent-mail participant add coordinator
-agent-mail participant add worker
+agent-mail agent add coordinator
+agent-mail agent add worker
 ```
 
-Each registration returns a `session` credential. Give each participant its own
-`AGENT_MAIL_SESSION`. Keep credentials out of version control.
-
-As the coordinator, assign a task:
+Launch each agent in its own terminal:
 
 ```sh
-export AGENT_MAIL_SESSION='<coordinator credential>'
+agent-mail run coordinator -- codex
+agent-mail run worker -- claude
+```
+
+Mail supplies identity and recovery hooks automatically. Review the generated
+Codex hooks when prompted. The required skill teaches agents the commands below.
+
+Inside the coordinator’s session, assign a task:
+
+```sh
 agent-mail task create api-review "Review API changes at abc123" --owner worker
 ```
 
-As the worker, recover the assignment and send a result:
+Inside the worker’s session, recover the assignment and send a result:
 
 ```sh
-export AGENT_MAIL_SESSION='<worker credential>'
 agent-mail context
 agent-mail mail send coordinator "Reviewed abc123; evidence: reviews/api.md" \
   --task api-review --key api-review-result-v1
 ```
 
 The group is inferred from the credential. Task changes notify the relevant
-participants automatically. The writer decides whether to accept the result;
+agents automatically. The writer decides whether to accept the result;
 receiving a message never marks a task complete.
 [Replies and task decisions](docs/usage.md#atomic-decisions).
 
@@ -99,7 +104,7 @@ Install the required agent skill above for the clients running inside Herdr too.
 - [Live runtime validation](docs/native-inbox-acceptance.md).
 - [Issues](https://github.com/youssef-tharwat/agent-mail/issues): bugs and feature requests.
 
-v0.4 changes command names and hook entry points. Existing users should follow
+v0.5 renames `participant` to `agent` and adds `run`. Existing users should follow
 [the upgrade guide](docs/usage.md#upgrading) before updating their store.
 
 ## Contributing

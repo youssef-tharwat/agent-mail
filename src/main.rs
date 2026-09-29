@@ -15,6 +15,7 @@ use std::{io::Read, path::PathBuf};
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod cli;
+mod launch;
 
 struct RunArgs {
     state_dir: Option<PathBuf>,
@@ -50,6 +51,7 @@ enum Command {
     },
     /// Operator: register a standalone participant; --replace rotates its session.
     Register {
+        show_session: bool,
         group: String,
         name: String,
         replace: bool,
@@ -376,12 +378,17 @@ async fn run(cli: RunArgs) -> Result<()> {
             json!({"bound":name,"group":group,"pane":agent.pane_id})
         }
         Command::Register {
+            show_session,
             group,
             name,
             replace,
         } => {
             let session = store.register(&group, &name, replace).await?;
-            json!({"group":group,"name":name,"session":session,"runtime":"standalone"})
+            let mut result = json!({"group":group,"name":name,"runtime":"standalone"});
+            if show_session {
+                result["session"] = json!(session);
+            }
+            result
         }
         Command::AttachCodex {
             group,

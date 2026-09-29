@@ -1,19 +1,20 @@
 ---
 name: agent-mail
 description: >-
-  Use Agent Mail for durable handoffs in a configured Mail group: resume assignments after a context reset, handle pending requests and replies, and record task decisions. Apply when coordinating agents through Mail, including Claude Code, Codex, Herdr and Fleet workflows, even when the user describes a forgotten assignment or stalled handoff without naming Mail. Requires Agent Mail v0.4 or later.
+  Use Agent Mail for durable handoffs in a configured Mail group: resume assignments after a context reset, handle pending requests and replies, and record task decisions. Apply when coordinating agents through Mail, including Claude Code, Codex, Herdr and Fleet workflows, even when the user describes a forgotten assignment or stalled handoff without naming Mail. Requires Agent Mail v0.5 or later.
 ---
 
 # Agent Mail
 
 Mail owns durable tasks and messages. The runtime owns live agents and permissions.
 The workflow decides reviews and acceptance. Use `agent-mail COMMAND --help` for
-the installed syntax. v0.4 uses `task`, `mail`, `participant` and `runtime` groups.
+the installed syntax. v0.5 uses `task`, `mail`, `agent` and `runtime` groups.
 
 ## Identity and recovery
 
-Use the participant credential assigned by the operator in `AGENT_MAIL_SESSION`,
-or a verified Herdr binding with that variable unset. Never borrow credentials,
+The operator launches standalone agents with `agent-mail run NAME -- CLIENT`,
+which supplies identity automatically. Use that inherited identity or a verified
+Herdr binding. Do not print or copy the credential. Never use `run` to switch identities, borrow credentials,
 register yourself, rotate identity or guess another group to bypass an error.
 Group selection uses `--group`, then `AGENT_MAIL_GROUP`, then verified identity.
 A supplied invalid credential fails; it never falls back to another runtime.

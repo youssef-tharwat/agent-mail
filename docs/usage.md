@@ -1,6 +1,6 @@
 # User guide
 
-[README](../README.md) · Agent Mail v0.4
+[README](../README.md) · Agent Mail v0.5
 
 ## Install
 
@@ -26,7 +26,7 @@ Download the archive and its checksum from [GitHub Releases](https://github.com/
 For Apple Silicon:
 
 ```sh
-version=0.4.0
+version=0.5.0
 target=aarch64-apple-darwin
 archive="agent-mail-v${version}-${target}.tar.gz"
 base="https://github.com/youssef-tharwat/agent-mail/releases/download/v${version}"
@@ -51,26 +51,52 @@ by that checkout. npm distribution is not provided.
 
 ```sh
 agent-mail init project
-agent-mail participant add coordinator
-agent-mail participant add worker
+agent-mail agent add coordinator
+agent-mail agent add worker
 ```
 
-Each registration returns a credential in `session`. Give each participant its
-own `AGENT_MAIL_SESSION`; keep credentials out of Git. Registration does not start
-an agent or prove it is running. A second `participant add` never replaces an
-existing credential. Use `participant replace NAME` explicitly when needed.
+Registration stores a private credential and prints only agent metadata. It does
+not start a process or prove liveness. `agent add` refuses an existing identity;
+`agent replace NAME` explicitly rotates its credential while preserving tasks and
+mail. Existing sessions then lose access; relaunch them with `run`.
 
-As the coordinator:
+Launch each client in its own terminal:
 
 ```sh
-export AGENT_MAIL_SESSION='<coordinator credential>'
+agent-mail run coordinator -- codex
+agent-mail run worker -- claude
+```
+
+`run` supplies the stored identity, selected group, state directory and Mail binary
+to the child process. There is no global current agent or credential to copy.
+Unknown agents and Herdr/remote bindings are rejected. For multiple groups, use
+`--group GROUP`. Client arguments pass through, including resume options:
+
+```sh
+agent-mail run worker -- claude --resume SESSION_ID
+agent-mail run coordinator -- codex resume SESSION_ID
+```
+
+The launcher preserves terminal input/output, exit status and signals. It replaces
+itself with the client; it is not a supervisor and does not start the Mail service.
+For one operator command, the same identity handling works with any executable:
+
+```sh
+agent-mail run coordinator -- agent-mail task create api-review "Review API" --owner worker
+```
+
+Custom commands receive identity but no runtime-specific hooks. Hooks are configured
+for executables named `claude` or `codex` (including absolute paths).
+
+Inside the coordinator’s session:
+
+```sh
 agent-mail task create api-review "Review API changes at abc123" --owner worker
 ```
 
-As the worker:
+Inside the worker’s session:
 
 ```sh
-export AGENT_MAIL_SESSION='<worker credential>'
 agent-mail context
 agent-mail mail send coordinator "Reviewed abc123; evidence: reviews/api.md" \
   --task api-review --key api-review-result-v1
@@ -195,24 +221,25 @@ agent-mail service run
 
 On macOS, `service install` installs a user launchd job; `service uninstall` removes
 the job while preserving data. On Linux, use foreground run under your supervisor.
-Mail does not launch or supervise the agents themselves.
+`run` launches a client; the Mail service handles delivery only. Herdr continues
+to launch and manage pane-bound agents.
 
 ### Claude Code
 
 ```sh
-agent-mail runtime configure claude --output .claude/agent-mail-hooks.json
-claude --settings .claude/agent-mail-hooks.json
+agent-mail run worker -- claude
 ```
 
-Launch each Claude terminal with its assigned Mail credential/environment. The
-normal Claude UI, tools and permissions remain in charge. Startup hooks register
-Claude's native inbox automatically. Resume with the same environment and settings
-file; compaction and lifecycle hooks recover current state.
+Mail writes a credential-free hook plugin under its private state directory and
+loads it with Claude’s additive `--plugin-dir` option. Existing settings, custom
+hooks, tools and permissions remain controlled by Claude. Startup hooks register
+its native inbox; resume and compaction hooks recover current state.
 
-The generated file contains no credentials. Generation is atomic and refuses to
-overwrite different existing content. Do not also install the generic Mail hooks.
-Client trust and inbound-message policy still apply; configuration is not proof
-that hooks are trusted. Tested with Claude Code 2.1.284.
+The launcher does not modify global or project client settings. Remove separately
+installed Mail hooks before adopting `run` to avoid duplicate delivery. For a
+manually managed launch, `runtime configure claude --output PATH` still generates
+settings; use `claude --settings PATH` with the assigned identity environment.
+Client trust and inbound-message policy still apply. Tested with Claude Code 2.1.285.
 
 A socket write is only an attempt. A correlated native `UserPromptSubmit` hook
 confirms admission and supplies fresh bounded context. It does not prove the model
@@ -222,12 +249,19 @@ finished a turn or accepted a result. Missing/refused delivery remains pending.
 ### Codex
 
 ```sh
-agent-mail runtime configure codex --output .codex/hooks.json
+agent-mail run worker -- codex
 ```
 
-If that file already contains hooks, generate into a separate file and merge its
-entries into the intended configuration. Review/trust hooks through Codex `/hooks`.
-For idle wake, attach the participant to a persistent thread on an existing local
+Mail adds lifecycle hooks through launch-specific Codex configuration. Review and
+trust those hooks in Codex’s native prompt or `/hooks`; untrusted hooks do not run.
+The launcher never bypasses hook trust or sandbox permissions. It uses
+`--no-daemon` so the agent’s identity cannot leak through a shared runtime process.
+Existing configuration and hook sources remain active. Tested with Codex 0.157.0.
+
+`runtime configure codex --output PATH` remains available for manual integration.
+Remove separately installed Mail hooks before switching to `run`.
+
+For idle wake, attach the agent to a persistent thread on an existing local
 Codex app-server:
 
 ```sh
@@ -251,7 +285,7 @@ agent-mail runtime retry worker
 ```
 
 Pause/resume affects group delivery, not mail writes. Retry resets only that
-participant's delivery budget; it never resumes a paused group or retries tools.
+agent's delivery budget; it never resumes a paused group or retries tools.
 Inspect and fix the endpoint before retrying. Attempts are limited to three per
 change batch, five minutes apart, with budgets persisted across worker restarts.
 
@@ -284,8 +318,8 @@ PATH for hooks. The plugin keeps a local executable for its actions too.
 ```sh
 agent-mail init project
 agent-mail runtime herdr --socket "$HERDR_SOCKET_PATH"
-agent-mail participant bind coordinator --herdr-pane COORDINATOR_PANE
-agent-mail participant bind worker --herdr-pane WORKER_PANE
+agent-mail agent bind coordinator --herdr-pane COORDINATOR_PANE
+agent-mail agent bind worker --herdr-pane WORKER_PANE
 ```
 
 Herdr owns live sessions; Mail owns durable coordination. Herdr prompts default
@@ -317,7 +351,7 @@ npx skills add youssef-tharwat/agent-mail --skill agent-mail -g
 
 This installs workflow instructions, not the binary. This installer uses Node/npm;
 the CLI and Homebrew installation do not require Node. The bundled skill targets
-v0.4 and must be upgraded alongside the CLI.
+v0.5 and must be upgraded alongside the CLI.
 
 For manual installation without Node, copy the repository’s `skills/agent-mail/`
 directory into each client’s discoverable skills directory. Start a new session
@@ -327,9 +361,15 @@ rules. Hooks still supply current state automatically when configured.
 
 ## Upgrading
 
-v0.4 intentionally changes the command interface without old aliases. Regenerate
-Mail hooks, update the skill, and update scripts to use `task`, `mail`, `participant`,
-`runtime`, `status --check` and `adapter`. Stored tasks/messages are preserved.
+v0.5 replaces `participant` with `agent` and adds `run`. Update the required skill
+and any operator scripts. Normal registration no longer prints a credential;
+manual integrations can explicitly request one with `agent add NAME --show-session`
+or `agent replace NAME --show-session`. Normal use needs neither this flag nor a
+manual `AGENT_MAIL_SESSION` export. The existing schema 12 store is unchanged.
+
+When upgrading from pre-v0.4, also update scripts to use `task`, `mail`, `runtime`
+and `adapter`; regenerate hooks before restarting clients. When using `run`, remove
+older manually installed Mail hooks to avoid duplicates.
 
 Stop the worker and other Mail commands and back up your state directory. On macOS
 run `service uninstall` before upgrading and `service install` afterward.

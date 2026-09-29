@@ -70,3 +70,25 @@ v0.4.0 Apple Silicon release was installed through both the checksum-verifying
 script and the public Homebrew formula. Each installed binary passed a fresh-store
 flow covering participant creation, task recovery, messages, atomic acceptance
 and identical retries. Existing Mail databases and runtime settings were untouched.
+
+
+## v0.5 launcher acceptance
+
+The launcher was exercised with Claude Code 2.1.285 and Codex 0.157.0 in temporary
+Mail groups. Both clients recovered an assigned marker from hook-injected context
+without calling Mail tools. After the coordinator changed the task’s next action,
+both resumed clients reported the new marker, establishing recovery from current
+durable state rather than the earlier transcript.
+
+The first Codex run had no context because its generated hooks were untrusted.
+An isolated authorization probe confirmed hook loading. The normal interactive
+Codex launch then showed its native six-hook review prompt; after approving the
+generated hooks there, recovery and subsequent resume worked without trust-bypass
+flags. The launcher never supplies such flags. Codex runs without its shared
+daemon so child identity stays scoped to that launch.
+
+Claude’s generated plugin was checked against the native manifest validator and
+then exercised through startup and resume. Existing explicit settings paths and
+custom hook files are passed through unchanged. Automated process tests cover
+concurrent agent identities, credential replacement, unknown agents, missing
+executables, child exit status and termination signals.

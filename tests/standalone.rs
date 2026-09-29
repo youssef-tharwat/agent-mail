@@ -35,7 +35,7 @@ impl Demo {
         Ok(serde_json::from_slice(&output.stdout)?)
     }
     fn register(&self, name: &str) -> Result<String> {
-        self.ok(None, &["participant", "add", name])?["session"]
+        self.ok(None, &["agent", "add", name, "--show-session"])?["session"]
             .as_str()
             .map(str::to_owned)
             .context("registration did not return a session")
@@ -97,12 +97,8 @@ fn standalone_mail_work_and_session_replacement() -> Result<()> {
         .status
         .success()
     );
-    assert!(
-        !d.call(None, &["participant", "add", "worker"])?
-            .status
-            .success()
-    );
-    let replacement = d.ok(None, &["participant", "replace", "worker"])?;
+    assert!(!d.call(None, &["agent", "add", "worker"])?.status.success());
+    let replacement = d.ok(None, &["agent", "replace", "worker", "--show-session"])?;
     let next = replacement["session"]
         .as_str()
         .context("missing replacement")?;
@@ -179,7 +175,7 @@ fn standalone_identity_is_scoped_and_never_infers_liveness() -> Result<()> {
             .unwrap()
             .contains("unknown")
     );
-    let list = d.ok(None, &["participant", "list", "--group", "default"])?;
+    let list = d.ok(None, &["agent", "list", "--group", "default"])?;
     assert!(!list.to_string().contains(&a));
     assert!(!list.to_string().contains(&b));
     assert_eq!(list[0]["runtime"], "standalone");
@@ -272,7 +268,7 @@ fn selection_is_unambiguous_and_configuration_never_overwrites() -> Result<()> {
     d.ok(None, &["init", "one"])?;
     let worker = d.register("worker")?;
     d.ok(None, &["init", "two"])?;
-    assert!(!d.call(None, &["participant", "list"])?.status.success());
+    assert!(!d.call(None, &["agent", "list"])?.status.success());
     d.ok(Some(&worker), &["context"])?;
     assert!(
         !d.call(Some(&worker), &["context", "--group", "two"])?

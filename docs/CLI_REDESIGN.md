@@ -12,12 +12,12 @@ work, identities and history through tested migrations.
 
 Inspected the current command definitions, identity checks, work mutation paths,
 operator guide and agent skill. Exercised the CLI with a disposable database;
-no real participants or runtimes were changed.
+no real agents or runtimes were changed.
 
 - The main help exposes more than 30 commands, mixing agent work, operator setup,
   transport protocols and remote-machine configuration.
 - `AGENT_MAIL_GROUP=project` is honored by hooks but ignored by `context`. With a
-  valid participant credential, the latter reports an unknown session in the
+  valid agent credential, the latter reports an unknown session in the
   wrong group. This is a context-selection problem, not an authentication failure.
 - Retrying identical `task create` fails with a raw SQLite uniqueness error.
 - `task update` and `work decide` reach the same underlying mutation code, but
@@ -37,7 +37,7 @@ agent-mail init GROUP       create or verify a local coordination group
 agent-mail context          recover my work and pending requests
 agent-mail mail …           send, read, reply, resolve or withdraw requests
 agent-mail task …           create, inspect or update work records
-agent-mail participant …    operator: manage durable Mail identities
+agent-mail agent …    operator: manage durable Mail identities
 agent-mail runtime …        operator: configure delivery and recovery
 agent-mail service …        operator: run or supervise the local worker
 agent-mail status           inspect coordination and delivery health
@@ -53,10 +53,10 @@ Bare `agent-mail` prints concise help and one setup example without mutating sta
 | Current command | Proposed command / behavior | Decision |
 | --- | --- | --- |
 | `setup` | `init GROUP` | Local by default; runtime configuration is separate. |
-| `register` | `participant add NAME` | Positional name; identity issued explicitly. |
-| `register --replace` | `participant replace NAME` | Make credential invalidation a distinct operation. |
-| `participants` | `participant list` | Durable registration view, not live-agent inventory. |
-| `bind` | `participant bind NAME --herdr-pane PANE` | Keep verified binding explicit. |
+| `register` | `agent add NAME` | Positional name; identity issued explicitly. |
+| `register --replace` | `agent replace NAME` | Make credential invalidation a distinct operation. |
+| `agents` | `agent list` | Durable registration view, not live-agent inventory. |
+| `bind` | `agent bind NAME --herdr-pane PANE` | Keep verified binding explicit. |
 | `context` | `context` | Keep the bounded recovery view. |
 | `send` | `mail send RECIPIENT SUMMARY` | Keep stable key; additional recipients via repeated `--to`. |
 | `inbox` | `mail list` | Pending request summaries only. |
@@ -109,18 +109,18 @@ Invalid credentials or identity/group mismatches never fall back to an operator
 or another runtime identity. Multiple matches are ambiguous, not “pick first”.
 An explicit missing group fails. Read commands never create `default` or a database.
 `init GROUP` requires a name and ignores ambient Herdr sockets. No persistent
-“last used group”, repository configuration file or machine-wide active participant
+“last used group”, repository configuration file or machine-wide active agent
 is needed. Agent environments remain independent, including concurrent sessions.
 
 ### Participant identity
 
-Keep one credential per standalone participant, injected by its operator/launcher.
+Keep one credential per standalone agent, injected by its operator/launcher.
 Infer the sender from that credential; never add a convenient `--as worker` that
-impersonates a participant. Group inference does not issue credentials.
+impersonates a agent. Group inference does not issue credentials.
 
-Repeated `participant add NAME` reports that it already exists and does not
+Repeated `agent add NAME` reports that it already exists and does not
 return or rotate its secret. Explicit replacement remains an operator action.
-The runtime registry and Mail participant registry continue to have separate owners.
+The runtime registry and Mail agent registry continue to have separate owners.
 
 ### Creation and mutation defaults
 
@@ -193,13 +193,14 @@ help documents the complete JSON schema. No generic string-based `--set` languag
 ```sh
 brew install youssef-tharwat/tap/agent-mail
 agent-mail init project
-agent-mail participant add coordinator
-agent-mail participant add worker
+agent-mail agent add coordinator
+agent-mail agent add worker
 ```
 
-Operator distributes each returned credential to that participant's environment.
-When only this group exists, no repeated group flag is needed. This does not start
-agents, install a service, or change client permissions.
+The operator uses `agent-mail run NAME -- CLIENT`; the launcher supplies identity.
+When only this group exists, no repeated group flag is needed. Registration does
+not start agents; `run` starts the selected client. Neither installs a service or
+changes client permissions.
 
 ### Assignment and result
 
@@ -260,7 +261,7 @@ update does not resolve unrelated messages. Workflow policy supplies acceptance.
 # Run once in the project; writes only the explicitly named settings file.
 agent-mail runtime configure claude --output .claude/agent-mail-hooks.json
 
-# Each participant launches normally in its assigned identity environment.
+# Each agent launches normally in its assigned identity environment.
 claude --settings .claude/agent-mail-hooks.json
 
 # One Mail worker for the store, in another terminal:

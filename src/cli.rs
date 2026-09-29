@@ -15,7 +15,7 @@ use uuid::Uuid;
     version,
     about = "Durable tasks and messages for coding agents",
     arg_required_else_help = true,
-    after_help = "Start: agent-mail init project\nThen:  agent-mail participant add worker\n\nAdvanced: agent-mail remote --help; agent-mail adapter --help\nOutput is JSON. Credentials belong in AGENT_MAIL_SESSION, not shell history."
+    after_help = "Start: agent-mail init project\nThen:  agent-mail agent add worker\n\nAdvanced: agent-mail remote --help; agent-mail adapter --help\nRun:   agent-mail run worker -- claude\nOutput is JSON; run preserves the child interface."
 )]
 pub(super) struct Cli {
     /// Coordination group; otherwise inferred from identity or the sole group.
@@ -24,11 +24,12 @@ pub(super) struct Cli {
     /// Local state directory; normally discovered automatically.
     #[arg(long, global = true, env = "AGENT_MAIL_STATE_DIR")]
     state_dir: Option<PathBuf>,
-    /// Participant credential; never falls back to another identity if invalid.
+    /// Agent credential; never falls back to another identity if invalid.
     #[arg(
         long,
         global = true,
         env = "AGENT_MAIL_SESSION",
+        hide = true,
         hide_env_values = true
     )]
     session: Option<Uuid>,
@@ -57,9 +58,16 @@ enum Action {
     /// Create, inspect and update versioned assignments.
     #[command(subcommand)]
     Task(Task),
-    /// Manage durable participant identities (operator).
+    /// Manage durable agent identities (operator).
     #[command(subcommand)]
-    Participant(Participant),
+    Agent(Agent),
+    /// Launch a command as a registered agent; configure Claude/Codex recovery hooks.
+    Run {
+        name: String,
+        /// Client or command and its arguments, after --.
+        #[arg(required = true, last = true, num_args = 1..)]
+        command: Vec<std::ffi::OsString>,
+    },
     /// Configure recovery and automatic delivery (operator).
     #[command(subcommand)]
     Runtime(Runtime),
@@ -68,7 +76,7 @@ enum Action {
     Service(Service),
     /// Read coordination health; --check also probes runtime setup.
     Status {
-        /// Probe setup, optionally for a named participant; never repairs or prompts.
+        /// Probe setup, optionally for a named agent; never repairs or prompts.
         #[arg(long,num_args=0..=1,default_missing_value="")]
         check: Option<String>,
     },
@@ -106,7 +114,7 @@ enum Mail {
         #[arg(long, default_value_t = 0)]
         after: i64,
     },
-    /// Read one message addressed to this participant.
+    /// Read one message addressed to this agent.
     Show { id: i64 },
     /// Send a final answer and resolve the request atomically; safe to retry.
     Reply {
@@ -134,7 +142,7 @@ enum Task {
         id: String,
         /// Task scope; also the initial next action unless overridden.
         task: String,
-        /// Participant responsible for the assignment.
+        /// Agent responsible for the assignment.
         #[arg(long)]
         owner: String,
         /// Initial next action when it differs from the task scope.
@@ -152,7 +160,7 @@ enum Task {
     },
     /// Read the current task, including version and linked messages.
     Show { id: String },
-    /// List open tasks owned or maintained by this participant.
+    /// List open tasks owned or maintained by this agent.
     List {
         #[arg(long, default_value = "")]
         after: String,
@@ -178,7 +186,7 @@ struct Changes {
     /// Why this change is authorized.
     #[arg(long)]
     reason: Option<String>,
-    /// New responsible participant.
+    /// New responsible agent.
     #[arg(long)]
     owner: Option<String>,
     /// Workflow-defined state label.
@@ -207,11 +215,21 @@ struct Changes {
     resolve: Option<i64>,
 }
 #[derive(Subcommand)]
-enum Participant {
+enum Agent {
     /// Issue a new standalone identity. Never replaces an existing credential.
-    Add { name: String },
+    Add {
+        name: String,
+        /// Print the credential for a manual integration. Normally use run.
+        #[arg(long)]
+        show_session: bool,
+    },
     /// Explicitly replace a standalone identity and invalidate its old credential.
-    Replace { name: String },
+    Replace {
+        name: String,
+        /// Print the new credential for a manual integration. Normally use run.
+        #[arg(long)]
+        show_session: bool,
+    },
     /// List registrations without secrets; registration does not imply liveness.
     List,
     /// Bind an address to a verified Herdr pane.
@@ -243,7 +261,7 @@ enum Runtime {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Attach a verified endpoint to an existing participant.
+    /// Attach a verified endpoint to an existing agent.
     Attach {
         name: String,
         #[command(subcommand)]
@@ -257,7 +275,7 @@ enum Runtime {
     Pause,
     /// Resume this group's delivery without resetting retry budgets.
     Resume,
-    /// Reset this participant's delivery budget after fixing its endpoint.
+    /// Reset this agent's delivery budget after fixing its endpoint.
     Retry { name: String },
     /// Configure the group's Herdr socket explicitly.
     Herdr {
@@ -301,7 +319,7 @@ enum Remote {
         #[arg(value_enum)]
         mode: Switch,
     },
-    /// Route a participant address to another machine.
+    /// Route a agent address to another machine.
     Route { name: String, machine: String },
     /// Exchange durable events with peers over SSH.
     Sync { peer: Option<String> },
@@ -406,7 +424,12 @@ impl Cli {
         } else {
             self.group.clone().unwrap_or_default()
         };
+        if let Action::Run { name, command } = &self.command {
+            super::launch::launch(&root, &group, name, command).await?;
+            return Ok(None);
+        }
         let command = match self.command {
+            Action::Run { .. } => unreachable!("handled before dispatch"),
             Action::Init { name } => {
                 ensure!(
                     self.group.as_ref().is_none_or(|g| g == &name),
@@ -433,19 +456,21 @@ impl Cli {
             },
             Action::Status { check: None } => Command::Status,
             Action::Service(s) => Command::Service(s),
-            Action::Participant(p) => match p {
-                Participant::Add { name } => Command::Register {
+            Action::Agent(p) => match p {
+                Agent::Add { name, show_session } => Command::Register {
+                    show_session,
                     group,
                     name,
                     replace: false,
                 },
-                Participant::Replace { name } => Command::Register {
+                Agent::Replace { name, show_session } => Command::Register {
+                    show_session,
                     group,
                     name,
                     replace: true,
                 },
-                Participant::List => Command::Participants { group },
-                Participant::Bind {
+                Agent::List => Command::Participants { group },
+                Agent::Bind {
                     name,
                     herdr_pane,
                     replace,
@@ -644,31 +669,7 @@ impl Cli {
 
 fn configure(client: Client, path: &std::path::Path) -> Result<()> {
     let claude = matches!(client, Client::Claude);
-    let command = if claude {
-        "agent-mail adapter claude-hook"
-    } else {
-        "agent-mail adapter hook"
-    };
-    let mut hooks = serde_json::Map::new();
-    let events = [
-        "SessionStart",
-        "PostCompact",
-        "UserPromptSubmit",
-        "PreToolUse",
-        "PostToolUse",
-        "Stop",
-    ];
-    for event in events
-        .into_iter()
-        .chain(if claude { Some("SessionEnd") } else { None })
-        .chain(if claude { Some("StopFailure") } else { None })
-    {
-        hooks.insert(
-            event.into(),
-            serde_json::json!([{"hooks":[{"type":"command","command":command,"timeout":10}]}]),
-        );
-    }
-    let content = serde_json::to_vec_pretty(&serde_json::json!({"hooks":hooks}))?;
+    let content = serde_json::to_vec_pretty(&super::launch::hook_settings(claude, "agent-mail"))?;
     if path.exists() {
         ensure!(
             std::fs::read(path)? == content,
@@ -689,7 +690,7 @@ fn configure(client: Client, path: &std::path::Path) -> Result<()> {
     }
     println!(
         "{}",
-        serde_json::json!({"configured":path,"next_action":if claude{"Launch Claude with --settings pointing to this file, in the participant identity environment"}else{"Use this file as the project's .codex/hooks.json, review and trust it via /hooks, then attach the app-server endpoint"}})
+        serde_json::json!({"configured":path,"next_action":if claude{"Launch Claude with --settings pointing to this file, in the agent identity environment"}else{"Use this file as the project's .codex/hooks.json, review and trust it via /hooks, then attach the app-server endpoint"}})
     );
     Ok(())
 }

@@ -85,7 +85,7 @@ impl Store {
         if replace {
             self.mailbox(group, name)
                 .await
-                .context("participant does not exist; use participant add NAME first")?;
+                .context("agent does not exist; use agent add NAME first")?;
         }
         let session = Uuid::new_v4();
         self.set_binding(group, name, &Binding::Standalone { session }, replace)
@@ -102,7 +102,9 @@ impl Store {
         if let Some(session) = session {
             return self.standalone_caller(group, session).await;
         }
-        self.authenticate_herdr(group).await.context("supply AGENT_MAIL_SESSION for a registered standalone participant, or use a bound Herdr pane")
+        self.authenticate_herdr(group)
+            .await
+            .context("launch with agent-mail run NAME -- COMMAND, or use a bound Herdr pane")
     }
 }
 

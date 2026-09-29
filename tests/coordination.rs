@@ -19,11 +19,21 @@ impl Demo {
             worker: String::new(),
         };
         d.call(None, &["init", "default"], None, false)?;
-        d.writer = d.call(None, &["participant", "add", "writer"], None, false)?["session"]
+        d.writer = d.call(
+            None,
+            &["agent", "add", "writer", "--show-session"],
+            None,
+            false,
+        )?["session"]
             .as_str()
             .unwrap()
             .into();
-        d.worker = d.call(None, &["participant", "add", "worker"], None, false)?["session"]
+        d.worker = d.call(
+            None,
+            &["agent", "add", "worker", "--show-session"],
+            None,
+            false,
+        )?["session"]
             .as_str()
             .unwrap()
             .into();
@@ -121,7 +131,12 @@ fn changes_publish_without_a_separate_send_and_receipts_do_not_resolve() -> Resu
     );
     // Another participant cannot acknowledge this event.
     d.call(Some(&d.writer), &["adapter", "ack", &id], None, true)?;
-    let rotated = d.call(None, &["participant", "replace", "worker"], None, false)?;
+    let rotated = d.call(
+        None,
+        &["agent", "replace", "worker", "--show-session"],
+        None,
+        false,
+    )?;
     let new = rotated["session"].as_str().unwrap();
     d.call(Some(&d.worker), &["adapter", "ack", &id], None, true)?;
     assert_eq!(d.events(new)?["items"][0]["id"], events["items"][0]["id"]);

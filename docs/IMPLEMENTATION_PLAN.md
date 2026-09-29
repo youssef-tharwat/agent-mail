@@ -138,3 +138,15 @@ provenance, durable runtime delivery policy and optional business deadlines.
 Release: https://github.com/youssef-tharwat/agent-mail/releases/tag/v0.4.0
 
 Homebrew tap: https://github.com/youssef-tharwat/homebrew-tap
+
+
+## Agent identity and launch UX (v0.5)
+
+- [x] Rename the public `participant` command to `agent`, with no alias.
+- [x] Add `run NAME -- COMMAND` using the stored identity and child-only environment.
+- [x] Keep credentials out of normal registration output; retain explicit manual export.
+- [x] Configure Claude/Codex hooks without replacing existing settings or permissions.
+- [x] Preserve native terminal, signals, exit status, and identity across resume.
+- [x] Complete startup and resume recovery with real Claude/Codex clients;
+  verify concurrent identities, rotation, native exit/signal behavior and settings preservation.
+- [ ] Publish v0.5.0 and verify the Homebrew upgrade.
