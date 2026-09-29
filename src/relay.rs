@@ -297,9 +297,8 @@ impl Store {
                 "route already belongs to another machine; reconcile explicitly"
             );
         } else {
-            let pane = format!("remote:{machine}:{participant}");
-            sqlx::query!("INSERT INTO mailboxes(group_name,name,pane,terminal,agent,session_kind,session_value,remote_machine) VALUES (?,?,?,'','','','',?)",
-                group, participant, pane, machine).execute(&mut *tx).await?;
+            sqlx::query!("INSERT INTO mailboxes(group_name,name,binding) VALUES (?,?,json_object('runtime','remote','machine',?))",
+                group, participant, machine).execute(&mut *tx).await?;
             let latest = sqlx::query!("SELECT c.snapshot FROM work_changes c WHERE c.group_name=? AND c.version=(SELECT MAX(version) FROM work_changes WHERE group_name=c.group_name AND work_id=c.work_id)", group)
                 .fetch_all(&mut *tx).await?;
             for row in latest {
@@ -652,9 +651,8 @@ async fn apply_event(
             } else {
                 ensure!(envelope.destination != home, "home sender route is missing");
                 let machine = envelope.origin.to_string();
-                let pane = format!("remote:{machine}:{}", m.sender);
-                sqlx::query!("INSERT INTO mailboxes(group_name,name,pane,terminal,agent,session_kind,session_value,remote_machine) VALUES (?,?,?,'','','','',?)",
-                    m.group, m.sender, pane, machine).execute(&mut **tx).await?.last_insert_rowid()
+                sqlx::query!("INSERT INTO mailboxes(group_name,name,binding) VALUES (?,?,json_object('runtime','remote','machine',?))",
+                    m.group, m.sender, machine).execute(&mut **tx).await?.last_insert_rowid()
             };
             let id = m.id.to_string();
             let canonical = serde_json::to_string(&(

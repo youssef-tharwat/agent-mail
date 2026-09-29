@@ -1,9 +1,9 @@
 [package]
 name = "agent-mail"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Durable, low-noise messaging for agents in Herdr"
+description = "Durable mail and work records for coding agents"
 repository = "https://github.com/youssef-tharwat/agent-mail"
 authors = ["Youssef Tharwat"]
 license = "MIT"

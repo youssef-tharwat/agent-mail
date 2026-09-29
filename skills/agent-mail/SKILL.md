@@ -1,18 +1,22 @@
 ---
 name: agent-mail
 description: >-
-  Use Agent Mail for durable handoffs in a configured Herdr group: resume assigned work after a context reset, handle pending requests and replies, and maintain linked work records. Apply when the task describes these needs even without naming Agent Mail.
+  Use Agent Mail for durable handoffs in a configured Mail group with Herdr or standalone participants: resume assigned work after a context reset, handle pending requests and replies, and maintain linked work records. Apply when the task describes these needs even without naming Agent Mail.
 ---
 
 # Agent Mail
 
-Agent Mail stores messages and small work records outside agent context. Herdr owns live agent identity and sessions; Mail owns pending deliveries and work state. Use `agent-mail <command> --help` for the installed CLI syntax.
+Agent Mail stores messages and small work records outside agent context. Mail owns durable participant identities, pending deliveries, and work state. Herdr supplies live sessions and wake hints for Herdr bindings; standalone participants use operator-issued session credentials. Use `agent-mail <command> --help` for the installed CLI syntax.
+
+## Identity
+
+Use the assigned group and identity. A Herdr pane uses its verified binding with `AGENT_MAIL_SESSION` unset. A standalone agent receives its own `AGENT_MAIL_SESSION` from the operator or launcher; `--session` is an explicit override. Never borrow another participant's credential. An invalid credential fails rather than falling back to Herdr. If it expires through explicit replacement, ask the operator for the new registration. `participants` lists bindings, not live availability.
 
 ## Resume with bounded context
 
 - Use the task's group name; `default` is appropriate only when that is the configured group. Run `agent-mail context --group <group>` when starting or resuming Mail-backed work, after a context reset, or after a Mail wake hint. Do not poll it every turn.
 - The command gives short work and inbox summaries. Follow a returned cursor only when more entries are relevant. Fetch a full message with `agent-mail inbox --group <group> <message-id>` or a work record with `agent-mail work show --group <group> <work-id>` when needed.
-- If the CLI reports that this agent is unbound or the group is missing, tell the operator which binding or setup is needed. Do not bind yourself or invent a group.
+- If the CLI reports that this agent is unbound or the group is missing, tell the operator which binding or setup is needed. Do not register, rebind, or rotate your own identity, and do not invent a group.
 
 ## Send and resolve
 

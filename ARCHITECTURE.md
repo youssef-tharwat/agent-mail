@@ -1,6 +1,7 @@
 # Agent Mail architecture
 
-Status: implementation in progress, 2026-09-28. Local mail and work records,
+Status: implementation in progress, 2026-09-29. Local mail and work records,
+standalone participant registration,
 the Herdr plugin manifest, and an SSH relay with explicit per-peer automatic
 sync opt-in are implemented. Release validation remains open.
 
@@ -10,7 +11,8 @@ Agent Mail is a small, local-first coordination tool for coding agents. It keeps
 messages and the current work position outside model context, so an agent can
 restart, reconnect, or compact its context and still find what it owns and what
 needs an answer. It is usable without Fleet Campaign. Agent-scoped CLI commands
-currently require a Herdr binding; operator and database commands do not.
+accept either a verified Herdr binding or an explicitly registered standalone
+session credential. Herdr remains an optional runtime integration.
 
 Install one binary on each participating machine. There is no account, hosted
 service, shared filesystem, Dolt database, or public network listener. A
@@ -25,8 +27,8 @@ execute a model's tools exactly once.
 
 | Component | Owns |
 | --- | --- |
-| Herdr | Agent inventory, processes, sessions, machine connections, live state, and prompts |
-| Mail | Mailbox addresses and routing bindings, delivery, request resolution, reminders, a small work register, and recovery views |
+| Runtime (Herdr integration today) | Live agent inventory, processes, sessions, machine connections, lifecycle observations, and wake prompts |
+| Mail | Durable participant identities, runtime/routing bindings, delivery, request resolution, reminders, a small work register, and recovery views |
 | Workflow using Mail | Meaning of work states, review criteria, who may accept or reassign work |
 | Git and CI | Code revisions, artifacts, test results, and other underlying evidence |
 
@@ -46,7 +48,7 @@ agent CLI ── short SQLite transaction ── local mail.db
 
 operator CLI ── explicit sync ── SSH peers
 
-remote host: the same binary, its own mail.db, and its own Herdr server
+remote host: the same binary, its own mail.db, and optional runtime integration
 ```
 
 One Rust executable supplies the CLI, local worker, and SSH stdio bridge. The
@@ -55,6 +57,10 @@ worker is stopped. The worker is supervised by the host OS (launchd on macOS;
 an equivalent user service or foreground process on Linux). Its only local
 socket dependency is Herdr's existing socket for live state and short prompts.
 The remote bridge uses SSH stdio; it does not open a TCP port.
+
+Herdr bindings use its existing local socket. Standalone local operations need
+no socket or running background worker. The participant listing describes
+registrations; live availability is unknown until a runtime supplies evidence.
 
 The local core uses SQLx for checked SQLite transactions and Tokio for the
 worker's bounded I/O and timers. The three-reminder loop does not need a job
@@ -71,9 +77,8 @@ bounded fan-out, with no topic expressions or global broadcast.
 A **group** is a namespace for mailboxes, messages, and optional work items.
 It has a home machine. Mailbox names are unique only inside that group;
 the routing identity also includes the machine. Herdr pane IDs and agent names
-are machine-scoped and cannot serve as global Mail IDs. Herdr remains the
-source for which agents actually exist and what they are doing; Mail does not
-maintain a second agent inventory.
+are machine-scoped and cannot serve as global Mail IDs. Herdr supplies live facts for its bound agents. Mail keeps the durable
+participant registry but does not infer live processes or lifecycle from it.
 
 A **message** has a stable ID, sender, recipient list, idempotency key, short
 summary, bounded body, creation time, optional deadline, and optional work-item
@@ -130,29 +135,48 @@ retargets a recipient or treats an unreachable host as an empty inbox. It does
 not promise immediate cross-machine delivery or progress while the home is
 offline. The operator can see unsynced count, oldest age, and last error.
 
-## Agent binding and trust
+## Participant identity, runtime bindings, and trust
 
-A Mail address is a logical inbox, not another Herdr agent record. Its binding
-records machine, server/session, pane, terminal, and native agent incarnation
-when available.
-Before an automatic prompt, the worker checks fresh Herdr state and verifies
-that the intended agent is still there. An agent CLI call also checks its
-current binding. Missing or ambiguous identity holds prompting and appears in
-status; rebinding is explicit. A last-moment pane replacement can still receive
-the generic wake hint because Herdr's state read and prompt are separate
-operations. The hint carries no message body or work data.
+A participant is a stable mailbox ID and group-scoped name. Its binding is one
+of three typed forms: a Herdr session, a standalone session credential, or a
+remote machine route. The binding is separate from work ownership and the
+identity of messages already sent. A generated UUID credential identifies each
+standalone registration; a mailbox name alone does not authorize a caller.
+Credentials are returned only at registration and are excluded from participant
+listings. The operator or launcher passes one participant's credential to its
+agent through `AGENT_MAIL_SESSION` or `--session`.
 
-Herdr plugins run as local processes. Agents sharing one OS account can read
-or alter that account's files, so Mail's actor checks are workflow guards, not
-a security boundary against malicious same-user code. SSH authenticates the
-machine connection; it does not turn a model's claim about its role into proof.
-Coordinator-only acceptance is enforced by the workflow and the designated
-home writer. Stronger adversarial isolation would require separate OS
-principals and is outside v1.
+Herdr remains the default when no standalone credential is supplied. Its adapter
+checks the current socket, pane, terminal, and native agent session. An explicit
+standalone credential is checked against that store and group, even inside
+Herdr; failure never falls back to another identity. Neither path silently
+registers a caller. Standalone availability stays unknown: registration is not
+evidence of a running process, and there is no model heartbeat or new supervisor.
 
-Herdr does not install local plugins on remote machines. Each participating
-host must install Mail explicitly. Herdr is currently required for agent-scoped
-send, inbox, resolve, context, and work commands.
+Replacing a session requires `register --replace` or `bind --replace`. This
+preserves the mailbox ID and work ownership while advancing the binding version.
+Reads and writes verify the version inside their database transaction; writes
+serialize against replacement. An old actor snapshot cannot continue after a
+replacement, even if a previous Herdr identity is later restored. A read already in progress may finish from its pre-replacement snapshot;
+committed operations remain valid. Remote routes cannot be taken over by a
+local registration. Existing schema-5 addresses migrate with their IDs, bindings,
+messages, work records, and reminder budgets intact.
+
+The reminder worker handles standalone mail as pending or overdue with unknown
+availability. It makes no runtime calls for those participants and does not
+claim to have notified them. Herdr participants retain fresh identity checks,
+idle-state checks, and the existing bounded wake policy. A last-moment pane
+replacement can still receive a generic wake hint because Herdr's state read
+and prompt are separate operations; the hint contains no message or work body.
+
+These checks guard against accidental identity mistakes among processes sharing
+an OS account. They are not adversarial isolation: same-user processes can read
+the database and registration credentials. SSH authenticates machine connections.
+The designated home writer and active workflow still govern work acceptance.
+
+Each participating host installs Mail explicitly. Herdr plugin installation and
+its existing setup/status actions remain supported. An installation can contain
+Herdr and standalone participants in the same group.
 
 ## Quiet liveness and compact context
 
@@ -183,8 +207,10 @@ automatic context use without hiding outstanding work.
 ## Minimal interface
 
 ```text
-agent-mail setup                 initialize local state and worker
-agent-mail bind                  attach a logical inbox to this agent
+agent-mail setup                 initialize state; optionally configure Herdr
+agent-mail register              create or explicitly replace a standalone binding
+agent-mail participants          list addresses and bindings; no credentials
+agent-mail bind                  attach an inbox to a verified Herdr session
 agent-mail send                  publish to named recipients, with a retry key
 agent-mail inbox [id]            list summaries or fetch one message
 agent-mail resolve <id>          close a delivery; optionally reply atomically

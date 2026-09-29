@@ -1,9 +1,9 @@
 # Implementation plan
 
-Status: in progress, 2026-09-28. [ARCHITECTURE.md](ARCHITECTURE.md) is the
+Status: in progress, 2026-09-29. [ARCHITECTURE.md](ARCHITECTURE.md) is the
 product and ownership contract. Local mail, work records, context, the plugin
-manifest, explicit SSH exchange, and opt-in background sync are implemented. No release or publication
-has been authorized or completed.
+manifest, explicit SSH exchange, and opt-in background sync are implemented. The early public build is published; real two-machine SSH release validation
+remains open.
 
 ## Starting point
 
@@ -130,3 +130,23 @@ keeps only mailbox routing bindings. Fleet Campaign or another caller defines
 review rules, acceptance gates, and authority to reassign work. Git and CI
 hold the underlying evidence. V1 does not schedule agent tool calls, replay
 agent reasoning, or automatically retry side effects.
+
+## 5. Runtime-independent participants
+
+Keep one binary, one durable store, and the existing Herdr plugin. Mail owns
+stable addresses and the work register. Herdr supplies live session identity,
+lifecycle observations, and wake prompts for its bindings.
+
+- Add standalone setup, explicit registration, generated session credentials,
+  and a credential-free participant listing.
+- Store runtime bindings as a typed union, separate from mailbox identity.
+  Preserve schema-5 identities, mail, work, routes, and reminder budgets.
+- Require explicit replacement; check the binding generation in every actor
+  transaction so stale sessions cannot keep reading or writing after rotation.
+- Keep standalone availability unknown and recovery driven by `context`
+  checkpoints. Do not add an agent launcher, heartbeat, broker, or public listener.
+- Verify actual CLI flows without Herdr, mixed-runtime messaging, stale actor
+  rejection, migration of populated state, and the full existing regression suite.
+
+**Exit:** standalone participants exchange mail and recover work with Herdr
+absent; existing Herdr behavior and delivery guarantees continue to pass.

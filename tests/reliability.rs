@@ -148,17 +148,28 @@ impl Fixture {
     }
 
     async fn cli(&self, pane: &str, args: &[&str]) -> Result<std::process::Output> {
-        Ok(
-            tokio::process::Command::new(env!("CARGO_BIN_EXE_agent-mail"))
-                .args(["--state-dir", self.store.root.to_str().unwrap()])
-                .args(args)
-                .env("HERDR_ENV", "1")
-                .env("HERDR_PANE_ID", pane)
-                .env("HERDR_SOCKET_PATH", &self.socket)
-                .env_remove("HERDR_PLUGIN_ID")
-                .output()
-                .await?,
-        )
+        self.cli_session(pane, args, None).await
+    }
+
+    async fn cli_session(
+        &self,
+        pane: &str,
+        args: &[&str],
+        session: Option<&str>,
+    ) -> Result<std::process::Output> {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_agent-mail"));
+        command
+            .args(["--state-dir", self.store.root.to_str().unwrap()])
+            .args(args)
+            .env("HERDR_ENV", "1")
+            .env("HERDR_PANE_ID", pane)
+            .env("HERDR_SOCKET_PATH", &self.socket)
+            .env_remove("HERDR_PLUGIN_ID")
+            .env_remove("AGENT_MAIL_SESSION");
+        if let Some(session) = session {
+            command.env("AGENT_MAIL_SESSION", session);
+        }
+        Ok(command.output().await?)
     }
 }
 
@@ -647,6 +658,116 @@ async fn safe_default_holds_unguarded_prompts_without_losing_mail() -> Result<()
         observations
             .iter()
             .any(|o| o.state.contains("automatic agent prompts disabled"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn standalone_and_herdr_share_mail_without_sharing_session_authority() -> Result<()> {
+    let f = Fixture::new().await?;
+    let token = f.store.register("g", "standalone", false).await?;
+    let standalone = f.store.authenticate("g", Some(&token)).await?;
+    let mut request = message("mixed");
+    request.recipients = vec!["standalone".into()];
+    let id = f.store.publish(&f.a, request, 1000).await?;
+    // An explicit credential selects its own mailbox even in another Herdr pane.
+    let cli = f
+        .cli_session(
+            "w1:p1",
+            &["context", "--group", "g"],
+            Some(&token.to_string()),
+        )
+        .await?;
+    assert!(
+        cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&cli.stdout)?["mail"][0]["id"],
+        id
+    );
+    let invalid = uuid::Uuid::new_v4().to_string();
+    assert!(
+        !f.cli_session("w1:p1", &["context", "--group", "g"], Some(&invalid))
+            .await?
+            .status
+            .success()
+    );
+    let observed = service::tick(&f.store, 1001).await?;
+    assert!(
+        observed
+            .iter()
+            .any(|o| o.participant == "standalone" && o.state.contains("unknown"))
+    );
+    assert!(f.host.lock().await.prompts.is_empty());
+    assert_eq!(f.store.inbox(&standalone, 0).await?.len(), 1);
+    let rotated = f.store.register("g", "standalone", true).await?;
+    assert!(f.store.authenticate("g", Some(&token)).await.is_err());
+    assert!(f.store.inbox(&standalone, 0).await.is_err());
+    assert!(
+        f.store
+            .resolve(&standalone, id, "stale", None, 1002)
+            .await
+            .is_err()
+    );
+    assert!(
+        f.store
+            .publish(&standalone, message("stale"), 1002)
+            .await
+            .is_err()
+    );
+    let current = f.store.authenticate("g", Some(&rotated)).await?;
+    assert_eq!(current.id, standalone.id);
+    f.store
+        .resolve(
+            &current,
+            id,
+            "handled",
+            Some(("reply".into(), "Reviewed".into())),
+            1003,
+        )
+        .await?;
+    assert_eq!(f.store.inbox(&f.a, 0).await?.len(), 1);
+
+    assert!(
+        f.store
+            .bind("g", "standalone", &agent("w1:p3"), false)
+            .await
+            .is_err()
+    );
+    f.store
+        .bind("g", "standalone", &agent("w1:p3"), true)
+        .await?;
+    assert!(f.store.authenticate("g", Some(&rotated)).await.is_err());
+    assert!(f.store.inbox(&current, 0).await.is_err());
+    f.host.lock().await.agents.push(agent("w1:p3"));
+    assert!(
+        f.cli("w1:p3", &["context", "--group", "g"])
+            .await?
+            .status
+            .success()
+    );
+
+    assert!(f.store.register("g", "b", false).await.is_err());
+    let b_token = f.store.register("g", "b", true).await?;
+    assert!(
+        !f.cli("w1:p2", &["context", "--group", "g"])
+            .await?
+            .status
+            .success()
+    );
+    let b = f.store.authenticate("g", Some(&b_token)).await?;
+    assert_eq!(b.id, f.b.id);
+    // Restoring the original Herdr identity must not revive an old actor snapshot.
+    f.store.bind("g", "b", &agent("w1:p2"), true).await?;
+    assert!(f.store.inbox(&f.b, 0).await.is_err());
+    assert!(f.store.inbox(&b, 0).await.is_err());
+    assert!(
+        f.cli("w1:p2", &["context", "--group", "g"])
+            .await?
+            .status
+            .success()
     );
     Ok(())
 }

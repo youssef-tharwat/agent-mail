@@ -3,8 +3,9 @@
 Agent Mail keeps short agent messages and small work records in SQLite. After a
 context reset, an agent runs one `context` command to find its current work,
 next action, pending mail, and sync backlog. Message bodies and full work
-records are fetched by ID. It is a general Herdr plugin; Fleet Campaign is one
-possible workflow using it.
+records are fetched by ID. It is a standalone CLI for coding agents: no account,
+server, or agent runtime required. Herdr is an optional integration.
+Fleet Campaign is one possible workflow using it.
 
 ![Agent Mail CLI: send a request, recover work and pending mail, then resolve the delivery](assets/agent-mail-demo.gif)
 
@@ -14,6 +15,100 @@ This is an early public build. The local flow is tested; a real two-machine
 SSH smoke test remains open. The [architecture](ARCHITECTURE.md) defines ownership
 and guarantees; the [implementation plan](IMPLEMENTATION_PLAN.md) records
 remaining release checks.
+
+## Install
+
+Download a prebuilt binary from [GitHub Releases](https://github.com/youssef-tharwat/agent-mail/releases/latest).
+No Rust toolchain or Herdr installation is required.
+
+| Platform | Archive target |
+| --- | --- |
+| macOS, Apple Silicon | `aarch64-apple-darwin` |
+| macOS, Intel | `x86_64-apple-darwin` |
+| Linux, x86-64 (glibc 2.35+) | `x86_64-unknown-linux-gnu` |
+| Linux, ARM64 (glibc 2.35+) | `aarch64-unknown-linux-gnu` |
+
+For example, on Apple Silicon:
+
+```sh
+version=0.2.0
+target=aarch64-apple-darwin
+archive="agent-mail-v${version}-${target}.tar.gz"
+base="https://github.com/youssef-tharwat/agent-mail/releases/download/v${version}"
+curl -fLO "$base/$archive"
+curl -fLO "$base/$archive.sha256"
+shasum -a 256 -c "$archive.sha256"
+tar -xzf "$archive" agent-mail
+mkdir -p "$HOME/.local/bin"
+install -m 755 agent-mail "$HOME/.local/bin/agent-mail"
+```
+
+Add `~/.local/bin` to your `PATH`. On Linux, `sha256sum -c` also verifies the
+checksum. macOS binaries are not Apple-notarized.
+
+Or build from source with Rust 1.85+:
+
+```sh
+cargo install --git https://github.com/youssef-tharwat/agent-mail --tag v0.2.0 --locked
+```
+
+## Quick start
+
+```sh
+agent-mail setup --standalone --group project
+agent-mail register --group project --name coordinator
+agent-mail register --group project --name worker
+```
+
+Each registration returns a generated `session` credential. The operator or
+launcher gives each agent its own credential through `AGENT_MAIL_SESSION`.
+Set this in the worker's environment, using the worker's returned value:
+
+```sh
+export AGENT_MAIL_SESSION='<worker session>'
+agent-mail context --group project
+```
+
+In the coordinator's environment, use the coordinator's credential:
+
+```sh
+export AGENT_MAIL_SESSION='<coordinator session>'
+agent-mail work create --group project --id api-review --owner worker \
+  --scope 'Review API changes' --next-action 'Review abc123'
+agent-mail send --group project --to worker --key review-1 \
+  --summary 'Review abc123' --work-id api-review
+```
+
+Both paths use the same send, inbox, resolve, context, and work commands.
+`--session <credential>` also works; an explicit credential selects standalone
+identity even inside Herdr. Invalid credentials fail without falling back to
+another identity. Leave it unset for the normal Herdr pane binding.
+
+`agent-mail participants --group project` lists addresses and runtime bindings
+without exposing credentials. This is a registration view; it does not infer
+whether a worker is alive. Standalone agents check `context` at checkpoints.
+No background worker is needed for local mail or work operations. When run,
+the worker reports pending/overdue standalone mail and unknown availability;
+it cannot wake a standalone agent or send an operator notification without a
+runtime integration.
+
+To replace a standalone session explicitly:
+
+```sh
+agent-mail register --group project --name worker --replace
+```
+
+Supply the new credential to the replacement session. The old credential stops
+working; the mailbox ID, pending mail, work ownership, and history survive.
+The same `--replace` rule applies when switching between standalone and Herdr
+bindings. Configure a Herdr socket with `setup --group project --socket PATH`
+before using `bind`. A registered remote route cannot be converted this way.
+
+`setup` uses a supplied or inherited Herdr socket when present; otherwise it
+creates standalone state. `--standalone` explicitly ignores an inherited socket.
+It never detaches an existing Herdr group silently. Use `--state-dir PATH` or
+`AGENT_MAIL_STATE_DIR` for an isolated store; both runtimes otherwise share the
+normal state location.
 
 ## Agent skill
 
@@ -33,50 +128,80 @@ mkdir -p ~/.codex/skills
 ln -s "$(pwd)/skills/agent-mail" ~/.codex/skills/agent-mail
 ```
 
-Then ask a bound agent to use `$agent-mail`, or let Codex select it for an
+Then ask a bound or registered agent to use `$agent-mail`, or let Codex select it for an
 Agent Mail task. Other agent tools can read the same `SKILL.md` directly.
 
-## Install from GitHub
+## Optional Herdr integration
 
-Requires Rust 1.85+ and Herdr 0.9.1+. Herdr builds the plugin and installs the
-`agent-mail` CLI into Cargo's bin directory:
+Herdr supplies live agent identity, lifecycle observations, and wake hints.
+Agent Mail keeps the durable participant registry, mail, and work records.
+
+### Install the plugin
+
+The Herdr plugin currently builds from source, requiring Rust 1.85+ and Herdr
+0.9.1+. It installs the CLI into Cargo's bin directory:
 
 ```sh
 herdr plugin install youssef-tharwat/agent-mail
+# macOS: set up state and install the background worker
 herdr plugin action invoke setup --plugin youssef-tharwat.agent-mail
+# Linux: set up state; run the worker under your own supervisor
+herdr plugin action invoke setup-linux --plugin youssef-tharwat.agent-mail
 ```
 
-The setup action creates the `default` group and installs the macOS worker (on
-Linux, run `agent-mail service run` under your own supervisor). It does not bind
-agents. Run `herdr pane list`, then bind each intended native agent session with
-`agent-mail bind --name NAME --target PANE_ID`. The agent skill is installed
-separately as described above.
+Setup does not bind agents. Run `herdr pane list`, then bind the intended native
+sessions:
 
-## Build and link locally
+```sh
+agent-mail bind --name coordinator --target YOUR_COORDINATOR_PANE
+agent-mail bind --name worker --target YOUR_WORKER_PANE
+```
 
-Requires Rust 1.85+ and Herdr 0.9.1+. On each host:
+For an existing named group, configure its socket with
+`agent-mail setup --group project --socket "$HERDR_SOCKET_PATH"` and pass
+`--group project` when binding. Leave `AGENT_MAIL_SESSION` unset inside bound
+Herdr panes. The skill is installed separately using the command above.
+
+### Local plugin development
 
 ```sh
 cargo install --path . --locked
 herdr plugin link . --enabled
-agent-mail setup --group project --socket "$HERDR_SOCKET_PATH"
-agent-mail bind --group project --name coordinator --target YOUR_COORDINATOR_PANE
-agent-mail bind --group project --name worker --target YOUR_WORKER_PANE
-agent-mail status
 ```
 
-Run `setup` from a Herdr environment with `HERDR_SOCKET_PATH`, or pass an
-absolute socket path. On macOS, `agent-mail service install` installs a user
-launchd job; on Linux run `agent-mail service run` under your own process
-supervisor. `setup`
-does not bind or prompt agents. The plugin manifest also exposes setup and
-status actions. `service uninstall` preserves the database.
+On macOS, `agent-mail service install` installs a user launchd job; on Linux,
+run `agent-mail service run` under your own process supervisor.
+`service uninstall` preserves the database.
 
-For an upgrade, stop the worker, install the new binary, rerun `setup` with the
-existing group and socket to apply migrations, then restart the worker. On
+### Quiet prompts
+
+Herdr's current socket API does not expose a reliable empty-draft check.
+Automatic agent prompts are therefore **off by default**. Pending mail remains
+in SQLite and `context`/`status`; the worker can raise one operator alert when
+it becomes overdue. An operator who accepts the risk of overwriting an
+unfinished agent draft may explicitly run:
+
+```sh
+agent-mail prompt-mode --group project --enable-unguarded
+```
+
+In that mode the worker sends only a short fixed inbox hint to a verified idle
+agent, with at most one initial prompt and two reminders spaced five minutes
+apart. It never inserts message bodies into prompts. `prompt-mode --disable`
+returns to the safe default. `pause` and `resume` control a group's prompts.
+
+## Upgrading
+
+For an upgrade, stop the worker and other Mail commands, install the new binary,
+rerun `setup` with the existing group and socket (or `--standalone`) to apply
+migrations, then restart the worker. Schema 6 preserves existing mailbox IDs,
+Herdr bindings, mail, work records, reminder budgets, and remote routes. Older
+binaries cannot open the upgraded store; back it up before upgrading. On
 macOS, use `service uninstall` before setup and `service install` afterward.
 
-Inside a bound Herdr agent pane:
+## Mail and work commands
+
+With your assigned session credential (or inside a bound Herdr pane):
 
 ```sh
 agent-mail send --group project --to worker --key review-1 \
@@ -105,23 +230,6 @@ agent-mail work update --group project lane-a --version 1 --reason 'Revision sub
 
 Work updates require the current version and a reason. The home writer decides
 state, ownership, and acceptance. Replies do not change work state.
-
-## Quiet prompts
-
-Herdr's current socket API does not expose a reliable empty-draft check.
-Automatic agent prompts are therefore **off by default**. Pending mail remains
-in SQLite and `context`/`status`; the worker can raise one operator alert when
-it becomes overdue. An operator who accepts the risk of overwriting an
-unfinished agent draft may explicitly run:
-
-```sh
-agent-mail prompt-mode --group project --enable-unguarded
-```
-
-In that mode the worker sends only a short fixed inbox hint to a verified idle
-agent, with at most one initial prompt and two reminders spaced five minutes
-apart. It never inserts message bodies into prompts. `prompt-mode --disable`
-returns to the safe default. `pause` and `resume` control a group's prompts.
 
 ## Optional remote machines
 
@@ -172,7 +280,8 @@ read-only; their version may be stale until another sync.
   page within a 4 KiB budget. Cursors fetch further pages.
 - Mail records obligations and decisions. It does not run tools, retry agent
   side effects, or decide whether a revision is correct.
-- Binding checks are workflow guards for agents sharing an OS account, not a
+- Bindings and standalone session credentials are workflow guards for agents
+  sharing an OS account, not a
   security boundary against malicious same-user code.
 
 ## Development

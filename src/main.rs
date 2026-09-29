@@ -10,10 +10,18 @@ use serde_json::{Value, json};
 use std::{io::Read, path::PathBuf};
 
 #[derive(Parser)]
-#[command(version, about = "Durable, low-noise messaging for agents in Herdr")]
+#[command(version, about = "Durable mail and work records for coding agents")]
 struct Cli {
     #[arg(long, global = true, env = "AGENT_MAIL_STATE_DIR")]
     state_dir: Option<PathBuf>,
+    /// Standalone registration credential. Omit to use the verified Herdr pane.
+    #[arg(
+        long,
+        global = true,
+        env = "AGENT_MAIL_SESSION",
+        hide_env_values = true
+    )]
+    session: Option<uuid::Uuid>,
     #[command(subcommand)]
     command: Command,
 }
@@ -25,7 +33,10 @@ enum Command {
         #[arg(long, default_value = "default")]
         group: String,
         #[arg(long, env = "HERDR_SOCKET_PATH")]
-        socket: PathBuf,
+        socket: Option<PathBuf>,
+        /// Create a group without Herdr, ignoring an inherited socket environment.
+        #[arg(long)]
+        standalone: bool,
         #[arg(long)]
         install_service: bool,
     },
@@ -39,6 +50,20 @@ enum Command {
         target: String,
         #[arg(long)]
         replace: bool,
+    },
+    /// Operator: register a standalone participant; --replace rotates its session.
+    Register {
+        #[arg(long, default_value = "default")]
+        group: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        replace: bool,
+    },
+    /// List registered participants without exposing session credentials.
+    Participants {
+        #[arg(long, default_value = "default")]
+        group: String,
     },
     /// Show this installation's stable machine identity.
     MachineId,
@@ -307,11 +332,16 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Setup {
             group,
             socket,
+            standalone,
             install_service,
         } => {
-            store
-                .enroll(&group, socket.to_str().context("socket path is not UTF-8")?)
-                .await?;
+            let socket = if standalone { None } else { socket };
+            let socket = socket
+                .as_deref()
+                .map(|path| path.to_str().context("socket path is not UTF-8"))
+                .transpose()?
+                .unwrap_or("");
+            store.enroll(&group, socket).await?;
             if !explicit_state {
                 supervision::save_locator(&root)?;
             }
@@ -333,10 +363,23 @@ async fn run(cli: Cli) -> Result<()> {
             replace,
         } => {
             let config = store.group(&group).await?;
-            let agent = herdr::agent(std::path::Path::new(&config.socket), &target).await?;
+            let socket = config
+                .socket
+                .as_deref()
+                .context("configure a Herdr socket before binding")?;
+            let agent = herdr::agent(std::path::Path::new(socket), &target).await?;
             store.bind(&group, &name, &agent, replace).await?;
             json!({"bound":name,"group":group,"pane":agent.pane_id})
         }
+        Command::Register {
+            group,
+            name,
+            replace,
+        } => {
+            let session = store.register(&group, &name, replace).await?;
+            json!({"group":group,"name":name,"session":session,"runtime":"standalone"})
+        }
+        Command::Participants { group } => serde_json::to_value(store.participants(&group).await?)?,
         Command::MachineId => json!({"machine_id":store.machine_id().await?}),
         Command::Join { group, home } => {
             store.set_home(&group, relay::machine(&home)?).await?;
@@ -416,7 +459,7 @@ async fn run(cli: Cli) -> Result<()> {
             due_after,
             work_id,
         } => {
-            let actor = store.authenticate(&group).await?;
+            let actor = store.authenticate(&group, cli.session.as_ref()).await?;
             let body = body_file
                 .as_deref()
                 .map(read_body)
@@ -444,7 +487,7 @@ async fn run(cli: Cli) -> Result<()> {
             message,
             after,
         } => {
-            let actor = store.authenticate(&group).await?;
+            let actor = store.authenticate(&group, cli.session.as_ref()).await?;
             if let Some(id) = message {
                 serde_json::to_value(store.message(&actor, id).await?)?
             } else {
@@ -474,7 +517,7 @@ async fn run(cli: Cli) -> Result<()> {
             reply_file,
             withdraw,
         } => {
-            let actor = store.authenticate(&group).await?;
+            let actor = store.authenticate(&group, cli.session.as_ref()).await?;
             if withdraw {
                 store.withdraw(&actor, message).await?;
                 json!({"id":message,"withdrawn":true})
@@ -492,7 +535,7 @@ async fn run(cli: Cli) -> Result<()> {
             work_after,
             mail_after,
         } => {
-            let actor = store.authenticate(&group).await?;
+            let actor = store.authenticate(&group, cli.session.as_ref()).await?;
             let work = store.work_list(&actor, &work_after).await?;
             let mail = store.inbox(&actor, mail_after).await?;
             let mut works = Vec::new();
@@ -533,7 +576,7 @@ async fn run(cli: Cli) -> Result<()> {
                 deadline,
                 evidence,
             } => {
-                let actor = store.authenticate(&group).await?;
+                let actor = store.authenticate(&group, cli.session.as_ref()).await?;
                 serde_json::to_value(
                     store
                         .work_create(
@@ -553,11 +596,11 @@ async fn run(cli: Cli) -> Result<()> {
                 )?
             }
             WorkCommand::Show { group, id } => {
-                let actor = store.authenticate(&group).await?;
+                let actor = store.authenticate(&group, cli.session.as_ref()).await?;
                 serde_json::to_value(store.work_show(&actor, &id).await?)?
             }
             WorkCommand::List { group, after } => {
-                let actor = store.authenticate(&group).await?;
+                let actor = store.authenticate(&group, cli.session.as_ref()).await?;
                 let items = store.work_list(&actor, &after).await?;
                 let more = items.len() > 5;
                 let items: Vec<_> = items.into_iter().take(5).collect();
@@ -581,7 +624,7 @@ async fn run(cli: Cli) -> Result<()> {
                 evidence,
                 clear_evidence,
             } => {
-                let actor = store.authenticate(&group).await?;
+                let actor = store.authenticate(&group, cli.session.as_ref()).await?;
                 let patch = WorkPatch {
                     owner,
                     state,
@@ -618,7 +661,7 @@ async fn run(cli: Cli) -> Result<()> {
                 )?
             }
             WorkCommand::History { group, id } => {
-                let actor = store.authenticate(&group).await?;
+                let actor = store.authenticate(&group, cli.session.as_ref()).await?;
                 serde_json::to_value(store.work_history(&actor, &id).await?)?
             }
         },

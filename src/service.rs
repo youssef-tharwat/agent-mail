@@ -1,5 +1,7 @@
 use crate::{
-    herdr, now,
+    herdr,
+    identity::Binding,
+    now,
     store::{Group, Pending, Store},
 };
 use anyhow::{Context, Result};
@@ -122,7 +124,12 @@ async fn session_tick_inner(
                 continue;
             }
             let binding = store.mailbox(&group.name, &item.name).await?;
-            let state = if let Some(agent) = agents.iter().find(|a| a.pane_id == binding.pane) {
+            let state = if let Some(agent) = agents.iter().find(|a| {
+                binding
+                    .binding
+                    .herdr()
+                    .is_some_and(|bound| a.pane_id == bound.pane)
+            }) {
                 if !agent.matches(&binding) {
                     "binding mismatch; rebind explicitly".to_string()
                 } else if !agent.ready() {
@@ -164,7 +171,10 @@ async fn wake(
     binding: &crate::store::Mailbox,
     time: i64,
 ) -> Result<String> {
-    let live = herdr::agent(socket, &binding.pane).await?;
+    let Some(target) = binding.binding.herdr() else {
+        return Ok("standalone participant; availability unknown; use context".into());
+    };
+    let live = herdr::agent(socket, &target.pane).await?;
     if !live.matches(binding) || !live.ready() {
         return Ok("state changed; queued".into());
     }
@@ -183,25 +193,39 @@ async fn wake(
     herdr::call(
         socket,
         "agent.prompt",
-        json!({"target": binding.pane, "text": text}),
+        json!({"target": target.pane, "text": text}),
     )
     .await?;
     Ok("wake-up submitted; messages remain pending".into())
 }
 
 pub async fn tick(store: &Store, time: i64) -> Result<Vec<Observation>> {
-    let pending = store.pending().await?;
+    let mut pending = Vec::new();
+    let mut observations = Vec::new();
+    for item in store.pending().await? {
+        let mailbox = store.mailbox(&item.group_name, &item.name).await?;
+        if matches!(mailbox.binding, Binding::Standalone { .. }) {
+            let state = if item.due <= time {
+                "overdue; standalone availability unknown; check context"
+            } else {
+                "standalone availability unknown; awaiting context checkpoint"
+            };
+            observations.push(Observation::for_inbox(&item, state));
+        } else {
+            pending.push(item);
+        }
+    }
     let mut sessions: BTreeMap<String, Vec<Group>> = BTreeMap::new();
     for group in store.groups().await? {
         if pending.iter().any(|p| p.group_name == group.name) {
-            sessions
-                .entry(group.socket.clone())
-                .or_default()
-                .push(group);
+            let socket = group
+                .socket
+                .clone()
+                .context("Herdr binding has no group socket")?;
+            sessions.entry(socket).or_default().push(group);
         }
     }
     let mut jobs = JoinSet::new();
-    let mut observations = Vec::new();
     for (socket, groups) in sessions {
         let subset = pending
             .iter()

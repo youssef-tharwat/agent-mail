@@ -1,4 +1,5 @@
 pub mod herdr;
+pub mod identity;
 pub mod relay;
 pub mod service;
 pub mod store;

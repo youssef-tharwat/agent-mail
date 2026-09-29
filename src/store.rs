@@ -1,10 +1,10 @@
 use crate::{
     BODY_LIMIT, SUMMARY_LIMIT, bounded,
-    herdr::Agent,
+    identity::{Binding, Participant},
     name,
     relay::{self, Event},
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sqlx::{
@@ -23,22 +23,45 @@ pub struct Mailbox {
     pub id: i64,
     pub group_name: String,
     pub name: String,
-    pub pane: String,
-    pub terminal: String,
-    pub agent: String,
-    pub session_kind: String,
-    pub session_value: String,
-    pub cwd: Option<String>,
+    #[serde(skip)]
+    pub binding: Binding,
+    pub binding_version: i64,
     pub attempts: i64,
     pub next_wake: i64,
     pub alerted: i64,
-    pub remote_machine: Option<String>,
+}
+
+// Database representation; decode the binding into a closed enum at the boundary.
+struct MailboxRow {
+    id: i64,
+    group_name: String,
+    name: String,
+    binding: String,
+    binding_version: i64,
+    attempts: i64,
+    next_wake: i64,
+    alerted: i64,
+}
+impl TryFrom<MailboxRow> for Mailbox {
+    type Error = anyhow::Error;
+    fn try_from(row: MailboxRow) -> Result<Self> {
+        Ok(Self {
+            id: row.id,
+            group_name: row.group_name,
+            name: row.name,
+            binding: serde_json::from_str(&row.binding).context("decode participant binding")?,
+            binding_version: row.binding_version,
+            attempts: row.attempts,
+            next_wake: row.next_wake,
+            alerted: row.alerted,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Group {
     pub name: String,
-    pub socket: String,
+    pub socket: Option<String>,
     pub paused: i64,
     pub auto_prompt: i64,
     pub home_machine: String,
@@ -188,9 +211,21 @@ impl Store {
             .await?
             .user_version
             .context("SQLite did not report its schema version")?;
-        ensure!(version <= 5, "database schema is newer than this binary");
+        ensure!(version <= 6, "database schema is newer than this binary");
         if setup {
-            sqlx::migrate!("./migrations").run(&pool).await?;
+            // Rebuilding a referenced table requires FK enforcement off outside
+            // the migration transaction. The migration checks every FK before commit.
+            // The schema guard excludes every other Mail process during setup.
+            let mut connection = pool.acquire().await?;
+            sqlx::query!("PRAGMA foreign_keys = OFF")
+                .execute(&mut *connection)
+                .await?;
+            let migrated = sqlx::migrate!("./migrations").run(&mut *connection).await;
+            sqlx::query!("PRAGMA foreign_keys = ON")
+                .execute(&mut *connection)
+                .await?;
+            migrated?;
+            drop(connection);
             if sqlx::query!("SELECT id FROM node LIMIT 1")
                 .fetch_optional(&pool)
                 .await?
@@ -213,8 +248,8 @@ impl Store {
             .await?;
         } else {
             ensure!(
-                version == 5,
-                "database schema is not initialized; run setup"
+                version == 6,
+                "database schema needs initialization or migration; run setup"
             );
         }
         Ok((
@@ -229,18 +264,18 @@ impl Store {
     pub async fn group(&self, group: &str) -> Result<Group> {
         sqlx::query_as!(
             Group,
-            "SELECT name, socket, paused, auto_prompt, home_machine FROM groups WHERE name = ?",
+            "SELECT name, NULLIF(socket, '') AS \"socket?: String\", paused, auto_prompt, home_machine FROM groups WHERE name = ?",
             group
         )
         .fetch_optional(&self.pool)
         .await?
-        .context("group not enrolled; run setup --group NAME --socket PATH")
+        .context("group not enrolled; run setup --group NAME")
     }
 
     pub async fn groups(&self) -> Result<Vec<Group>> {
         Ok(sqlx::query_as!(
             Group,
-            "SELECT name, socket, paused, auto_prompt, home_machine FROM groups ORDER BY name"
+            "SELECT name, NULLIF(socket, '') AS \"socket?: String\", paused, auto_prompt, home_machine FROM groups ORDER BY name"
         )
         .fetch_all(&self.pool)
         .await?)
@@ -249,7 +284,7 @@ impl Store {
     pub async fn enroll(&self, group: &str, socket: &str) -> Result<()> {
         name(group)?;
         ensure!(
-            Path::new(socket).is_absolute(),
+            socket.is_empty() || Path::new(socket).is_absolute(),
             "Herdr socket path must be absolute"
         );
         let mut tx = self.pool.begin().await?;
@@ -266,9 +301,14 @@ impl Store {
             .fetch_one(&mut *tx)
             .await?;
         ensure!(
-            old.socket == socket,
+            old.socket == socket || old.socket.is_empty(),
             "group belongs to another socket; choose a different group"
         );
+        if old.socket.is_empty() && !socket.is_empty() {
+            sqlx::query!("UPDATE groups SET socket=? WHERE name=?", socket, group)
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -289,7 +329,11 @@ impl Store {
     }
 
     pub async fn set_auto_prompt(&self, group: &str, enabled: bool) -> Result<()> {
-        self.group(group).await?;
+        let config = self.group(group).await?;
+        ensure!(
+            !enabled || config.socket.is_some(),
+            "automatic prompts require a Herdr socket"
+        );
         sqlx::query!(
             "UPDATE groups SET auto_prompt = ? WHERE name = ?",
             enabled,
@@ -301,66 +345,95 @@ impl Store {
     }
 
     pub async fn mailbox(&self, group: &str, participant: &str) -> Result<Mailbox> {
-        sqlx::query_as!(
-            Mailbox,
-            "SELECT * FROM mailboxes WHERE group_name = ? AND name = ?",
-            group,
-            participant
-        )
-        .fetch_optional(&self.pool)
-        .await?
-        .context("participant is not bound in this group")
+        sqlx::query_as!(MailboxRow,
+            "SELECT id,group_name,name,binding,binding_version,attempts,next_wake,alerted FROM mailboxes WHERE group_name=? AND name=?",
+            group, participant).fetch_optional(&self.pool).await?
+            .context("participant is not registered in this group")?.try_into()
     }
 
     pub async fn caller(&self, group: &str, pane: &str) -> Result<Mailbox> {
-        sqlx::query_as!(
-            Mailbox,
-            "SELECT * FROM mailboxes WHERE group_name = ? AND pane = ?",
-            group,
-            pane
-        )
-        .fetch_optional(&self.pool)
-        .await?
-        .context("caller pane is not bound in this group")
+        sqlx::query_as!(MailboxRow,
+            "SELECT id,group_name,name,binding,binding_version,attempts,next_wake,alerted FROM mailboxes WHERE group_name=? AND pane=?",
+            group, pane).fetch_optional(&self.pool).await?
+            .context("caller pane is not bound in this group")?.try_into()
     }
 
-    pub async fn bind(
+    pub(crate) async fn standalone_caller(
+        &self,
+        group: &str,
+        session: &uuid::Uuid,
+    ) -> Result<Mailbox> {
+        let session = session.to_string();
+        sqlx::query_as!(MailboxRow,
+            "SELECT id,group_name,name,binding,binding_version,attempts,next_wake,alerted FROM mailboxes WHERE group_name=? AND standalone_session=?",
+            group, session).fetch_optional(&self.pool).await?
+            .context("standalone session is unknown or replaced in this group")?.try_into()
+    }
+
+    pub async fn participants(&self, group: &str) -> Result<Vec<Participant>> {
+        self.group(group).await?;
+        let rows = sqlx::query_as!(MailboxRow,
+            "SELECT id,group_name,name,binding,binding_version,attempts,next_wake,alerted FROM mailboxes WHERE group_name=? ORDER BY name",
+            group).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                let mailbox = Mailbox::try_from(row)?;
+                Ok(Participant {
+                    id: mailbox.id,
+                    name: mailbox.name,
+                    runtime: mailbox.binding.runtime(),
+                    pane: mailbox.binding.herdr().map(|binding| binding.pane.clone()),
+                    availability: "unknown",
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) async fn set_binding(
         &self,
         group: &str,
         participant: &str,
-        agent: &Agent,
+        binding: &Binding,
         replace: bool,
     ) -> Result<()> {
         name(participant)?;
         self.group(group).await?;
-        let session = agent.identity()?;
         let mut tx = self.pool.begin().await?;
-        // Taking the writer lock also serializes binding changes against sends/resolutions.
-        sqlx::query!("UPDATE groups SET paused = paused WHERE name = ?", group)
+        sqlx::query!("UPDATE groups SET paused=paused WHERE name=?", group)
             .execute(&mut *tx)
             .await?;
-        let old = sqlx::query_as!(
-            Mailbox,
-            "SELECT * FROM mailboxes WHERE group_name = ? AND name = ?",
-            group,
-            participant
-        )
-        .fetch_optional(&mut *tx)
-        .await?;
+        let old = sqlx::query_as!(MailboxRow,
+            "SELECT id,group_name,name,binding,binding_version,attempts,next_wake,alerted FROM mailboxes WHERE group_name=? AND name=?",
+            group, participant).fetch_optional(&mut *tx).await?;
+        let encoded = serde_json::to_string(binding)?;
         if let Some(old) = old {
+            let old = Mailbox::try_from(old)?;
             ensure!(
-                old.remote_machine.is_none(),
+                !matches!(old.binding, Binding::Remote { .. }),
                 "remote route cannot be rebound as a local agent"
             );
             ensure!(
-                agent.matches(&old) || replace,
+                old.binding.same_identity(binding) || replace,
                 "binding changed; use --replace after confirming the intended participant"
             );
-            sqlx::query!("UPDATE mailboxes SET pane=?, terminal=?, agent=?, session_kind=?, session_value=?, cwd=? WHERE id=?",
-                agent.pane_id, agent.terminal_id, session.agent, session.kind, session.value, agent.cwd, old.id).execute(&mut *tx).await?;
+            if old.binding != *binding {
+                sqlx::query!(
+                    "UPDATE mailboxes SET binding=?,binding_version=binding_version+1 WHERE id=?",
+                    encoded,
+                    old.id
+                )
+                .execute(&mut *tx)
+                .await?;
+            }
         } else {
-            sqlx::query!("INSERT INTO mailboxes(group_name,name,pane,terminal,agent,session_kind,session_value,cwd) VALUES (?,?,?,?,?,?,?,?)",
-                group, participant, agent.pane_id, agent.terminal_id, session.agent, session.kind, session.value, agent.cwd).execute(&mut *tx).await?;
+            sqlx::query!(
+                "INSERT INTO mailboxes(group_name,name,binding) VALUES (?,?,?)",
+                group,
+                participant,
+                encoded
+            )
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         Ok(())
@@ -370,10 +443,10 @@ impl Store {
         tx: &mut Transaction<'_, Sqlite>,
         actor: &Mailbox,
     ) -> Result<()> {
-        let r = sqlx::query!("UPDATE mailboxes SET attempts=attempts WHERE id=? AND pane=? AND terminal=? AND agent=? AND session_kind=? AND session_value=?",
-            actor.id, actor.pane, actor.terminal, actor.agent, actor.session_kind, actor.session_value).execute(&mut **tx).await?;
+        let result = sqlx::query!("UPDATE mailboxes SET attempts=attempts WHERE id=? AND binding_version=? AND remote_machine IS NULL",
+            actor.id, actor.binding_version).execute(&mut **tx).await?;
         ensure!(
-            r.rows_affected() == 1,
+            result.rows_affected() == 1,
             "binding changed during operation; retry from the current participant"
         );
         Ok(())
@@ -384,13 +457,9 @@ impl Store {
         actor: &Mailbox,
     ) -> Result<()> {
         let current = sqlx::query!(
-            "SELECT id FROM mailboxes WHERE id=? AND pane=? AND terminal=? AND agent=? AND session_kind=? AND session_value=?",
+            "SELECT id FROM mailboxes WHERE id=? AND binding_version=? AND remote_machine IS NULL",
             actor.id,
-            actor.pane,
-            actor.terminal,
-            actor.agent,
-            actor.session_kind,
-            actor.session_value
+            actor.binding_version
         )
         .fetch_optional(&mut **tx)
         .await?;
@@ -644,8 +713,8 @@ impl Store {
 
     pub async fn reserve(&self, actor: &Mailbox, now: i64) -> Result<bool> {
         let next = now.checked_add(300).context("clock overflow")?;
-        let result = sqlx::query!("UPDATE mailboxes SET attempts=attempts+1,next_wake=? WHERE id=? AND pane=? AND terminal=? AND session_kind=? AND session_value=? AND attempts<3 AND next_wake<=? AND EXISTS(SELECT 1 FROM groups WHERE name=mailboxes.group_name AND paused=0) AND EXISTS(SELECT 1 FROM deliveries WHERE recipient=mailboxes.id AND state='pending')",
-            next, actor.id, actor.pane, actor.terminal, actor.session_kind, actor.session_value, now).execute(&self.pool).await?;
+        let result = sqlx::query!("UPDATE mailboxes SET attempts=attempts+1,next_wake=? WHERE id=? AND binding_version=? AND pane IS NOT NULL AND attempts<3 AND next_wake<=? AND EXISTS(SELECT 1 FROM groups WHERE name=mailboxes.group_name AND paused=0 AND auto_prompt=1) AND EXISTS(SELECT 1 FROM deliveries WHERE recipient=mailboxes.id AND state='pending')",
+            next, actor.id, actor.binding_version, now).execute(&self.pool).await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -663,28 +732,5 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
-    }
-
-    pub async fn authenticate(&self, group: &str) -> Result<Mailbox> {
-        ensure!(
-            std::env::var("HERDR_ENV").as_deref() == Ok("1"),
-            "agent commands must run inside Herdr"
-        );
-        let pane = std::env::var("HERDR_PANE_ID").context("missing caller pane identity")?;
-        let group = self.group(group).await?;
-        let caller_socket =
-            std::env::var("HERDR_SOCKET_PATH").context("missing caller Herdr socket")?;
-        ensure!(
-            Path::new(&caller_socket) == Path::new(&group.socket),
-            "caller belongs to a different Herdr session"
-        );
-        let binding = self.caller(&group.name, &pane).await?;
-        let live = crate::herdr::agent(Path::new(&group.socket), &pane).await?;
-        if !live.matches(&binding) {
-            bail!(
-                "participant binding no longer matches this agent; operator rebinding is required"
-            );
-        }
-        Ok(binding)
     }
 }

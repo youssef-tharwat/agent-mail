@@ -7,7 +7,22 @@ use tokio::{
     net::UnixStream,
 };
 
-use crate::{PLUGIN_ID, store::Mailbox};
+use crate::{
+    PLUGIN_ID,
+    identity::Binding,
+    store::{Mailbox, Store},
+};
+
+/// A verified Herdr session bound to a durable Mail participant.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HerdrBinding {
+    pub pane: String,
+    pub terminal: String,
+    pub agent: String,
+    pub session_kind: String,
+    pub session_value: String,
+    pub cwd: Option<String>,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Session {
@@ -50,7 +65,10 @@ impl Agent {
         Ok(session)
     }
 
-    pub fn matches(&self, binding: &Mailbox) -> bool {
+    pub fn matches(&self, mailbox: &Mailbox) -> bool {
+        let Some(binding) = mailbox.binding.herdr() else {
+            return false;
+        };
         self.identity().is_ok_and(|s| {
             self.pane_id == binding.pane
                 && self.terminal_id == binding.terminal
@@ -131,4 +149,56 @@ pub async fn notify(socket: &Path, group: &str, count: usize) -> Result<()> {
     )
     .await?;
     Ok(())
+}
+
+impl Store {
+    /// Bind a mailbox to a native Herdr identity, preserving its durable address.
+    pub async fn bind(
+        &self,
+        group: &str,
+        participant: &str,
+        agent: &Agent,
+        replace: bool,
+    ) -> Result<()> {
+        ensure!(
+            self.group(group).await?.socket.is_some(),
+            "configure a Herdr socket before binding"
+        );
+        let session = agent.identity()?;
+        let binding = Binding::Herdr(HerdrBinding {
+            pane: agent.pane_id.clone(),
+            terminal: agent.terminal_id.clone(),
+            agent: session.agent.clone(),
+            session_kind: session.kind.clone(),
+            session_value: session.value.clone(),
+            cwd: agent.cwd.clone(),
+        });
+        self.set_binding(group, participant, &binding, replace)
+            .await
+    }
+
+    pub(crate) async fn authenticate_herdr(&self, group: &str) -> Result<Mailbox> {
+        ensure!(
+            std::env::var("HERDR_ENV").as_deref() == Ok("1"),
+            "no Herdr session or standalone credential"
+        );
+        let pane = std::env::var("HERDR_PANE_ID").context("missing caller pane identity")?;
+        let group = self.group(group).await?;
+        let socket = std::env::var("HERDR_SOCKET_PATH").context("missing caller Herdr socket")?;
+        let configured_socket = group
+            .socket
+            .as_deref()
+            .context("group has no Herdr socket")?;
+        ensure!(
+            Path::new(&socket) == Path::new(configured_socket),
+            "caller belongs to a different Herdr session"
+        );
+        let binding = self.caller(&group.name, &pane).await?;
+        let live = agent(Path::new(configured_socket), &pane).await?;
+        ensure!(
+            live.matches(&binding),
+            "participant binding no longer matches this agent; operator rebinding is required"
+        );
+        Ok(binding)
+    }
 }

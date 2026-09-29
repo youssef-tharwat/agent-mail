@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check release version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          test "$RELEASE_TAG" = "v$version"
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-features
+      - run: cargo build --release --locked
+      - name: Package and smoke test
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "$RELEASE_TARGET"
+          ./target/release/agent-mail --version
+          mkdir -p dist package
+          cp target/release/agent-mail LICENSE package/
+          archive="agent-mail-$RELEASE_TAG-$RELEASE_TARGET.tar.gz"
+          tar -czf "dist/$archive" -C package agent-mail LICENSE
+          cd dist
+          shasum -a 256 "$archive" > "$archive.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --title "Agent Mail $RELEASE_TAG" --generate-notes
