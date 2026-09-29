@@ -82,7 +82,7 @@ No ACP launcher or automatic credential export ships in v0.3.
 - [x] Pass local formatting, strict Clippy and all tests (58 plus one doctest).
   Concurrent maintenance changes are preserved.
 - [x] Version source and the plugin manifest as 0.4.0.
-- [ ] Publish after integrated review and CI; binaries are still v0.3.0.
+- [x] Publish v0.4.0 after local validation and macOS/Linux CI.
 
 ACP and remote SSH acceptance remain deferred. The schema 10 streaming bridge
 is complemented by native terminal inbox integration in schema 11 below.
@@ -107,14 +107,13 @@ Keep the streaming bridge as an advanced integration. Do not build a terminal
 client, approval UI, model-driven acknowledgment loop or ACP dependency.
 
 
-## Release hold: CLI workflow redesign
+## Earlier release hold: CLI workflow redesign (resolved)
 
 The user paused v0.4.0 publication to simplify installation, defaults and the
 command model. No backward CLI compatibility is required; stored data must survive.
-The proposed keep/merge/automate/remove mapping and workflow acceptance criteria
-are in [CLI redesign](CLI_REDESIGN.md). This is a design proposal, not implemented
-behavior. Do not publish the release or tap until this pass is complete and the
-release hold is lifted.
+The keep/merge/automate/remove mapping and workflow acceptance criteria are in
+[CLI redesign](CLI_REDESIGN.md). The approved pass below implemented the redesign
+and lifted this hold after validation.
 
 
 ## Approved CLI and distribution pass
@@ -132,4 +131,10 @@ provenance, durable runtime delivery policy and optional business deadlines.
 - [x] Complete regression and live acceptance on the final interface: 66 tests
   and one doctest, strict Clippy, mixed Claude/Codex correction and acceptance,
   then Claude resume and compaction recovery.
-- [ ] Publish v0.4.0 binaries and verify Homebrew/direct installation.
+- [x] Publish v0.4.0 binaries for all four targets and verify Homebrew/direct
+  installation against the published artifacts. Both installed binaries passed
+  fresh-store task recovery, messaging, atomic acceptance and safe retries.
+
+Release: https://github.com/youssef-tharwat/agent-mail/releases/tag/v0.4.0
+
+Homebrew tap: https://github.com/youssef-tharwat/homebrew-tap

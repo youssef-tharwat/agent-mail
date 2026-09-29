@@ -60,3 +60,13 @@ requests resolved. The Claude worker then resumed and compacted; recovery report
 the accepted task at version 3 with no remaining open assignment. No fixture
 permission requests were denied. The test used native delivery and generated
 `adapter claude-hook` settings, not manual context polling by either agent.
+
+
+## Published binary verification
+
+The final source passed 66 automated tests, one doctest and strict Clippy. All
+four release runners passed their validation and binary smoke checks. The actual
+v0.4.0 Apple Silicon release was installed through both the checksum-verifying
+script and the public Homebrew formula. Each installed binary passed a fresh-store
+flow covering participant creation, task recovery, messages, atomic acceptance
+and identical retries. Existing Mail databases and runtime settings were untouched.
