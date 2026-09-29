@@ -149,4 +149,6 @@ Homebrew tap: https://github.com/youssef-tharwat/homebrew-tap
 - [x] Preserve native terminal, signals, exit status, and identity across resume.
 - [x] Complete startup and resume recovery with real Claude/Codex clients;
   verify concurrent identities, rotation, native exit/signal behavior and settings preservation.
-- [ ] Publish v0.5.1 and verify the Homebrew upgrade.
+- [x] Publish v0.5.1 after 70 tests, one doctest, strict Clippy and all four
+  platform release gates. Verify direct installation and the Homebrew upgrade
+  with agent registration, automatic identity, task/mail flow and native exit status.

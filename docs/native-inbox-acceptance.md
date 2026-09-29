@@ -92,3 +92,15 @@ then exercised through startup and resume. Existing explicit settings paths and
 custom hook files are passed through unchanged. Automated process tests cover
 concurrent agent identities, credential replacement, unknown agents, missing
 executables, child exit status and termination signals.
+
+
+The v0.5.1 release passed 70 tests, one doctest, strict Clippy and all four
+platform release gates. The earlier v0.5.0 candidate remained unpublished after
+a Linux test exposed a five-second storage-speed assumption in the stream
+liveness test. v0.5.1 separates that from the unchanged reconciliation deadline
+and reports write progress on timeout. No runtime stream code changed.
+
+Both the checksum-verifying installer and the Homebrew upgrade were tested with
+the published Apple Silicon binary. Registration emitted no credential; `run`
+supplied identity for assignment, recovery, result delivery and atomic closure.
+Child exit status was preserved. Existing user Mail state was not modified.
