@@ -440,6 +440,7 @@ impl Store {
                 .await?;
         }
         tx.commit().await?;
+        crate::stream::hint(&self.root).await;
         Ok(Receipt { ack: accepted })
     }
 

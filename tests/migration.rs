@@ -40,7 +40,7 @@ async fn existing_version_four_state_upgrades_to_opt_in_sync() -> Result<()> {
     let version = sqlx::query!("PRAGMA user_version")
         .fetch_one(&store.pool)
         .await?;
-    assert_eq!(version.user_version, Some(8));
+    assert_eq!(version.user_version, Some(9));
     let peer = uuid::Uuid::new_v4();
     store.add_peer(peer, "test-host").await?;
     assert!(!store.peers_status().await?[0].auto_sync);
@@ -176,5 +176,59 @@ async fn invalid_legacy_references_abort_the_migration_atomically() -> Result<()
         messages.count, 1,
         "failed migration must preserve original data"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn published_six_and_eight_upgrade_with_binding_and_receipts_intact() -> Result<()> {
+    for version in [6, 8] {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("state");
+        let migrations = temp.path().join("migrations");
+        fs::create_dir_all(&root)?;
+        fs::create_dir_all(&migrations)?;
+        for entry in fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let text = name.to_string_lossy();
+            if text.ends_with(".sql") && text[..4].parse::<u32>()? <= version {
+                fs::copy(entry.path(), migrations.join(name))?;
+            }
+        }
+        let pool = SqlitePoolOptions::new()
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(root.join("mail.db"))
+                    .create_if_missing(true),
+            )
+            .await?;
+        sqlx::migrate::Migrator::new(migrations.as_path())
+            .await?
+            .run(&pool)
+            .await?;
+        // Historical schema fixture; runtime SQL is only for pre-migration schemas.
+        sqlx::raw_sql(r#"
+          INSERT INTO node VALUES ('00000000-0000-4000-8000-000000000001');
+          INSERT INTO groups(name,socket,home_machine) VALUES ('g','','00000000-0000-4000-8000-000000000001');
+          INSERT INTO mailboxes(id,group_name,name,binding) VALUES (1,'g','owner','{"runtime":"standalone","session":"00000000-0000-4000-8000-000000000002"}');
+          INSERT INTO work_items(group_name,id,scope,owner,writer,state,next_action,updated) VALUES ('g','task','Review','owner','owner','custom','Review',100);
+        "#).execute(&pool).await?;
+        if version == 8 {
+            sqlx::raw_sql("INSERT INTO codex_wakes(recipient,binding_version,socket,thread,delivered,attempts,next_attempt) VALUES(1,1,'/tmp/test.sock','00000000-0000-4000-8000-000000000003',1,2,400);").execute(&pool).await?;
+        }
+        pool.close().await;
+        let (store, _guard) = Store::open(&root, true).await?;
+        let actor = store.mailbox("g", "owner").await?;
+        assert_eq!(store.work_show(&actor, "task").await?.version, 1);
+        if version == 8 {
+            let endpoint = sqlx::query!(
+                "SELECT scanned,delivered,attempts,next_attempt FROM codex_wakes WHERE recipient=1"
+            )
+            .fetch_one(&store.pool)
+            .await?;
+            assert_eq!(endpoint.scanned, endpoint.delivered);
+            assert_eq!((endpoint.attempts, endpoint.next_attempt), (2, 400));
+        }
+    }
     Ok(())
 }

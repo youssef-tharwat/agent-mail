@@ -28,6 +28,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect setup without starting agents or changing configuration.
+    Doctor {
+        #[arg(long, default_value = "default")]
+        group: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Create the database and enroll a group. Does not bind or prompt agents.
     Setup {
         #[arg(long, default_value = "default")]
@@ -196,6 +203,15 @@ enum Command {
     /// Maintain small versioned work records in the same store as mail.
     #[command(subcommand)]
     Work(WorkCommand),
+    /// Stream committed events. Resume cursors must include their binding generation.
+    Watch {
+        #[arg(long, default_value = "default")]
+        group: String,
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+        #[arg(long)]
+        generation: Option<i64>,
+    },
     /// Operator: show durable pending work and the latest service diagnostics.
     Status,
     /// Operator: stop automatic prompts for a group. Message operations still work.
@@ -367,6 +383,13 @@ async fn run(cli: Cli) -> Result<()> {
     }
     let explicit_state = cli.state_dir.is_some();
     let root = supervision::state_root(cli.state_dir)?;
+    if let Command::Doctor { group, name } = &cli.command {
+        let report =
+            agent_mail::doctor::inspect(&root, group, name.as_deref(), cli.session.as_ref()).await;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        ensure!(!report.failed(), "diagnostic checks failed");
+        return Ok(());
+    }
     if matches!(cli.command, Command::Restore) && !root.join("mail.db").exists() {
         println!("{}", json!({"configured":false}));
         return Ok(());
@@ -744,6 +767,26 @@ async fn run(cli: Cli) -> Result<()> {
                 serde_json::to_value(store.work_history(&actor, &id).await?)?
             }
         },
+        Command::Watch {
+            group,
+            after,
+            generation,
+        } => {
+            let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+            ensure!(
+                after == 0 || generation == Some(actor.binding_version),
+                "resuming requires --generation matching the current binding; otherwise recover with --after 0"
+            );
+            let mut stream = agent_mail::stream::connect(&store, &actor, after).await?;
+            loop {
+                let frame = agent_mail::stream::next(&mut stream).await?;
+                println!("{}", serde_json::to_string(&frame)?);
+                ensure!(
+                    !matches!(frame, agent_mail::stream::Frame::Error { .. }),
+                    "stream ended; recover and reconnect"
+                );
+            }
+        }
         Command::Status => {
             let report = root.join("service-status.json");
             let diagnostics = if report.exists() {
@@ -752,7 +795,7 @@ async fn run(cli: Cli) -> Result<()> {
                 Value::Null
             };
             let (outbox_pending, outbox_oldest) = store.outbox_status().await?;
-            json!({"service_running":service::running(&root),"now":now()?,"groups":store.groups().await?,"inboxes":store.pending().await?,"notifications":store.notification_status().await?,"codex":store.codex_status().await?,"peers":store.peers_status().await?,"outbox_pending":outbox_pending,"outbox_oldest":outbox_oldest,"last_scan":diagnostics})
+            json!({"service_running":service::running(&root),"now":now()?,"groups":store.groups().await?,"inboxes":store.pending().await?,"notifications":store.notification_status().await?,"codex":store.codex_status().await?,"attention":store.attention(now()?).await?,"peers":store.peers_status().await?,"outbox_pending":outbox_pending,"outbox_oldest":outbox_oldest,"last_scan":diagnostics})
         }
         Command::Pause { group } => {
             store.pause(&group, true).await?;
@@ -781,7 +824,7 @@ async fn run(cli: Cli) -> Result<()> {
             service::run(&store, once).await?;
             return Ok(());
         }
-        Command::Service(_) | Command::Restore | Command::HooksConfig => {
+        Command::Doctor { .. } | Command::Service(_) | Command::Restore | Command::HooksConfig => {
             unreachable!("handled before opening database")
         }
     };

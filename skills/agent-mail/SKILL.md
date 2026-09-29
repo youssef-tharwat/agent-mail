@@ -14,7 +14,7 @@ Use the assigned group and identity. A Herdr pane uses its verified binding with
 
 ## Automatic recovery when configured
 
-On v0.3 source builds with trusted lifecycle hooks or a configured Codex queue adapter, use the supplied Agent Mail
+On v0.3 or later with trusted lifecycle hooks or a configured Codex queue adapter, use the supplied Agent Mail
 recovery context directly. Do not run another `context` merely to repeat it.
 Fetch details by ID when the supplied view is insufficient. Hook delivery and
 `ack` receipts never mean a request was handled; acknowledgment is the runtime
@@ -43,3 +43,5 @@ operator that automatic recovery is not configured.
 Only the operator attaches or detaches Codex wake endpoints. Do not rearm a delivery budget yourself or poll while waiting for the other agent. A queued update may be repeated after a lost transport response; use stable operation keys.
 
 Herdr prompts remain off by default. Trusted client hooks supply recovery automatically; manual checkpoints are the fallback when hooks are unavailable.
+
+If delivery appears broken, report `agent-mail doctor --group <group> --name <participant>` to the operator. Do not launch an agent, rotate identity, or rearm retries to repair it yourself. Deadline and delivery warnings are attention facts, not permission to retry work. `watch` is for programmatic consumers; do not use it to keep a model turn waiting.

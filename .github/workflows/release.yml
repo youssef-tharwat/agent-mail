@@ -46,6 +46,11 @@ jobs:
           set -eu
           test "$(rustc -vV | sed -n 's/^host: //p')" = "$RELEASE_TARGET"
           ./target/release/agent-mail --version
+          smoke_root=$(mktemp -d)
+          ./target/release/agent-mail --state-dir "$smoke_root/state" setup --standalone >/dev/null
+          ./target/release/agent-mail --state-dir "$smoke_root/state" status | jq -e '.attention.work == []' >/dev/null
+          ./target/release/agent-mail watch --help >/dev/null
+          ./target/release/agent-mail doctor --help >/dev/null
           mkdir -p dist package
           cp target/release/agent-mail LICENSE package/
           archive="agent-mail-$RELEASE_TAG-$RELEASE_TARGET.tar.gz"

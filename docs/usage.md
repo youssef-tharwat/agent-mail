@@ -17,7 +17,7 @@ No Rust toolchain or Herdr installation is required.
 For example, on Apple Silicon:
 
 ```sh
-version=0.2.0
+version=0.3.0
 target=aarch64-apple-darwin
 archive="agent-mail-v${version}-${target}.tar.gz"
 base="https://github.com/youssef-tharwat/agent-mail/releases/download/v${version}"
@@ -35,7 +35,7 @@ checksum. macOS binaries are not Apple-notarized.
 Or build from source with Rust 1.85+:
 
 ```sh
-cargo install --git https://github.com/youssef-tharwat/agent-mail --tag v0.2.0 --locked
+cargo install --git https://github.com/youssef-tharwat/agent-mail --tag v0.3.0 --locked
 ```
 
 ## Quick start
@@ -117,11 +117,10 @@ ln -s "$(pwd)/skills/agent-mail" ~/.codex/skills/agent-mail
 Then ask a bound or registered agent to use `$agent-mail`, or let Codex select it for an
 Agent Mail task. Other agent tools can read the same `SKILL.md` directly.
 
-## Automatic recovery and change notifications (unreleased v0.3)
+## Automatic recovery and change notifications (v0.3)
 
-This section describes the source checkout. The published v0.2.0 binaries do
-not include these commands. Build this revision with `cargo install --path . --locked`.
-Stop existing Mail workers and run `setup` to migrate a backed-up store to schema 8;
+These commands require v0.3.0 or later.
+Stop existing Mail workers and run `setup` to migrate a backed-up store to schema 9;
 v0.2.0 cannot open the upgraded database.
 
 Mail and work changes automatically publish recipient-scoped events in the same
@@ -195,9 +194,11 @@ client its participant credential as described above; attachment only configures
 delivery, it does not set the client's environment. One thread can serve one Mail
 participant per store.
 
-The worker waits until the thread is idle, then queues a summary capped at 6,000
+The worker wakes an idle thread for current actionable obligations, using a summary capped at 6,000
 UTF-8 bytes. Codex starts the turn; no agent poll or separate `context` call is
-needed. Changes made while busy remain durable. Install the lifecycle hooks too
+needed. Changes made while busy remain durable. Closed or reassigned work can steer an active
+turn with an expected-turn precondition. Idle closure and passive receipt changes
+remain available for recovery without starting courtesy turns. Install the lifecycle hooks too
 for recovery during compaction and session resume. The queue adapter was tested
 against Codex 0.157.0's experimental app-server API.
 
@@ -418,3 +419,46 @@ cargo test --locked
 ```
 
 License: MIT.
+
+## Local event stream (v0.3)
+
+Start the existing worker with `agent-mail service run`. In a participant's
+configured environment:
+
+```sh
+agent-mail watch --group project
+# Reconnect using the last event ID and the binding generation from Ready:
+agent-mail watch --group project --after 42 --generation 1
+```
+
+The private `events.sock` uses versioned newline-delimited JSON. `ready` identifies
+the participant and binding generation; `event` contains an ID, kind, subject,
+and revision. It contains no message body or credential. Save the cursor only
+after your consumer processes the event. A subscription never acknowledges Mail
+or resolves work. Replacing the binding closes the old subscription; recover with
+the new credential and cursor zero.
+
+Database commits precede best-effort socket hints. Missed hints reconcile within
+the worker's five-second interval. Writes succeed while the worker is stopped.
+Replay uses batches of 32; at most 32 connections are admitted. An unread socket
+is disconnected after a two-second blocked write and can resume from its cursor.
+This stream is for programs; agents use runtime delivery and lifecycle recovery.
+
+## Diagnose setup and attention (v0.3)
+
+```sh
+agent-mail doctor --group project --name worker
+agent-mail status
+```
+
+`doctor` checks schema, selected identity, worker, authenticated stream, and the
+configured runtime capability. Omit `--name` to check the caller's credential.
+It emits structured checks (`pass`, `fail`, `warning`, `unknown`); exit 1 means at
+least one failed check, exit 0 means none. Unknown hook trust requires a real
+client check. Diagnostics never launch an agent, grant approval, or rotate identity.
+
+`status.attention` lists open local work, explicit overdue deadlines, missing
+standalone endpoints, unconfirmed attempts, and exhausted delivery budgets.
+Results are bounded and expose `more` when truncated. Delivery is not progress:
+accepted input leaves work open until its designated writer decides. No elapsed
+period or workflow-state label invents a waiting state, deadline, or extra reminder.

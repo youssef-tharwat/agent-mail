@@ -296,6 +296,11 @@ fn relay_result(job: std::result::Result<Result<Vec<Value>>, JoinError>) -> Vec<
 
 pub async fn run(store: &Store, once: bool) -> Result<()> {
     let guard = WorkerLock::acquire(&store.root)?;
+    let stream = if once {
+        None
+    } else {
+        Some(crate::stream::Server::start(store.clone())?)
+    };
     let mut last_relay = None::<tokio::time::Instant>;
     let mut relay_jobs = JoinSet::<Result<Vec<Value>>>::new();
     let mut relay_report = Vec::new();
@@ -348,6 +353,7 @@ pub async fn run(store: &Store, once: bool) -> Result<()> {
         }
         tokio::select! {
             () = tokio::time::sleep(Duration::from_secs(5)) => {},
+            () = async { if let Some(server)=&stream { server.changed.notified().await } else { std::future::pending::<()>().await } } => {},
             result = tokio::signal::ctrl_c() => { result?; break; }
         }
     }

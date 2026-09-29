@@ -14,6 +14,7 @@ struct Server {
     received: Arc<AtomicUsize>,
     lose: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
+    unloaded: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Server {
@@ -25,9 +26,12 @@ fn server(listener: UnixListener, thread: Uuid) -> Server {
     let received = Arc::new(AtomicUsize::new(0));
     let lose = Arc::new(AtomicBool::new(false));
     let active = Arc::new(AtomicBool::new(false));
+    let unloaded = Arc::new(AtomicBool::new(false));
+    let absent = unloaded.clone();
     let (count, loss, busy) = (received.clone(), lose.clone(), active.clone());
     let task = tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
+            let absent = absent.clone();
             let (count, loss, busy) = (count.clone(), loss.clone(), busy.clone());
             tokio::spawn(async move {
                 let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
@@ -41,8 +45,20 @@ fn server(listener: UnixListener, thread: Uuid) -> Server {
                     let result = match r["method"].as_str().unwrap() {
                         "initialize" => json!({}),
                         "thread/read" => {
-                            json!({"thread":{"id":thread,"ephemeral":false,"status":{"type":if busy.load(Ordering::SeqCst){"active"}else{"idle"}}}})
+                            json!({"thread":{"id":thread,"ephemeral":false,"turns":[{"id":"turn-active","status":"inProgress"}],"status":{"type":if absent.load(Ordering::SeqCst){"notLoaded"}else if busy.load(Ordering::SeqCst){"active"}else{"idle"}}}})
                         }
+                        "turn/steer" => {
+                            assert_eq!(r["params"]["expectedTurnId"], "turn-active");
+                            assert!(
+                                r["params"]["input"][0]["text"]
+                                    .as_str()
+                                    .unwrap()
+                                    .contains("Stop only assignments")
+                            );
+                            count.fetch_add(1, Ordering::SeqCst);
+                            json!({"turnId":"turn-active"})
+                        }
+                        "thread/queue/list" => json!({"queuedSubmissions":[]}),
                         "thread/queue/add" => {
                             assert_eq!(r["params"]["threadId"], thread.to_string());
                             let text = r["params"]["input"][0]["text"].as_str().unwrap();
@@ -72,6 +88,7 @@ fn server(listener: UnixListener, thread: Uuid) -> Server {
         received,
         lose,
         active,
+        unloaded,
         task,
     }
 }
@@ -209,5 +226,99 @@ async fn lost_receipts_use_durable_bounded_retries_and_pause_is_respected() -> R
     store.detach_codex(&actor).await?;
     service::tick(&store, 2400).await?;
     assert_eq!(server.received.load(Ordering::SeqCst), 6);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_reaches_active_owner_but_idle_closure_does_not_wake() -> Result<()> {
+    for (active, reassigned) in [(false, false), (true, false), (false, true), (true, true)] {
+        let dir = tempfile::tempdir()?;
+        let socket = dir.path().join("codex.sock");
+        let thread = Uuid::new_v4();
+        let server = server(UnixListener::bind(&socket)?, thread);
+        let (store, _guard) = Store::open(dir.path(), true).await?;
+        store.enroll("g", "").await?;
+        store.register("g", "writer", false).await?;
+        store.register("g", "new-owner", false).await?;
+        store.register("g", "worker", false).await?;
+        let actor = store.mailbox("g", "worker").await?;
+        let writer = store.mailbox("g", "writer").await?;
+        store.attach_codex(&actor, &socket, thread).await?;
+        store
+            .work_create(
+                &writer,
+                WorkDraft {
+                    id: "task".into(),
+                    scope: "Review".into(),
+                    owner: "worker".into(),
+                    state: "active".into(),
+                    next_action: "Inspect evidence".into(),
+                    deadline: Some(1100),
+                    evidence: vec![],
+                },
+                1000,
+            )
+            .await?;
+        service::tick(&store, 1000).await?;
+        assert_eq!(server.received.load(Ordering::SeqCst), 1);
+        // Accepted runtime input without a decision remains open and overdue.
+        assert_eq!(store.attention(1200).await?.work.len(), 1);
+        service::tick(&store, 1200).await?;
+        assert_eq!(server.received.load(Ordering::SeqCst), 1);
+        server.active.store(active, Ordering::SeqCst);
+        store
+            .work_update(
+                &writer,
+                "task",
+                1,
+                agent_mail::work::WorkPatch {
+                    open: (!reassigned).then_some(false),
+                    owner: reassigned.then(|| "new-owner".into()),
+                    ..Default::default()
+                },
+                "Cancelled",
+                1201,
+            )
+            .await?;
+        service::tick(&store, 1201).await?;
+        assert_eq!(
+            server.received.load(Ordering::SeqCst),
+            if active { 2 } else { 1 }
+        );
+        assert_eq!(store.work_show(&writer, "task").await?.open, reassigned);
+        // Passive records remain available after a reset even without a courtesy turn.
+        assert!(
+            store
+                .latest_changes(&actor)
+                .await?
+                .iter()
+                .any(|e| e.subject == "task" && e.version == 2)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn doctor_rejects_an_unloaded_thread_even_when_its_socket_responds() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let socket = dir.path().join("codex.sock");
+    let thread = Uuid::new_v4();
+    let server = server(UnixListener::bind(&socket)?, thread);
+    let (store, guard) = Store::open(dir.path(), true).await?;
+    store.enroll("g", "").await?;
+    store.register("g", "worker", false).await?;
+    let actor = store.mailbox("g", "worker").await?;
+    store.attach_codex(&actor, &socket, thread).await?;
+    store.pool.close().await;
+    drop(guard);
+    server.unloaded.store(true, Ordering::SeqCst);
+    let report = agent_mail::doctor::inspect(dir.path(), "g", Some("worker"), None).await;
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|c| c.check == "endpoint" && c.status == agent_mail::doctor::Level::Fail)
+    );
+    assert_eq!(server.received.load(Ordering::SeqCst), 0);
     Ok(())
 }

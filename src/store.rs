@@ -211,7 +211,7 @@ impl Store {
             .await?
             .user_version
             .context("SQLite did not report its schema version")?;
-        ensure!(version <= 8, "database schema is newer than this binary");
+        ensure!(version <= 9, "database schema is newer than this binary");
         if setup {
             // Rebuilding a referenced table requires FK enforcement off outside
             // the migration transaction. The migration checks every FK before commit.
@@ -248,7 +248,7 @@ impl Store {
             .await?;
         } else {
             ensure!(
-                version == 8,
+                version == 9,
                 "database schema needs initialization or migration; run setup"
             );
         }
@@ -436,6 +436,7 @@ impl Store {
             .await?;
         }
         tx.commit().await?;
+        crate::stream::hint(&self.root).await;
         Ok(())
     }
 
@@ -550,6 +551,7 @@ impl Store {
         Self::lock_actor(&mut tx, actor).await?;
         let id = Self::publish_tx(&mut tx, actor, &mut publish, now).await?;
         tx.commit().await?;
+        crate::stream::hint(&self.root).await;
         Ok(id)
     }
 
@@ -585,6 +587,7 @@ impl Store {
         Self::lock_actor(&mut tx, actor).await?;
         let result = Self::resolve_tx(&mut tx, actor, id, note, reply, now).await?;
         tx.commit().await?;
+        crate::stream::hint(&self.root).await;
         Ok(result)
     }
 
@@ -708,6 +711,7 @@ impl Store {
         }
         Self::reset_empty(&mut tx, &actor.group_name).await?;
         tx.commit().await?;
+        crate::stream::hint(&self.root).await;
         Ok(())
     }
 

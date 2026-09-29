@@ -245,6 +245,7 @@ impl Store {
             .execute(&mut *tx).await?;
         relay::enqueue_snapshot(&mut tx, &item, None, now).await?;
         tx.commit().await?;
+        crate::stream::hint(&self.root).await;
         Ok(item)
     }
 
@@ -503,6 +504,7 @@ impl Store {
             .await?;
         }
         tx.commit().await?;
+        crate::stream::hint(&self.root).await;
         Ok(item)
     }
 

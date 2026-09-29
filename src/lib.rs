@@ -42,3 +42,9 @@ pub mod hooks;
 pub mod recovery;
 
 pub mod codex;
+
+pub mod attention;
+
+pub mod stream;
+
+pub mod doctor;

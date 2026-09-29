@@ -71,3 +71,33 @@ live testing verified Codex 0.157 prompt/resume recovery and PostCompact
 invalidation followed by next-boundary recovery. Immediate mid-turn reinjection
 is not promised. Claude hooks are protocol-tested only; there is no Claude idle
 wake adapter in this release. SSH acceptance is outside this local test.
+
+## Actionable routing acceptance — 2026-09-29
+
+With the schema-9 working tree, repeated the isolated two-Codex workflow on
+Codex 0.157.0. Native sessions and project files were disposable. The worker ran
+as a fresh CLI process for every tick; runtime sessions remained connected.
+
+| Measurement | Previous routing | Actionable routing |
+| --- | ---: | ---: |
+| Completed model turns | 8 | 4 |
+| Substantive turns | 4 | 4 |
+| Notification-only turns | 4 | 0 |
+| Injected summary bytes | 6,360 | 3,793 |
+| Resolved submissions | 2 | 2 |
+| Final work version | 3 | 3 |
+
+New payload sizes were 812, 993, 873, and 1,115 UTF-8 bytes. These are injected
+payload sizes, not total token usage. The worker submitted initial evidence;
+the reviewer requested a correction; the worker resubmitted; the reviewer
+accepted `test-revision` with `evidence.txt`. Initial writer updates and idle
+closure caused no extra turns. The same workflow completed with unchanged
+business decisions and both submission obligations resolved.
+
+Local fixture: `/private/tmp/am-two-agent-zcliryl5` (`trace.jsonl`, `result.json`,
+`threads.json`). It is ephemeral; no credentials or private traces are committed.
+This run exercised process restart, not compaction; the earlier compaction witness
+above remains the scoped evidence. Deterministic tests additionally cover active
+cancellation, stream replay, missed hints, binding replacement, recipient isolation,
+and slow-consumer disconnection. ACP, Claude/Claude and mixed-client acceptance are deferred from v0.3 by scope
+decision. Standalone Claude idle delivery is not supported.

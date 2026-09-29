@@ -793,7 +793,7 @@ async fn work_only_changes_wake_without_separate_mail_and_keep_retry_budget() ->
     assert!(f.store.inbox(&f.b, 0).await?.is_empty());
     service::tick(&f.store, 1000).await?;
     let initial = f.host.lock().await.prompts.len();
-    assert_eq!(initial, 2); // Both the designated writer and owner subscribe.
+    assert_eq!(initial, 1); // Both subscribe, but only the owner has a new obligation.
     service::tick(&f.store, 1001).await?;
     assert_eq!(f.host.lock().await.prompts.len(), initial);
     assert!(f.host.lock().await.prompts[0].contains("context"));

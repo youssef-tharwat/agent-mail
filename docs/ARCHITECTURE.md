@@ -325,3 +325,21 @@ solution until those paths pass.
   zero-account local installation with optional SSH, a compact shared register,
   and explicit unresolved-work supervision. This is a product hypothesis to
   validate, not a claim of unique underlying technology.
+
+## Local coordination increment (schema 9, v0.3)
+
+The existing worker owns a private Unix event socket. SQLite remains authoritative:
+mutations commit events, then issue a best-effort hint. Subscribers replay by event
+ID and binding generation; bounded writes and periodic reconciliation handle lost
+hints and slow clients. No model polls the stream.
+
+Wake routing classifies current obligations separately from durable history.
+`scanned` advances across passive updates without forging `delivered` receipts.
+Active Codex cancellation uses an expected-turn steer; idle closure is recovered
+at the next lifecycle boundary. Herdr retains its existing runtime safety checks.
+No mailbox-name match alone proves the current native session saw an action.
+
+Attention reports facts, never infers workflow progress. The work writer still owns
+acceptance. `doctor` probes setup without launching runtimes or approving hooks.
+ACP and standalone Claude idle delivery are deferred. Claude hook fixtures do not
+establish live recovery compatibility. See the implementation plan for release scope.

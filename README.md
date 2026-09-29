@@ -16,8 +16,7 @@ cargo install --git https://github.com/youssef-tharwat/agent-mail --locked
 ```
 
 [Prebuilt binaries](https://github.com/youssef-tharwat/agent-mail/releases/latest)
-are available for macOS and Linux. They currently ship v0.2.0; automatic recovery
-and Codex wake require the v0.3 source build above.
+are available for macOS and Linux.
 [Binary installation and upgrades](docs/usage.md#install).
 
 ## Quick start
@@ -60,9 +59,12 @@ Lifecycle hooks supply current work after resets and when state changes. The
 optional Codex adapter wakes idle sessions with a bounded summary. Agents do not
 need to poll. Idle wake requires a running Mail worker and an attached Codex session.
 
-[Set up hooks and Codex wake](docs/usage.md#automatic-recovery-and-change-notifications-unreleased-v03).
+[Set up hooks and Codex wake](docs/usage.md#automatic-recovery-and-change-notifications-v03).
 Tested with two live Codex agents through submission, correction, and acceptance.
 [Results and limits](docs/local-codex-acceptance.md).
+
+Use `agent-mail doctor --group project --name worker` to check setup.
+`agent-mail status` reports unresolved work and delivery issues.
 
 ## Agent skill
 
