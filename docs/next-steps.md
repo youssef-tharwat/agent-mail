@@ -1,7 +1,8 @@
 # Improvements from local testing
 
-These are proposed follow-ups, not implemented features. Keep the same CLI,
-SQLite store, and small background worker.
+These improvements are approved and specified in the active
+[implementation plan](IMPLEMENTATION_PLAN.md). They are not completed features.
+Keep the same CLI, SQLite store, and small background worker.
 
 Evidence: [local Codex acceptance](local-codex-acceptance.md).
 
@@ -34,9 +35,11 @@ work. The successful live run does not establish recovery from an agent ignoring
 an assignment.
 
 Report delivery and work progress separately. Surface expired deadlines,
-exhausted attempts, and missing endpoints as attention items. Use an existing
-deadline and a bounded follow-up policy for actionable work; do not repeatedly
-wake agents legitimately waiting for a review or blocked on an external action.
+exhausted attempts, and missing endpoints as attention items. Attention reporting
+is the default. Add a bounded deadline follow-up only when responsibility and
+waiting conditions are explicit; otherwise report the obligation to the operator.
+Do not add an agent-maintained bookkeeping flag or infer waiting from arbitrary
+workflow-state names.
 Never infer acceptance or automatically retry tool side effects.
 
 Test a client that accepts a notification but makes no progress. It should leave
@@ -56,8 +59,8 @@ attachment explicit, preserving unrelated client settings.
 
 ## Scope
 
-Prioritize fewer unnecessary turns and clear attention reporting, then setup
-checks. Extend the live acceptance harness with dropped receipts, stalled agents,
-and reset recovery as those behaviors change. No new broker, hosted service,
-workflow language, or agent runtime is needed. Remote SSH and another client's
-idle wake adapter remain separate work.
+The approved scope also includes a resumable local event stream, evaluation of
+ACP at the runtime boundary, and live Claude support alongside Codex. The active
+implementation plan defines their order and acceptance gates. No new broker,
+hosted service, workflow language, or agent supervisor is needed. Remote SSH
+validation remains separate work.
