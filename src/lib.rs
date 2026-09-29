@@ -1,3 +1,32 @@
+//! Durable mail, work records, and explicit runtime bindings for coding agents.
+//!
+//! Start with [`store::Store::open`] and register or bind participants through
+//! [`identity`] or [`herdr`]. Mutations authenticate a current mailbox snapshot;
+//! transport receipts never imply business completion. [`service`] drives retries,
+//! [`stream`] replays committed changes, and [`relay`] exchanges them over SSH.
+//!
+//! This is the application support library: fallible operations use `anyhow`.
+//! State and sockets require Unix. Automatic supervisor installation requires macOS.
+//! Timestamps supplied to business operations are Unix seconds, enabling deterministic tests.
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use agent_mail::store::Store;
+//!
+//! # #[tokio::main]
+//! # async fn main() -> anyhow::Result<()> {
+//! let root = std::path::Path::new("/tmp/agent-mail-example");
+//! let store = Store::open(root, true).await?;
+//! store.enroll("review", None).await?;
+//! let credential = store.register("review", "reviewer", false).await?;
+//! let actor = store.authenticate("review", Some(&credential)).await?;
+//! assert_eq!(actor.name, "reviewer");
+//! store.close().await;
+//! # Ok(())
+//! # }
+//! ```
+
 pub mod herdr;
 pub mod identity;
 pub mod relay;
@@ -6,10 +35,17 @@ pub mod store;
 pub mod supervision;
 pub mod work;
 
+/// Stable Herdr plugin identifier used for session-scoped enablement checks.
 pub const PLUGIN_ID: &str = "youssef-tharwat.agent-mail";
+/// Maximum message body size in UTF-8 bytes, keeping relay batches bounded.
 pub const BODY_LIMIT: usize = 8 * 1024;
+/// Maximum summary size in UTF-8 bytes for compact recovery views.
 pub const SUMMARY_LIMIT: usize = 240;
 
+/// Read the system clock as Unix seconds.
+///
+/// # Errors
+/// The clock precedes the Unix epoch or exceeds the signed timestamp range.
 pub fn now() -> anyhow::Result<i64> {
     Ok(i64::try_from(
         std::time::SystemTime::now()
@@ -18,6 +54,10 @@ pub fn now() -> anyhow::Result<i64> {
     )?)
 }
 
+/// Validate a bounded ASCII identifier.
+///
+/// # Errors
+/// The name is empty, exceeds 48 bytes, or contains unsupported characters.
 pub fn name(value: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         !value.is_empty()
@@ -30,6 +70,10 @@ pub fn name(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Validate a UTF-8 byte budget and reject embedded NUL characters.
+///
+/// # Errors
+/// The value exceeds `limit` bytes or contains a NUL character.
 pub fn bounded(value: &str, limit: usize, label: &str) -> anyhow::Result<()> {
     anyhow::ensure!(value.len() <= limit, "{label} exceeds {limit} UTF-8 bytes");
     anyhow::ensure!(!value.contains('\0'), "{label} contains a NUL byte");
@@ -48,3 +92,7 @@ pub mod attention;
 pub mod stream;
 
 pub mod doctor;
+
+pub mod claude;
+
+pub mod native;

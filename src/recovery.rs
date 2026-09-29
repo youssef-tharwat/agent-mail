@@ -1,8 +1,17 @@
-//! Bounded recovery view shared by CLI and automatic client hooks.
+//! Bounded recovery views shared by the CLI and automatic hooks.
+//!
+//! The view combines current work, unresolved mail, relay health, and continuation
+//! cursors. Payload budgets may truncate either collection; callers use the returned
+//! cursors to fetch more. Reading a recovery view does not acknowledge events.
+
 use crate::store::{Mailbox, Store};
 use anyhow::Result;
 use serde_json::{Value, json};
 impl Store {
+    /// Read bounded recovery state and continuation cursors for a participant.
+    ///
+    /// # Errors
+    /// The actor is stale or database reads or JSON encoding fail.
     pub async fn context_value(
         &self,
         actor: &Mailbox,

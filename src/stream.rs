@@ -1,4 +1,10 @@
-//! Private, resumable event stream. Socket hints never substitute for committed events.
+//! Private, resumable streams of committed coordination events.
+//!
+//! The server owns the worker lock and removes its socket before releasing that lock.
+//! Subscriptions authenticate the current binding generation, then replay from a
+//! cursor. Hints only accelerate replay; reconnecting never acknowledges business work.
+//! Use [`Server::shutdown`] to await client cleanup before starting a replacement.
+
 use crate::{identity::Binding, store::Store};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -11,7 +17,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
-    sync::{Notify, Semaphore, broadcast},
+    sync::{Notify, Semaphore, broadcast, oneshot},
     task::{JoinHandle, JoinSet},
 };
 
@@ -30,33 +36,49 @@ enum Request {
         after: i64,
     },
 }
+/// A versioned subscription response, committed event, or protocol error.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Frame {
+    /// The subscription has authenticated and is ready to replay.
     Ready {
+        /// Event-stream protocol version.
         version: u32,
+        /// Authenticated participant receiving this frame.
         participant: String,
+        /// Credential generation used for this subscription.
         binding_version: i64,
     },
+    /// One committed coordination event for the subscriber.
     Event {
+        /// Event-stream protocol version.
         version: u32,
+        /// Authenticated participant receiving this frame.
         participant: String,
+        /// Credential generation used for this subscription.
         binding_version: i64,
+        /// Committed coordination-event cursor.
         id: i64,
+        /// Category of the committed change.
         kind: String,
+        /// Identifier of the changed business record.
         subject: String,
+        /// Version of the subject when this event was committed.
         revision: i64,
     },
+    /// A protocol or subscription failure requiring caller handling.
     Error {
+        /// Message UUID or protocol failure description.
         message: String,
     },
 }
 
+/// Return the private event socket path beneath a state directory.
 pub fn socket(root: &Path) -> PathBuf {
     root.join("events.sock")
 }
 
-/// Best-effort post-commit acceleration; an absent worker cannot fail a committed operation.
+/// Send a best-effort acceleration hint after committing a state change.
 pub async fn hint(root: &Path) {
     let _ = tokio::time::timeout(Duration::from_millis(100), async {
         let mut stream = UnixStream::connect(socket(root)).await?;
@@ -67,50 +89,99 @@ pub async fn hint(root: &Path) {
     .await;
 }
 
+/// Event listener whose tasks share ownership of the worker lock.
+#[derive(Debug)]
 pub struct Server {
-    pub changed: Arc<Notify>,
+    changed: Arc<Notify>,
     task: JoinHandle<()>,
+    stop: Option<oneshot::Sender<()>>,
+}
+
+#[derive(Debug)]
+struct Endpoint {
     path: PathBuf,
+    _lock: crate::service::WorkerLock,
+}
+impl Drop for Endpoint {
+    fn drop(&mut self) {
+        // Remove our socket before releasing the worker lock. Client tasks also
+        // retain this guard, including while task cancellation is being polled.
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 impl Drop for Server {
     fn drop(&mut self) {
         self.task.abort();
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 impl Server {
-    /// Start only while holding the installation's worker lock.
+    /// Start the event server while exclusively owning the installation's worker lock.
+    ///
+    /// # Errors
+    /// Returns an error if another worker owns the lock, the socket path is not
+    /// a socket, or binding and setting private permissions fails.
+    ///
+    /// # Panics
+    /// Panics if called outside a Tokio runtime with I/O enabled.
     pub fn start(store: Store) -> Result<Self> {
-        let path = socket(&store.root);
+        let lock = crate::service::WorkerLock::acquire(store.root())?;
+        let path = socket(store.root());
         if let Ok(meta) = std::fs::symlink_metadata(&path) {
             ensure!(meta.file_type().is_socket(), "stream path is not a socket");
             std::fs::remove_file(&path)?;
         }
         let listener = UnixListener::bind(&path)?;
+        let endpoint = Arc::new(Endpoint {
+            path: path.clone(),
+            _lock: lock,
+        });
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         let changed = Arc::new(Notify::new());
         let notify = changed.clone();
+        let (stop, mut stopped) = oneshot::channel();
         let task = tokio::spawn(async move {
             let (signals, _) = broadcast::channel::<()>(1);
             let slots = Arc::new(Semaphore::new(32));
             let mut clients = JoinSet::new();
             loop {
                 tokio::select! {
+                    _ = &mut stopped => break,
                     accepted=listener.accept()=>{
                         let Ok((stream,_))=accepted else {break;};
                         let Ok(permit)=slots.clone().try_acquire_owned() else {continue;};
-                        let store=store.clone();let signals=signals.clone();let notify=notify.clone();
-                        clients.spawn(async move {let _permit=permit;let _=serve(stream,&store,&signals,&notify).await;});
+                        let store=store.clone();let signals=signals.clone();let notify=notify.clone();let endpoint=Arc::clone(&endpoint);
+                        clients.spawn(async move {let _endpoint=endpoint;let _permit=permit;let _=serve(stream,&store,&signals,&notify).await;});
                     }
                     _=clients.join_next(),if !clients.is_empty()=>{}
                 }
             }
+            clients.abort_all();
+            while clients.join_next().await.is_some() {}
+            drop(listener);
+            drop(endpoint);
         });
         Ok(Self {
             changed,
             task,
-            path,
+            stop: Some(stop),
         })
+    }
+
+    /// Wait for a committed-change hint; durable replay remains authoritative.
+    pub async fn changed(&self) {
+        self.changed.notified().await;
+    }
+
+    /// Stop the listener and all client tasks before releasing the worker lock.
+    ///
+    /// # Errors
+    /// Returns an error if the server task panicked or was externally cancelled.
+    pub async fn shutdown(mut self) -> Result<()> {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        (&mut self.task).await.context("event server task failed")?;
+        Ok(())
     }
 }
 async fn send(stream: &mut tokio::net::unix::OwnedWriteHalf, frame: &Frame) -> Result<()> {
@@ -163,7 +234,7 @@ async fn serve(
         let mut receiver=signals.subscribe();
         send(&mut write,&Frame::Ready{version:1,participant:participant.clone(),binding_version}).await?;
         loop {
-            let mut tx=store.pool.begin().await?;
+            let mut tx=store.pool().begin().await?;
             Store::check_actor(&mut tx,&actor).await?;
             let rows=sqlx::query!("SELECT id,kind,subject,version FROM coordination_events WHERE recipient=? AND id>? ORDER BY id LIMIT 32",actor.id,after).fetch_all(&mut *tx).await?;
             tx.commit().await?;
@@ -192,14 +263,17 @@ async fn serve(
     Ok(())
 }
 
-/// Connect using the already authenticated actor; streaming never acknowledges events.
+/// Subscribe using a mailbox credential and an exclusive replay cursor.
+///
+/// # Errors
+/// The cursor is negative, socket connection fails, or the handshake cannot be written.
 pub async fn connect(
     store: &Store,
     actor: &crate::store::Mailbox,
     after: i64,
 ) -> Result<BufReader<UnixStream>> {
     ensure!(after >= 0, "cursor must be nonnegative");
-    let mut stream = UnixStream::connect(socket(&store.root))
+    let mut stream = UnixStream::connect(socket(store.root()))
         .await
         .context("Mail worker unavailable; start agent-mail service run")?;
     let request = Request::Subscribe {
@@ -215,6 +289,10 @@ pub async fn connect(
     stream.write_all(&bytes).await?;
     Ok(BufReader::new(stream))
 }
+/// Read and decode one bounded event frame.
+///
+/// # Errors
+/// The stream closes, the frame is incomplete or oversized, or decoding fails.
 pub async fn next(reader: &mut BufReader<UnixStream>) -> Result<Frame> {
     serde_json::from_slice(&line(reader, 8192).await?).context("invalid event frame")
 }

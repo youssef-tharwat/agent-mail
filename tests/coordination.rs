@@ -246,8 +246,8 @@ async fn lost_hook_output_retries_with_a_persisted_budget_and_reset_restores() -
         work::WorkDraft,
     };
     let dir = tempfile::tempdir()?;
-    let (store, guard) = Store::open(dir.path(), true).await?;
-    store.enroll("g", "").await?;
+    let store = Store::open(dir.path(), true).await?;
+    store.enroll("g", None).await?;
     store.register("g", "worker", false).await?;
     let actor = store.mailbox("g", "worker").await?;
     store
@@ -271,9 +271,8 @@ async fn lost_hook_output_retries_with_a_persisted_budget_and_reset_restores() -
             .reserve_hook(&actor, "client", true, false, 1000)
             .await?
     );
-    store.pool.close().await;
-    drop(guard);
-    let (store, _guard) = Store::open(dir.path(), false).await?;
+    store.close().await;
+    let store = Store::open(dir.path(), false).await?;
     let input = || HookInput {
         hook_event_name: HookEvent::PostToolUse,
         session_id: "client".into(),

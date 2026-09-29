@@ -67,3 +67,23 @@ Neither finding justifies adding a second runtime layer now. A future ACP propos
 must show a concrete need, explicit session ownership, negotiated capabilities,
 permission forwarding, recovery behavior and an intentional credential boundary.
 No ACP launcher or automatic credential export ships in v0.3.
+
+
+## Native Claude parity — next release, ACP independent
+
+- [x] Share delivery policy, SQLite retry budgets, bounded context and diagnostics
+  across native Codex and Claude transports.
+- [x] Add an operator-owned Claude streaming bridge with bounded private socket
+  requests, session checks and runtime lifecycle receipts. Forward approvals.
+- [x] Preserve existing Codex request contracts and the `status.codex` view.
+- [x] Add schema 10 without rewriting published migrations; preserve Codex state.
+- [x] Run a live Claude/Claude submission, correction and acceptance flow.
+- [x] Finish live mixed-runtime, resume and compaction acceptance.
+- [x] Pass local formatting, strict Clippy and all tests (58 plus one doctest).
+  Concurrent maintenance changes are preserved.
+- [x] Version source and the plugin manifest as 0.4.0.
+- [ ] Publish after integrated review and CI; binaries are still v0.3.0.
+
+ACP and remote SSH acceptance remain deferred. Native Claude is a client-owned
+streaming process; attaching arbitrary existing interactive Claude terminals is
+outside this implementation.

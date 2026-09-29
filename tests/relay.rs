@@ -1,7 +1,9 @@
+//! Regression coverage for relay behavior.
+mod support;
 use agent_mail::{
     herdr::{Agent, Session},
     relay::{Envelope, Exchange, Receipt, machine},
-    store::{DatabaseGuard, Publish, Store},
+    store::{Publish, Store},
     work::WorkDraft,
 };
 use anyhow::Result;
@@ -12,7 +14,6 @@ use tokio::{io::AsyncWriteExt, process::Command};
 struct Node {
     _dir: TempDir,
     store: Store,
-    _guard: DatabaseGuard,
 }
 
 struct FakeSsh {
@@ -36,7 +37,7 @@ impl FakeSsh {
         Ok(Self {
             _dir: dir,
             path,
-            remote_state: remote.store.root.clone(),
+            remote_state: remote.store.root().to_path_buf(),
         })
     }
 
@@ -44,7 +45,7 @@ impl FakeSsh {
         let binary = env!("CARGO_BIN_EXE_agent-mail");
         let mut command = Command::new(binary);
         command
-            .args(["--state-dir", home.store.root.to_str().unwrap()])
+            .args(["--state-dir", home.store.root().to_str().unwrap()])
             .args(args)
             .env("PATH", &self.path)
             .env("AGENT_MAIL_TEST_BIN", binary)
@@ -75,19 +76,14 @@ impl Node {
         let dir = tempfile::Builder::new()
             .prefix("agent-mail-relay-")
             .tempdir_in("/tmp")?;
-        let (store, guard) = Store::open(&dir.path().join("state"), true).await?;
+        let store = Store::open(&dir.path().join("state"), true).await?;
         store
-            .enroll("g", &dir.path().join("herdr.sock").to_string_lossy())
+            .enroll("g", Some(&dir.path().join("herdr.sock")))
             .await?;
         store.bind("g", participant, &agent(pane), false).await?;
-        store.pool.close().await;
-        drop(guard);
-        let (store, guard) = Store::open(&dir.path().join("state"), false).await?;
-        Ok(Self {
-            _dir: dir,
-            store,
-            _guard: guard,
-        })
+        store.close().await;
+        let store = Store::open(&dir.path().join("state"), false).await?;
+        Ok(Self { _dir: dir, store })
     }
 
     async fn id(&self) -> Result<uuid::Uuid> {
@@ -155,10 +151,12 @@ async fn offline_mail_reply_resolution_and_snapshot_survive_replay() -> Result<(
     let home = Node::new("same-pane", "coordinator").await?;
     let remote = Node::new("same-pane", "worker").await?;
     remote.store.set_home("g", home.id().await?).await?;
-    home.store.route("g", "worker", remote.id().await?).await?;
+    home.store
+        .route("g", "worker", remote.id().await?, 1_000)
+        .await?;
     remote
         .store
-        .route("g", "coordinator", home.id().await?)
+        .route("g", "coordinator", home.id().await?, 1_000)
         .await?;
     let coordinator = home.store.mailbox("g", "coordinator").await?;
     let worker = remote.store.mailbox("g", "worker").await?;
@@ -237,7 +235,7 @@ async fn offline_mail_reply_resolution_and_snapshot_survive_replay() -> Result<(
         id,
         recipient.id
     )
-    .fetch_one(&home.store.pool)
+    .fetch_one(&support::pool(&home.store).await?)
     .await?
     .state;
     assert_eq!(state, "resolved");
@@ -246,7 +244,7 @@ async fn offline_mail_reply_resolution_and_snapshot_survive_replay() -> Result<(
         .publish(&coordinator, message("worker", "cancel", None), 1010)
         .await?;
     transfer(&home, &remote, 1011).await?;
-    home.store.withdraw(&coordinator, later).await?;
+    home.store.withdraw(&coordinator, later, 1_000).await?;
     transfer(&home, &remote, 1012).await?;
     let withdrawn = remote.store.inbox(&worker, 0).await?;
     assert!(withdrawn.is_empty());
@@ -260,9 +258,15 @@ async fn home_relays_between_remote_nodes_once() -> Result<()> {
     let right = Node::new("same-pane", "right").await?;
     left.store.set_home("g", home.id().await?).await?;
     right.store.set_home("g", home.id().await?).await?;
-    home.store.route("g", "left", left.id().await?).await?;
-    home.store.route("g", "right", right.id().await?).await?;
-    left.store.route("g", "right", right.id().await?).await?;
+    home.store
+        .route("g", "left", left.id().await?, 1_000)
+        .await?;
+    home.store
+        .route("g", "right", right.id().await?, 1_000)
+        .await?;
+    left.store
+        .route("g", "right", right.id().await?, 1_000)
+        .await?;
     let sender = left.store.mailbox("g", "left").await?;
     let recipient = right.store.mailbox("g", "right").await?;
     left.store
@@ -296,7 +300,7 @@ async fn home_relays_between_remote_nodes_once() -> Result<()> {
     assert_eq!(left.store.inbox(&sender, 0).await?.len(), 1);
     let remote_recipient = left.store.mailbox("g", "right").await?;
     let original = sqlx::query!("SELECT d.state FROM deliveries d JOIN messages m ON m.id=d.message WHERE m.dedup_key='cross' AND d.recipient=?", remote_recipient.id)
-        .fetch_one(&left.store.pool).await?;
+        .fetch_one(&support::pool(&left.store).await?).await?;
     assert_eq!(original.state, "resolved");
     Ok(())
 }
@@ -306,7 +310,9 @@ async fn bridge_commands_exchange_json_across_processes() -> Result<()> {
     let home = Node::new("home", "coordinator").await?;
     let remote = Node::new("remote", "worker").await?;
     remote.store.set_home("g", home.id().await?).await?;
-    home.store.route("g", "worker", remote.id().await?).await?;
+    home.store
+        .route("g", "worker", remote.id().await?, 1_000)
+        .await?;
     let sender = home.store.mailbox("g", "coordinator").await?;
     home.store
         .publish(&sender, message("worker", "bridge", None), 1000)
@@ -315,7 +321,7 @@ async fn bridge_commands_exchange_json_across_processes() -> Result<()> {
     let export = Command::new(binary)
         .args([
             "--state-dir",
-            home.store.root.to_str().unwrap(),
+            home.store.root().to_str().unwrap(),
             "bridge",
             "export",
         ])
@@ -335,7 +341,7 @@ async fn bridge_commands_exchange_json_across_processes() -> Result<()> {
     let mut child = Command::new(binary)
         .args([
             "--state-dir",
-            remote.store.root.to_str().unwrap(),
+            remote.store.root().to_str().unwrap(),
             "bridge",
             "exchange",
             "--source",
@@ -371,8 +377,11 @@ async fn explicit_sync_uses_ssh_stdio_and_clears_both_outboxes() -> Result<()> {
     let home_id = home.id().await?;
     let remote_id = remote.id().await?;
     remote.store.set_home("g", home_id).await?;
-    home.store.route("g", "worker", remote_id).await?;
-    remote.store.route("g", "coordinator", home_id).await?;
+    home.store.route("g", "worker", remote_id, 1_000).await?;
+    remote
+        .store
+        .route("g", "coordinator", home_id, 1_000)
+        .await?;
     home.store.add_peer(remote_id, "test-remote").await?;
 
     let fake_ssh = FakeSsh::new(&remote)?;
@@ -427,8 +436,11 @@ async fn worker_sync_requires_opt_in_and_target_change_revokes_it() -> Result<()
     let home_id = home.id().await?;
     let remote_id = remote.id().await?;
     remote.store.set_home("g", home_id).await?;
-    home.store.route("g", "worker", remote_id).await?;
-    remote.store.route("g", "coordinator", home_id).await?;
+    home.store.route("g", "worker", remote_id, 1_000).await?;
+    remote
+        .store
+        .route("g", "coordinator", home_id, 1_000)
+        .await?;
     home.store.add_peer(remote_id, "test-remote").await?;
     let fake_ssh = FakeSsh::new(&remote)?;
     let remote_id_text = remote_id.to_string();
@@ -516,5 +528,26 @@ async fn worker_sync_requires_opt_in_and_target_change_revokes_it() -> Result<()
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!home.store.peers_status().await?[0].auto_sync);
+    Ok(())
+}
+
+#[tokio::test]
+async fn withdrawal_uses_the_supplied_timestamp_for_relay_events() -> Result<()> {
+    let home = Node::new("coordinator-pane", "coordinator").await?;
+    let remote = Node::new("worker-pane", "worker").await?;
+    let remote_id = remote.id().await?;
+    home.store.route("g", "worker", remote_id, 100).await?;
+    let actor = home.store.caller("g", "coordinator-pane").await?;
+    let id = home
+        .store
+        .publish(&actor, message("worker", "withdraw-clock", None), 200)
+        .await?;
+    home.store.withdraw(&actor, id, 12_345).await?;
+    let created: i64 = sqlx::query_scalar(
+        "SELECT created FROM outbox WHERE json_extract(payload, '$.event.kind')='withdrawal'",
+    )
+    .fetch_one(&support::pool(&home.store).await?)
+    .await?;
+    assert_eq!(created, 12_345);
     Ok(())
 }

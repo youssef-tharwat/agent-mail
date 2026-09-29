@@ -1,3 +1,11 @@
+//! Transactional mail storage with schema locks shared by every store handle.
+//!
+//! [`Store::open`] explicitly distinguishes setup/migration from normal access.
+//! Mutations use SQLite transactions and validate the actor's binding generation.
+//! The database pool is private so callers cannot detach access from its schema lock.
+//! All clones must be dropped before migration; [`Store::close`] first drains the pool.
+//! Socket paths use OS path types, with UTF-8 encoding required by the SQLite schema.
+
 use crate::{
     BODY_LIMIT, SUMMARY_LIMIT, bounded,
     identity::{Binding, Participant},
@@ -15,19 +23,29 @@ use std::{
     fs::OpenOptions,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
+/// Current participant identity, binding generation, and reminder budget.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Mailbox {
+    /// Persistent identifier for this record.
     pub id: i64,
+    /// Enrolled group containing this record.
     pub group_name: String,
+    /// Name within the enclosing registration or group.
     pub name: String,
+    /// Runtime identity authenticated for this mailbox generation.
     #[serde(skip)]
     pub binding: Binding,
+    /// Generation invalidated by explicit identity replacement.
     pub binding_version: i64,
+    /// Persisted delivery attempt count for the current retry budget.
     pub attempts: i64,
+    /// Earliest next reminder attempt, in Unix seconds.
     pub next_wake: i64,
+    /// Whether an operator alert has been reserved, encoded as zero or one.
     pub alerted: i64,
 }
 
@@ -58,23 +76,57 @@ impl TryFrom<MailboxRow> for Mailbox {
     }
 }
 
+/// An enrolled group’s routing and automatic delivery configuration.
 #[derive(Debug, Clone, Serialize)]
 pub struct Group {
+    /// Name within the enclosing registration or group.
     pub name: String,
-    pub socket: Option<String>,
+    /// Absolute Herdr socket path; absent for standalone-only groups.
+    pub socket: Option<PathBuf>,
+    /// Whether automatic delivery is paused, encoded as zero or one.
     pub paused: i64,
+    /// Whether automatic Herdr prompts are enabled, encoded as zero or one.
     pub auto_prompt: i64,
+    /// UUID of the authoritative machine for this group.
     pub home_machine: String,
 }
 
-#[derive(Clone)]
-pub struct Store {
-    pub pool: SqlitePool,
-    pub root: PathBuf,
+// SQLite representation; paths become OS types at the store boundary.
+struct GroupRow {
+    name: String,
+    socket: Option<String>,
+    paused: i64,
+    auto_prompt: i64,
+    home_machine: String,
+}
+impl From<GroupRow> for Group {
+    fn from(row: GroupRow) -> Self {
+        Self {
+            name: row.name,
+            socket: row.socket.map(PathBuf::from),
+            paused: row.paused,
+            auto_prompt: row.auto_prompt,
+            home_machine: row.home_machine,
+        }
+    }
 }
 
-/// Held for every process using the database. Setup needs an exclusive lock.
-pub struct DatabaseGuard(std::fs::File);
+/// Shared database access that retains its schema lock across clones.
+#[derive(Debug, Clone)]
+pub struct Store {
+    inner: Arc<StoreInner>,
+}
+
+#[derive(Debug)]
+struct StoreInner {
+    pool: SqlitePool,
+    root: PathBuf,
+    _guard: DatabaseGuard,
+}
+
+/// Excludes migration for the lifetime of all store handles.
+#[derive(Debug)]
+struct DatabaseGuard(std::fs::File);
 
 impl DatabaseGuard {
     fn acquire(root: &Path, exclusive: bool) -> Result<Self> {
@@ -101,18 +153,30 @@ impl Drop for DatabaseGuard {
     }
 }
 
+/// Message content, recipients, and associations validated when publishing.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Publish {
+    /// Participant names receiving this message.
     pub recipients: Vec<String>,
+    /// Caller-supplied idempotency key; retries must preserve their original content.
     pub key: String,
+    /// Short UTF-8 summary used in inbox and recovery views.
     pub summary: String,
+    /// Full UTF-8 message body, subject to the message byte limit.
     pub body: String,
+    /// Number of seconds after publication until the message becomes overdue.
     pub due_after: i64,
+    /// Optional identifier of the message being answered.
     pub reply_to: Option<i64>,
+    /// Optional work identifier associated with this message.
     pub work_id: Option<String>,
 }
 
 impl Publish {
+    /// Validate a message request and canonicalize its recipients.
+    ///
+    /// # Errors
+    /// Recipients, payload lengths, reply timing, or identifiers are invalid.
     pub fn normalize(&mut self) -> Result<()> {
         self.recipients.sort();
         self.recipients.dedup();
@@ -139,44 +203,80 @@ impl Publish {
     }
 }
 
+/// A message summary for an unresolved inbox delivery.
 #[derive(Debug, Serialize)]
 pub struct InboxItem {
+    /// Persistent identifier for this record.
     pub id: i64,
+    /// Name of the participant that published this message.
     pub sender: String,
+    /// Short UTF-8 summary used in inbox and recovery views.
     pub summary: String,
+    /// Creation timestamp in Unix seconds.
     pub created: i64,
+    /// Deadline timestamp in Unix seconds.
     pub due: i64,
+    /// Optional work identifier associated with this message.
     pub work_id: Option<String>,
 }
 
+/// Message content and the recipient’s current delivery disposition.
 #[derive(Debug, Serialize)]
 pub struct Message {
+    /// Persistent identifier for this record.
     pub id: i64,
+    /// Name of the participant that published this message.
     pub sender: String,
+    /// Short UTF-8 summary used in inbox and recovery views.
     pub summary: String,
+    /// Full UTF-8 message body, subject to the message byte limit.
     pub body: String,
+    /// Creation timestamp in Unix seconds.
     pub created: i64,
+    /// Deadline timestamp in Unix seconds.
     pub due: i64,
+    /// Stored business state; it does not imply transport delivery.
     pub state: String,
+    /// Identifier of the reply created while resolving this delivery, if any.
     pub reply_id: Option<i64>,
+    /// Optional work identifier associated with this message.
     pub work_id: Option<String>,
 }
 
+/// Aggregate pending obligations and reminder state for one mailbox.
 #[derive(Debug, Serialize)]
 pub struct Pending {
+    /// Persistent identifier for this record.
     pub id: i64,
+    /// Enrolled group containing this record.
     pub group_name: String,
+    /// Name within the enclosing registration or group.
     pub name: String,
+    /// Number of pending obligations included in this aggregate.
     pub pending: i64,
+    /// Earliest queued creation timestamp in Unix seconds, when available.
     pub oldest: i64,
+    /// Deadline timestamp in Unix seconds.
     pub due: i64,
+    /// Persisted delivery attempt count for the current retry budget.
     pub attempts: i64,
+    /// Earliest next reminder attempt, in Unix seconds.
     pub next_wake: i64,
+    /// Whether an operator alert has been reserved, encoded as zero or one.
     pub alerted: i64,
 }
 
 impl Store {
-    pub async fn open(root: &Path, setup: bool) -> Result<(Self, DatabaseGuard)> {
+    /// Open a database, optionally creating and migrating its schema.
+    ///
+    /// Setup takes an exclusive schema lock; normal access takes a shared lock.
+    /// Every clone retains that lock. Close and drop all handles before setup.
+    /// Setup creates private state files and applies embedded migrations.
+    ///
+    /// # Errors
+    /// Returns an error for lock contention, filesystem or database failures,
+    /// incompatible schema versions, or missing state when `setup` is false.
+    pub async fn open(root: &Path, setup: bool) -> Result<Self> {
         if setup {
             std::fs::create_dir_all(root)?;
             std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
@@ -211,7 +311,7 @@ impl Store {
             .await?
             .user_version
             .context("SQLite did not report its schema version")?;
-        ensure!(version <= 9, "database schema is newer than this binary");
+        ensure!(version <= 10, "database schema is newer than this binary");
         if setup {
             // Rebuilding a referenced table requires FK enforcement off outside
             // the migration transaction. The migration checks every FK before commit.
@@ -248,46 +348,82 @@ impl Store {
             .await?;
         } else {
             ensure!(
-                version == 9,
+                version == 10,
                 "database schema needs initialization or migration; run setup"
             );
         }
-        Ok((
-            Self {
+        Ok(Self {
+            inner: Arc::new(StoreInner {
                 pool,
                 root: root.to_path_buf(),
-            },
-            guard,
-        ))
+                _guard: guard,
+            }),
+        })
     }
 
+    /// Return the directory containing this store's database and private sockets.
+    pub fn root(&self) -> &Path {
+        &self.inner.root
+    }
+
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.inner.pool
+    }
+
+    /// Close all pooled connections and consume this handle.
+    ///
+    /// All clones share the pool, so further database operations on them fail.
+    /// The schema lock remains held until the last clone is dropped. Await this
+    /// before releasing the final handle when preparing to run migrations.
+    pub async fn close(self) {
+        self.inner.pool.close().await;
+    }
+
+    /// Read one enrolled group.
+    ///
+    /// # Errors
+    /// The group is missing or its database query fails.
     pub async fn group(&self, group: &str) -> Result<Group> {
         sqlx::query_as!(
-            Group,
+            GroupRow,
             "SELECT name, NULLIF(socket, '') AS \"socket?: String\", paused, auto_prompt, home_machine FROM groups WHERE name = ?",
             group
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.pool())
         .await?
+        .map(Group::from)
         .context("group not enrolled; run setup --group NAME")
     }
 
+    /// List enrolled groups in name order.
+    ///
+    /// # Errors
+    /// The database query fails.
     pub async fn groups(&self) -> Result<Vec<Group>> {
         Ok(sqlx::query_as!(
-            Group,
+            GroupRow,
             "SELECT name, NULLIF(socket, '') AS \"socket?: String\", paused, auto_prompt, home_machine FROM groups ORDER BY name"
         )
-        .fetch_all(&self.pool)
-        .await?)
+        .fetch_all(self.pool())
+        .await?.into_iter().map(Group::from).collect())
     }
 
-    pub async fn enroll(&self, group: &str, socket: &str) -> Result<()> {
+    /// Enroll a group with an optional absolute Herdr socket path.
+    ///
+    /// # Errors
+    /// The group name or path is invalid, the socket conflicts, or persistence fails.
+    pub async fn enroll(&self, group: &str, socket: Option<&Path>) -> Result<()> {
         name(group)?;
         ensure!(
-            socket.is_empty() || Path::new(socket).is_absolute(),
+            socket.is_none_or(Path::is_absolute),
             "Herdr socket path must be absolute"
         );
-        let mut tx = self.pool.begin().await?;
+        // The existing SQLite schema stores UTF-8 text; retain that wire format.
+        let socket = socket
+            .map(|path| path.to_str().context("socket path is not UTF-8"))
+            .transpose()?
+            .unwrap_or("");
+        let mut tx = self.pool().begin().await?;
         let machine = self.machine_id().await?;
         sqlx::query!(
             "INSERT INTO groups(name, socket, home_machine) VALUES (?, ?, ?) ON CONFLICT(name) DO NOTHING",
@@ -313,21 +449,33 @@ impl Store {
         Ok(())
     }
 
+    /// Read this installation’s persistent machine UUID.
+    ///
+    /// # Errors
+    /// The database query fails or the node record is missing.
     pub async fn machine_id(&self) -> Result<String> {
         Ok(sqlx::query!("SELECT id FROM node LIMIT 1")
-            .fetch_one(&self.pool)
+            .fetch_one(self.pool())
             .await?
             .id)
     }
 
+    /// Set whether a group permits automatic delivery.
+    ///
+    /// # Errors
+    /// The database update fails.
     pub async fn pause(&self, group: &str, paused: bool) -> Result<()> {
         self.group(group).await?;
         sqlx::query!("UPDATE groups SET paused = ? WHERE name = ?", paused, group)
-            .execute(&self.pool)
+            .execute(self.pool())
             .await?;
         Ok(())
     }
 
+    /// Opt a group into automatic Herdr prompts, or disable them.
+    ///
+    /// # Errors
+    /// The group is missing, enabling lacks a Herdr socket, or persistence fails.
     pub async fn set_auto_prompt(&self, group: &str, enabled: bool) -> Result<()> {
         let config = self.group(group).await?;
         ensure!(
@@ -339,22 +487,30 @@ impl Store {
             enabled,
             group
         )
-        .execute(&self.pool)
+        .execute(self.pool())
         .await?;
         Ok(())
     }
 
+    /// Read the current identity and retry state for a participant.
+    ///
+    /// # Errors
+    /// The participant is missing, its binding cannot be decoded, or the query fails.
     pub async fn mailbox(&self, group: &str, participant: &str) -> Result<Mailbox> {
         sqlx::query_as!(MailboxRow,
             "SELECT id,group_name,name,binding,binding_version,attempts,next_wake,alerted FROM mailboxes WHERE group_name=? AND name=?",
-            group, participant).fetch_optional(&self.pool).await?
+            group, participant).fetch_optional(self.pool()).await?
             .context("participant is not registered in this group")?.try_into()
     }
 
+    /// Look up a participant by its bound Herdr pane.
+    ///
+    /// # Errors
+    /// The pane is unbound, the binding cannot be decoded, or the query fails.
     pub async fn caller(&self, group: &str, pane: &str) -> Result<Mailbox> {
         sqlx::query_as!(MailboxRow,
             "SELECT id,group_name,name,binding,binding_version,attempts,next_wake,alerted FROM mailboxes WHERE group_name=? AND pane=?",
-            group, pane).fetch_optional(&self.pool).await?
+            group, pane).fetch_optional(self.pool()).await?
             .context("caller pane is not bound in this group")?.try_into()
     }
 
@@ -366,15 +522,19 @@ impl Store {
         let session = session.to_string();
         sqlx::query_as!(MailboxRow,
             "SELECT id,group_name,name,binding,binding_version,attempts,next_wake,alerted FROM mailboxes WHERE group_name=? AND standalone_session=?",
-            group, session).fetch_optional(&self.pool).await?
+            group, session).fetch_optional(self.pool()).await?
             .context("standalone session is unknown or replaced in this group")?.try_into()
     }
 
+    /// List registrations without exposing standalone session credentials.
+    ///
+    /// # Errors
+    /// The database query or binding decoding fails.
     pub async fn participants(&self, group: &str) -> Result<Vec<Participant>> {
         self.group(group).await?;
         let rows = sqlx::query_as!(MailboxRow,
             "SELECT id,group_name,name,binding,binding_version,attempts,next_wake,alerted FROM mailboxes WHERE group_name=? ORDER BY name",
-            group).fetch_all(&self.pool).await?;
+            group).fetch_all(self.pool()).await?;
         rows.into_iter()
             .map(|row| {
                 let mailbox = Mailbox::try_from(row)?;
@@ -398,7 +558,7 @@ impl Store {
     ) -> Result<()> {
         name(participant)?;
         self.group(group).await?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         sqlx::query!("UPDATE groups SET paused=paused WHERE name=?", group)
             .execute(&mut *tx)
             .await?;
@@ -436,7 +596,7 @@ impl Store {
             .await?;
         }
         tx.commit().await?;
-        crate::stream::hint(&self.root).await;
+        crate::stream::hint(self.root()).await;
         Ok(())
     }
 
@@ -546,17 +706,25 @@ impl Store {
         Ok(id)
     }
 
+    /// Publish an idempotent message and its delivery records atomically.
+    ///
+    /// # Errors
+    /// The actor is stale, the payload or recipients are invalid, the key conflicts, or persistence fails.
     pub async fn publish(&self, actor: &Mailbox, mut publish: Publish, now: i64) -> Result<i64> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
         let id = Self::publish_tx(&mut tx, actor, &mut publish, now).await?;
         tx.commit().await?;
-        crate::stream::hint(&self.root).await;
+        crate::stream::hint(self.root()).await;
         Ok(id)
     }
 
+    /// Read a bounded page of unresolved messages after a message cursor.
+    ///
+    /// # Errors
+    /// The actor is stale or the database query fails.
     pub async fn inbox(&self, actor: &Mailbox, after: i64) -> Result<Vec<InboxItem>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         Self::check_actor(&mut tx, actor).await?;
         let items = sqlx::query_as!(InboxItem,
             "SELECT m.id, b.name AS sender, m.summary, m.created, m.due, m.work_id FROM deliveries d JOIN messages m ON m.id=d.message JOIN mailboxes b ON b.id=m.sender WHERE d.recipient=? AND d.state='pending' AND m.id>? ORDER BY m.id LIMIT 6",
@@ -565,8 +733,12 @@ impl Store {
         Ok(items)
     }
 
+    /// Read a message addressed to the authenticated participant.
+    ///
+    /// # Errors
+    /// The actor is stale, the message is outside its inbox, or the query fails.
     pub async fn message(&self, actor: &Mailbox, id: i64) -> Result<Message> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         Self::check_actor(&mut tx, actor).await?;
         let item = sqlx::query_as!(Message,
             "SELECT m.id,b.name AS sender,m.summary,m.body,m.created,m.due,d.state,d.reply_id,m.work_id FROM messages m JOIN deliveries d ON d.message=m.id JOIN mailboxes b ON b.id=m.sender WHERE m.id=? AND d.recipient=?",
@@ -575,6 +747,10 @@ impl Store {
         Ok(item)
     }
 
+    /// Resolve an inbox delivery and optionally publish an atomic reply.
+    ///
+    /// # Errors
+    /// The actor is stale, disposition conflicts, the delivery is withdrawn or absent, or persistence fails.
     pub async fn resolve(
         &self,
         actor: &Mailbox,
@@ -583,11 +759,11 @@ impl Store {
         reply: Option<(String, String)>,
         now: i64,
     ) -> Result<Option<i64>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
         let result = Self::resolve_tx(&mut tx, actor, id, note, reply, now).await?;
         tx.commit().await?;
-        crate::stream::hint(&self.root).await;
+        crate::stream::hint(self.root()).await;
         Ok(result)
     }
 
@@ -671,8 +847,12 @@ impl Store {
         Ok(reply_id)
     }
 
-    pub async fn withdraw(&self, actor: &Mailbox, id: i64) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+    /// Withdraw a sender’s pending deliveries at the supplied Unix timestamp.
+    ///
+    /// # Errors
+    /// The actor is stale, the message is absent or owned by another sender, or persistence fails.
+    pub async fn withdraw(&self, actor: &Mailbox, id: i64, time: i64) -> Result<()> {
+        let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
         let m = sqlx::query!("SELECT sender FROM messages WHERE id=?", id)
             .fetch_optional(&mut *tx)
@@ -705,13 +885,13 @@ impl Store {
                     )?,
                     recipient: recipient.name,
                 },
-                crate::now()?,
+                time,
             )
             .await?;
         }
         Self::reset_empty(&mut tx, &actor.group_name).await?;
         tx.commit().await?;
-        crate::stream::hint(&self.root).await;
+        crate::stream::hint(self.root()).await;
         Ok(())
     }
 
@@ -721,27 +901,43 @@ impl Store {
         Ok(())
     }
 
+    /// List mailboxes with pending mail or work notifications.
+    ///
+    /// # Errors
+    /// The database query fails.
     pub async fn pending(&self) -> Result<Vec<Pending>> {
         Ok(sqlx::query_as!(Pending,
             "SELECT b.id AS 'id!: i64',b.group_name AS 'group_name!: String',b.name AS 'name!: String',COUNT(*) AS 'pending!: i64',MIN(m.created) AS 'oldest!: i64',MIN(m.due) AS 'due!: i64',b.attempts AS 'attempts!: i64',b.next_wake AS 'next_wake!: i64',b.alerted AS 'alerted!: i64' FROM mailboxes b JOIN (SELECT d.recipient,m.created,m.due FROM deliveries d JOIN messages m ON m.id=d.message WHERE d.state='pending' UNION ALL SELECT recipient,created,created+900 AS due FROM pending_work_events) m ON m.recipient=b.id WHERE b.remote_machine IS NULL GROUP BY b.id ORDER BY b.group_name,b.id")
-            .fetch_all(&self.pool).await?)
+            .fetch_all(self.pool()).await?)
     }
 
+    /// Reserve a reminder attempt at the supplied Unix timestamp.
+    ///
+    /// # Errors
+    /// The database update fails; an ineligible reservation returns false.
     pub async fn reserve(&self, actor: &Mailbox, now: i64) -> Result<bool> {
         let next = now.checked_add(300).context("clock overflow")?;
         let result = sqlx::query!("UPDATE mailboxes SET attempts=attempts+1,next_wake=? WHERE id=? AND binding_version=? AND pane IS NOT NULL AND attempts<3 AND next_wake<=? AND EXISTS(SELECT 1 FROM groups WHERE name=mailboxes.group_name AND paused=0 AND auto_prompt=1) AND (EXISTS(SELECT 1 FROM deliveries WHERE recipient=mailboxes.id AND state='pending') OR EXISTS(SELECT 1 FROM pending_work_events WHERE recipient=mailboxes.id))",
-            next, actor.id, actor.binding_version, now).execute(&self.pool).await?;
+            next, actor.id, actor.binding_version, now).execute(self.pool()).await?;
         Ok(result.rows_affected() == 1)
     }
 
+    /// Reserve an operator alert for overdue or exhausted delivery attempts.
+    ///
+    /// # Errors
+    /// The database update fails; an already reserved or ineligible alert returns false.
     pub async fn reserve_alert(&self, id: i64, now: i64) -> Result<bool> {
-        let result = sqlx::query!("UPDATE mailboxes SET alerted=1 WHERE id=? AND alerted=0 AND (EXISTS(SELECT 1 FROM deliveries d JOIN messages m ON m.id=d.message WHERE d.recipient=mailboxes.id AND d.state='pending' AND (m.due<=? OR mailboxes.attempts>=3)) OR EXISTS(SELECT 1 FROM pending_work_events WHERE recipient=mailboxes.id AND (created+900<=? OR mailboxes.attempts>=3)))", id, now, now).execute(&self.pool).await?;
+        let result = sqlx::query!("UPDATE mailboxes SET alerted=1 WHERE id=? AND alerted=0 AND (EXISTS(SELECT 1 FROM deliveries d JOIN messages m ON m.id=d.message WHERE d.recipient=mailboxes.id AND d.state='pending' AND (m.due<=? OR mailboxes.attempts>=3)) OR EXISTS(SELECT 1 FROM pending_work_events WHERE recipient=mailboxes.id AND (created+900<=? OR mailboxes.attempts>=3)))", id, now, now).execute(self.pool()).await?;
         Ok(result.rows_affected() == 1)
     }
 
+    /// Reset reminder and native delivery budgets for a participant.
+    ///
+    /// # Errors
+    /// The participant is missing or the transaction fails.
     pub async fn rearm(&self, group: &str, participant: &str) -> Result<()> {
         let actor = self.mailbox(group, participant).await?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, &actor).await?;
         sqlx::query!(
             "UPDATE mailboxes SET attempts=0,next_wake=0,alerted=0 WHERE id=?",
@@ -749,7 +945,7 @@ impl Store {
         )
         .execute(&mut *tx)
         .await?;
-        sqlx::query!("UPDATE codex_wakes SET attempts=0,next_attempt=0 WHERE recipient=? AND binding_version=?",actor.id,actor.binding_version).execute(&mut *tx).await?;
+        sqlx::query!("UPDATE runtime_wakes SET attempts=0,next_attempt=0 WHERE recipient=? AND binding_version=?",actor.id,actor.binding_version).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
     }

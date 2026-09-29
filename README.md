@@ -56,10 +56,12 @@ record's writer decides whether to accept the result.
 ## Automatic recovery
 
 Lifecycle hooks supply current work after resets and when state changes. The
-optional Codex adapter wakes idle sessions with a bounded summary. Agents do not
-need to poll. Idle wake requires a running Mail worker and an attached Codex session.
+native adapters wake idle sessions with a bounded summary. Agents do not need to
+poll. Idle wake requires a running Mail worker and an attached runtime session.
 
 [Set up hooks and Codex wake](docs/usage.md#automatic-recovery-and-change-notifications-v03).
+[Native Claude setup](docs/usage.md#native-claude-delivery-next-release) is available
+in source for the next release; it does not require ACP.
 Tested with two live Codex agents through submission, correction, and acceptance.
 [Results and limits](docs/local-codex-acceptance.md).
 

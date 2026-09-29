@@ -1,3 +1,4 @@
+//! Regression coverage for codex wake behavior.
 use agent_mail::{service, store::Store, work::WorkDraft};
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
@@ -60,6 +61,11 @@ fn server(listener: UnixListener, thread: Uuid) -> Server {
                         }
                         "thread/queue/list" => json!({"queuedSubmissions":[]}),
                         "thread/queue/add" => {
+                            assert!(
+                                r["params"]["clientUserMessageId"]
+                                    .as_str()
+                                    .is_some_and(|id| id.starts_with("agent-mail-"))
+                            );
                             assert_eq!(r["params"]["threadId"], thread.to_string());
                             let text = r["params"]["input"][0]["text"].as_str().unwrap();
                             assert!(text.len() <= 6000 && text.contains("Inspect evidence"));
@@ -99,8 +105,8 @@ async fn delivery_survives_restart_and_never_accepts_work_or_targets_a_replaceme
     let socket = dir.path().join("codex.sock");
     let thread = Uuid::new_v4();
     let server = server(UnixListener::bind(&socket)?, thread);
-    let (store, guard) = Store::open(dir.path(), true).await?;
-    store.enroll("g", "").await?;
+    let store = Store::open(dir.path(), true).await?;
+    store.enroll("g", None).await?;
     store.register("g", "worker", false).await?;
     let actor = store.mailbox("g", "worker").await?;
     store.attach_codex(&actor, &socket, thread).await?;
@@ -131,9 +137,8 @@ async fn delivery_survives_restart_and_never_accepts_work_or_targets_a_replaceme
     assert_eq!(server.received.load(Ordering::SeqCst), 1);
     assert!(store.notifications(&actor, 0).await?.is_empty());
     assert!(store.work_show(&actor, "task").await?.open);
-    store.pool.close().await;
-    drop(guard);
-    let (store, _guard) = Store::open(dir.path(), false).await?;
+    store.close().await;
+    let store = Store::open(dir.path(), false).await?;
     service::tick(&store, 1400).await?;
     assert_eq!(server.received.load(Ordering::SeqCst), 1);
     // Idempotent attach must not replay an already accepted notification.
@@ -154,8 +159,8 @@ async fn lost_receipts_use_durable_bounded_retries_and_pause_is_respected() -> R
     let socket = dir.path().join("codex.sock");
     let thread = Uuid::new_v4();
     let server = server(UnixListener::bind(&socket)?, thread);
-    let (store, guard) = Store::open(dir.path(), true).await?;
-    store.enroll("g", "").await?;
+    let store = Store::open(dir.path(), true).await?;
+    store.enroll("g", None).await?;
     store.register("g", "worker", false).await?;
     let actor = store.mailbox("g", "worker").await?;
     store.attach_codex(&actor, &socket, thread).await?;
@@ -176,9 +181,8 @@ async fn lost_receipts_use_durable_bounded_retries_and_pause_is_respected() -> R
         .await?;
     server.lose.store(true, Ordering::SeqCst);
     service::tick(&store, 1000).await?;
-    store.pool.close().await;
-    drop(guard);
-    let (store, _guard) = Store::open(dir.path(), false).await?;
+    store.close().await;
+    let store = Store::open(dir.path(), false).await?;
     for time in [1001, 1300, 1600, 1900] {
         service::tick(&store, time).await?;
     }
@@ -236,8 +240,8 @@ async fn cancellation_reaches_active_owner_but_idle_closure_does_not_wake() -> R
         let socket = dir.path().join("codex.sock");
         let thread = Uuid::new_v4();
         let server = server(UnixListener::bind(&socket)?, thread);
-        let (store, _guard) = Store::open(dir.path(), true).await?;
-        store.enroll("g", "").await?;
+        let store = Store::open(dir.path(), true).await?;
+        store.enroll("g", None).await?;
         store.register("g", "writer", false).await?;
         store.register("g", "new-owner", false).await?;
         store.register("g", "worker", false).await?;
@@ -304,13 +308,12 @@ async fn doctor_rejects_an_unloaded_thread_even_when_its_socket_responds() -> Re
     let socket = dir.path().join("codex.sock");
     let thread = Uuid::new_v4();
     let server = server(UnixListener::bind(&socket)?, thread);
-    let (store, guard) = Store::open(dir.path(), true).await?;
-    store.enroll("g", "").await?;
+    let store = Store::open(dir.path(), true).await?;
+    store.enroll("g", None).await?;
     store.register("g", "worker", false).await?;
     let actor = store.mailbox("g", "worker").await?;
     store.attach_codex(&actor, &socket, thread).await?;
-    store.pool.close().await;
-    drop(guard);
+    store.close().await;
     server.unloaded.store(true, Ordering::SeqCst);
     let report = agent_mail::doctor::inspect(dir.path(), "g", Some("worker"), None).await;
     assert!(

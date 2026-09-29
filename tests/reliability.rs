@@ -4,7 +4,7 @@ use agent_mail::{
     PLUGIN_ID,
     herdr::{Agent, Session},
     service,
-    store::{DatabaseGuard, Mailbox, Publish, Store},
+    store::{Mailbox, Publish, Store},
 };
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -29,7 +29,6 @@ struct Host {
 struct Fixture {
     _temp: TempDir,
     store: Store,
-    _guard: DatabaseGuard,
     socket: PathBuf,
     host: Arc<Mutex<Host>>,
     server: JoinHandle<()>,
@@ -121,20 +120,18 @@ impl Fixture {
             }
         });
         let root = temp.path().join("state");
-        let (initial, setup_guard) = Store::open(&root, true).await?;
-        initial.enroll("g", socket.to_str().unwrap()).await?;
+        let initial = Store::open(&root, true).await?;
+        initial.enroll("g", Some(&socket)).await?;
         initial.set_auto_prompt("g", true).await?;
         initial.bind("g", "a", &agents[0], false).await?;
         initial.bind("g", "b", &agents[1], false).await?;
-        initial.pool.close().await;
-        drop(setup_guard);
-        let (store, guard) = Store::open(&root, false).await?;
+        initial.close().await;
+        let store = Store::open(&root, false).await?;
         let a = store.mailbox("g", "a").await?;
         let b = store.mailbox("g", "b").await?;
         Ok(Self {
             _temp: temp,
             store,
-            _guard: guard,
             socket,
             host,
             server,
@@ -159,7 +156,7 @@ impl Fixture {
     ) -> Result<std::process::Output> {
         let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_agent-mail"));
         command
-            .args(["--state-dir", self.store.root.to_str().unwrap()])
+            .args(["--state-dir", self.store.root().to_str().unwrap()])
             .args(args)
             .env("HERDR_ENV", "1")
             .env("HERDR_PANE_ID", pane)
@@ -189,15 +186,14 @@ fn message(key: &str) -> Publish {
 async fn publish_is_durable_and_retry_safe() -> Result<()> {
     let f = Fixture::new().await?;
     let id = f.send("once").await?;
-    let (reopened, second_guard) = Store::open(&f.store.root, false).await?;
+    let reopened = Store::open(f.store.root(), false).await?;
     assert_eq!(reopened.message(&f.b, id).await?.body, "Durable body");
     assert_eq!(reopened.publish(&f.a, message("once"), 5000).await?, id);
     assert_eq!(reopened.inbox(&f.b, 0).await?.len(), 1);
     let mut changed = message("once");
     changed.body = "Different".into();
     assert!(reopened.publish(&f.a, changed, 5000).await.is_err());
-    reopened.pool.close().await;
-    drop(second_guard);
+    reopened.close().await;
     Ok(())
 }
 
@@ -263,8 +259,8 @@ async fn reply_and_resolution_are_atomic_and_idempotent() -> Result<()> {
 async fn withdrawal_does_not_erase_history() -> Result<()> {
     let f = Fixture::new().await?;
     let id = f.send("withdraw").await?;
-    assert!(f.store.withdraw(&f.b, id).await.is_err());
-    f.store.withdraw(&f.a, id).await?;
+    assert!(f.store.withdraw(&f.b, id, 1_000).await.is_err());
+    f.store.withdraw(&f.a, id, 1_000).await?;
     assert!(f.store.inbox(&f.b, 0).await?.is_empty());
     assert_eq!(f.store.message(&f.b, id).await?.state, "withdrawn");
     assert_eq!(f.send("withdraw").await?, id);
@@ -281,7 +277,7 @@ async fn withdrawal_does_not_erase_history() -> Result<()> {
 async fn groups_and_rebound_identities_are_isolated() -> Result<()> {
     let f = Fixture::new().await?;
     let id = f.send("isolated").await?;
-    f.store.enroll("other", f.socket.to_str().unwrap()).await?;
+    f.store.enroll("other", Some(&f.socket)).await?;
     f.store.bind("other", "b", &agent("w1:p2"), false).await?;
     let other = f.store.mailbox("other", "b").await?;
     assert!(f.store.message(&other, id).await.is_err());
@@ -315,7 +311,7 @@ async fn bursts_batch_and_retry_budget_survives_restarts() -> Result<()> {
     service::tick(&f.store, 1300).await?;
     service::tick(&f.store, 1600).await?;
     f.send("new-arrival").await?;
-    let (reopened, second_guard) = Store::open(&f.store.root, false).await?;
+    let reopened = Store::open(f.store.root(), false).await?;
     service::tick(&reopened, 5000).await?;
     let host = f.host.lock().await;
     assert_eq!(host.prompts.len(), 3);
@@ -326,8 +322,7 @@ async fn bursts_batch_and_retry_budget_survives_restarts() -> Result<()> {
     );
     assert_eq!(host.notifications, 1);
     drop(host);
-    reopened.pool.close().await;
-    drop(second_guard);
+    reopened.close().await;
     Ok(())
 }
 
@@ -394,12 +389,12 @@ async fn pause_and_empty_inbox_reset_are_explicit() -> Result<()> {
 #[tokio::test]
 async fn singleton_and_schema_locks_are_released() -> Result<()> {
     let f = Fixture::new().await?;
-    let lock = service::WorkerLock::acquire(&f.store.root)?;
-    assert!(service::running(&f.store.root));
-    assert!(service::WorkerLock::acquire(&f.store.root).is_err());
-    assert!(Store::open(&f.store.root, true).await.is_err());
+    let lock = service::WorkerLock::acquire(f.store.root())?;
+    assert!(service::running(f.store.root()));
+    assert!(service::WorkerLock::acquire(f.store.root()).is_err());
+    assert!(Store::open(f.store.root(), true).await.is_err());
     drop(lock);
-    assert!(!service::running(&f.store.root));
+    assert!(!service::running(f.store.root()));
     Ok(())
 }
 
@@ -494,7 +489,7 @@ async fn cli_worker_crash_keeps_messages_and_reservations() -> Result<()> {
     let mut worker = tokio::process::Command::new(env!("CARGO_BIN_EXE_agent-mail"))
         .args([
             "--state-dir",
-            f.store.root.to_str().unwrap(),
+            f.store.root().to_str().unwrap(),
             "service",
             "run",
         ])
@@ -591,7 +586,7 @@ async fn work_writer_versions_and_mail_links_survive_restart() -> Result<()> {
         Some("lane-api")
     );
     f.store.resolve(&f.b, id, "reviewed", None, 1004).await?;
-    let (reopened, _guard) = Store::open(&f.store.root, false).await?;
+    let reopened = Store::open(f.store.root(), false).await?;
     let current = reopened.work_show(&f.b, "lane-api").await?;
     assert_eq!(current.state, "review");
     assert!(current.open);

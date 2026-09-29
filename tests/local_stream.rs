@@ -1,3 +1,5 @@
+//! Regression coverage for local stream behavior.
+mod support;
 use agent_mail::{
     doctor::{self, Level},
     store::Store,
@@ -7,18 +9,17 @@ use agent_mail::{
 use anyhow::Result;
 use std::time::Duration;
 
-async fn setup() -> Result<(tempfile::TempDir, Store, agent_mail::store::DatabaseGuard)> {
+async fn setup() -> Result<(tempfile::TempDir, Store)> {
     let temp = tempfile::Builder::new()
         .prefix("am-stream-")
         .tempdir_in("/tmp")?;
-    let (store, guard) = Store::open(&temp.path().join("state"), true).await?;
-    store.enroll("g", "").await?;
+    let store = Store::open(&temp.path().join("state"), true).await?;
+    store.enroll("g", None).await?;
     store.register("g", "writer", false).await?;
     store.register("g", "owner", false).await?;
-    store.pool.close().await;
-    drop(guard);
-    let (store, guard) = Store::open(&temp.path().join("state"), false).await?;
-    Ok((temp, store, guard))
+    store.close().await;
+    let store = Store::open(&temp.path().join("state"), false).await?;
+    Ok((temp, store))
 }
 fn draft(id: &str) -> WorkDraft {
     WorkDraft {
@@ -37,7 +38,7 @@ async fn next(reader: &mut tokio::io::BufReader<tokio::net::UnixStream>) -> Resu
 
 #[tokio::test]
 async fn replay_live_restart_and_binding_rotation() -> Result<()> {
-    let (_temp, store, _guard) = setup().await?;
+    let (_temp, store) = setup().await?;
     let writer = store.mailbox("g", "writer").await?;
     let owner = store.mailbox("g", "owner").await?;
     // Writes succeed while no worker or socket exists.
@@ -66,11 +67,11 @@ async fn replay_live_restart_and_binding_rotation() -> Result<()> {
     };
     // Stream consumption never supplies a runtime receipt.
     let receipts = sqlx::query!("SELECT COUNT(*) AS 'count!:i64' FROM event_receipts")
-        .fetch_one(&store.pool)
+        .fetch_one(&support::pool(&store).await?)
         .await?;
     assert_eq!(receipts.count, 0);
     drop(client);
-    drop(server);
+    server.shutdown().await?;
     store.work_create(&writer, draft("three"), 102).await?;
     let _server = Server::start(store.clone())?;
     let mut client = stream::connect(&store, &owner, second).await?;
@@ -85,7 +86,7 @@ async fn replay_live_restart_and_binding_rotation() -> Result<()> {
 
 #[tokio::test]
 async fn subscription_race_has_no_gap_and_is_recipient_scoped() -> Result<()> {
-    let (_temp, store, _guard) = setup().await?;
+    let (_temp, store) = setup().await?;
     let writer = store.mailbox("g", "writer").await?;
     let owner = store.mailbox("g", "owner").await?;
     store.register("g", "unrelated", false).await?;
@@ -111,7 +112,7 @@ async fn subscription_race_has_no_gap_and_is_recipient_scoped() -> Result<()> {
 
 #[tokio::test]
 async fn attention_does_not_infer_waiting_or_completion() -> Result<()> {
-    let (_temp, store, _guard) = setup().await?;
+    let (_temp, store) = setup().await?;
     let writer = store.mailbox("g", "writer").await?;
     let mut work = draft("overdue");
     work.deadline = Some(200);
@@ -152,8 +153,8 @@ async fn doctor_missing_state_is_read_only_and_reports_unknown_trust() -> Result
     let report = doctor::inspect(&root, "g", Some("owner"), None).await;
     assert!(report.failed());
     assert!(!root.exists());
-    let (_temp, store, _guard) = setup().await?;
-    let report = doctor::inspect(&store.root, "g", Some("owner"), None).await;
+    let (_temp, store) = setup().await?;
+    let report = doctor::inspect(store.root(), "g", Some("owner"), None).await;
     assert!(report.failed());
     assert!(
         report
@@ -168,7 +169,7 @@ async fn doctor_missing_state_is_read_only_and_reports_unknown_trust() -> Result
             .any(|c| c.check == "endpoint" && c.status == Level::Warning)
     );
     let stale = uuid::Uuid::new_v4();
-    let report = doctor::inspect(&store.root, "g", Some("owner"), Some(&stale)).await;
+    let report = doctor::inspect(store.root(), "g", Some("owner"), Some(&stale)).await;
     assert!(
         report
             .checks
@@ -180,7 +181,7 @@ async fn doctor_missing_state_is_read_only_and_reports_unknown_trust() -> Result
 
 #[tokio::test]
 async fn missed_hint_reconciles_and_unread_subscriber_does_not_block_writes() -> Result<()> {
-    let (_temp, store, _guard) = setup().await?;
+    let (_temp, store) = setup().await?;
     let writer = store.mailbox("g", "writer").await?;
     let owner = store.mailbox("g", "owner").await?;
     let _server = Server::start(store.clone())?;
@@ -188,7 +189,7 @@ async fn missed_hint_reconciles_and_unread_subscriber_does_not_block_writes() ->
     assert!(matches!(next(&mut live).await?, Frame::Ready { .. }));
     // Remove only this disposable socket name: existing connection remains live,
     // while the post-commit hint cannot reach the listener.
-    std::fs::remove_file(stream::socket(&store.root))?;
+    std::fs::remove_file(stream::socket(store.root()))?;
     store
         .work_create(&writer, draft("missed-hint"), 100)
         .await?;
@@ -209,10 +210,10 @@ async fn missed_hint_reconciles_and_unread_subscriber_does_not_block_writes() ->
 
 #[tokio::test]
 async fn slow_subscriber_is_disconnected_and_can_replay() -> Result<()> {
-    let (_temp, store, _guard) = setup().await?;
+    let (_temp, store) = setup().await?;
     let owner = store.mailbox("g", "owner").await?;
     // Large durable backlog; the server still reads only 32 records per batch.
-    sqlx::query!("WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<20000) INSERT INTO coordination_events(recipient,kind,subject,version,created) SELECT ?,'work_changed','backpressure',n,n FROM seq",owner.id).execute(&store.pool).await?;
+    sqlx::query!("WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<20000) INSERT INTO coordination_events(recipient,kind,subject,version,created) SELECT ?,'work_changed','backpressure',n,n FROM seq",owner.id).execute(&support::pool(&store).await?).await?;
     let _server = Server::start(store.clone())?;
     let mut slow = stream::connect(&store, &owner, 0).await?;
     assert!(matches!(next(&mut slow).await?, Frame::Ready { .. }));

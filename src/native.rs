@@ -1,0 +1,362 @@
+//! Shared native wake routing with durable retry and receipt policy.
+//!
+//! Codex and Claude attachments belong to a standalone binding generation. A wake
+//! reserves its retry budget before I/O and records confirmed queue acceptance in a
+//! transaction. Mail and work remain unresolved until an explicit business decision.
+//! Endpoint replacement invalidates stale delivery attempts.
+
+use crate::{
+    identity::Binding,
+    service::Observation,
+    store::{Mailbox, Store},
+};
+use anyhow::{Context, Result, ensure};
+use serde_json::{Value, json};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
+use uuid::Uuid;
+
+/// A supported native runtime transport.
+#[derive(Debug, Clone, Copy)]
+pub enum Kind {
+    /// A local Codex runtime queue.
+    Codex,
+    /// A local Claude streaming bridge.
+    Claude,
+}
+impl Kind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+    /// Parse a supported native runtime name.
+    ///
+    /// # Errors
+    /// The runtime is neither codex nor claude.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "codex" => Ok(Self::Codex),
+            "claude" => Ok(Self::Claude),
+            _ => anyhow::bail!("unsupported native runtime"),
+        }
+    }
+}
+enum State {
+    Idle,
+    Active,
+    Unavailable,
+}
+enum Peer {
+    Codex {
+        client: Box<crate::codex::Client>,
+        thread: Uuid,
+        turn: Option<String>,
+    },
+    Claude {
+        socket: PathBuf,
+        status: crate::claude::Status,
+    },
+}
+impl Peer {
+    async fn connect(kind: Kind, socket: &Path, thread: Uuid) -> Result<Self> {
+        Ok(match kind {
+            Kind::Codex => Self::Codex {
+                client: Box::new(crate::codex::Client::connect(socket).await?),
+                thread,
+                turn: None,
+            },
+            Kind::Claude => Self::Claude {
+                socket: socket.into(),
+                status: crate::claude::probe(socket, thread).await?,
+            },
+        })
+    }
+    async fn state(&mut self) -> Result<State> {
+        Ok(match self {
+            Self::Codex { client, thread, .. } => match client.thread(*thread).await?.status {
+                crate::codex::ThreadStatus::Idle => State::Idle,
+                crate::codex::ThreadStatus::Active => State::Active,
+                _ => State::Unavailable,
+            },
+            Self::Claude { status, .. } => {
+                if !status.ready {
+                    State::Unavailable
+                } else if status.active {
+                    State::Active
+                } else {
+                    State::Idle
+                }
+            }
+        })
+    }
+    async fn prepare(&mut self, active: bool) -> Result<()> {
+        if active {
+            if let Self::Codex {
+                client,
+                thread,
+                turn,
+            } = self
+            {
+                let result = client
+                    .call(
+                        "thread/read",
+                        json!({"threadId":thread,"includeTurns":true}),
+                    )
+                    .await?;
+                *turn = Some(
+                    result["thread"]["turns"]
+                        .as_array()
+                        .context("active turn unavailable")?
+                        .iter()
+                        .rev()
+                        .find(|t| t["status"] == "inProgress")
+                        .and_then(|t| t["id"].as_str())
+                        .context("active turn changed")?
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
+    async fn send(
+        &mut self,
+        thread: Uuid,
+        text: String,
+        active: bool,
+        message_id: String,
+    ) -> Result<()> {
+        match self {
+            Self::Codex { client, turn, .. } => {
+                if let Some(turn) = turn {
+                    client.call("turn/steer",json!({"threadId":thread,"expectedTurnId":turn,"input":[{"type":"text","text":text}]})).await?;
+                } else {
+                    let receipt = client
+                        .call(
+                            "thread/queue/add",
+                            json!({"threadId":thread,"clientUserMessageId":message_id,"input":[{"type":"text","text":text}]}),
+                        )
+                        .await?;
+                    ensure!(
+                        receipt["queuedSubmission"]["id"].as_str().is_some(),
+                        "native queue receipt missing"
+                    );
+                }
+                Ok(())
+            }
+            Self::Claude { socket, status } => {
+                ensure!(status.active == active, "Claude state changed");
+                crate::claude::deliver(socket, thread, status, text).await
+            }
+        }
+    }
+}
+/// Probe a configured runtime endpoint without starting a turn.
+///
+/// # Errors
+/// The runtime is unavailable, its identity is invalid, or protocol checks fail.
+pub async fn probe(kind: Kind, socket: &Path, thread: Uuid) -> Result<Value> {
+    match kind {
+        Kind::Codex => crate::codex::probe(socket, thread).await,
+        Kind::Claude => {
+            let status = crate::claude::probe(socket, thread).await?;
+            Ok(
+                json!({"client":status.client,"ready":status.ready,"persistent":true,"state":if !status.ready{"not_loaded"}else if status.active{"active"}else{"idle"},"safe_queue":status.ready,"receipt":"queue_accepted"}),
+            )
+        }
+    }
+}
+impl Store {
+    /// Attach a verified Codex thread to a standalone binding generation.
+    ///
+    /// Errors if the endpoint is unavailable, already assigned, or not persistent.
+    ///
+    /// # Errors
+    /// The binding, endpoint, thread, or assignment is invalid, or probing or persistence fails.
+    pub async fn attach_codex(&self, actor: &Mailbox, socket: &Path, thread: Uuid) -> Result<()> {
+        self.attach_native(actor, socket, thread, Kind::Codex).await
+    }
+    /// Attach a verified Claude session to a standalone binding generation.
+    ///
+    /// # Errors
+    /// The binding, endpoint, session, or assignment is invalid, or probing or persistence fails.
+    pub async fn attach_claude(&self, actor: &Mailbox, socket: &Path, thread: Uuid) -> Result<()> {
+        self.attach_native(actor, socket, thread, Kind::Claude)
+            .await
+    }
+    async fn attach_native(
+        &self,
+        actor: &Mailbox,
+        socket: &Path,
+        thread: Uuid,
+        kind: Kind,
+    ) -> Result<()> {
+        ensure!(
+            matches!(actor.binding, Binding::Standalone { .. }),
+            "Runtime wake requires a standalone participant"
+        );
+        ensure!(socket.is_absolute(), "socket path must be absolute");
+        let socket = socket.to_str().context("socket must be UTF-8")?;
+        let info = probe(kind, Path::new(socket), thread).await?;
+        ensure!(
+            info["ready"] != false,
+            "runtime is not ready; initialize its native session first"
+        );
+        let runtime = kind.as_str();
+        let thread = thread.to_string();
+        let mut tx = self.pool().begin().await?;
+        Self::lock_actor(&mut tx, actor).await?;
+        // Repeating identical attachment preserves its cursor and retry budget.
+        sqlx::query!("INSERT INTO runtime_wakes(recipient,binding_version,socket,thread,runtime) VALUES (?,?,?,?,?) ON CONFLICT(recipient) DO UPDATE SET binding_version=excluded.binding_version,socket=excluded.socket,thread=excluded.thread,runtime=excluded.runtime,scanned=0,delivered=0,attempted=0,attempts=0,next_attempt=0 WHERE runtime_wakes.binding_version<>excluded.binding_version OR runtime_wakes.socket<>excluded.socket OR runtime_wakes.thread<>excluded.thread OR runtime_wakes.runtime<>excluded.runtime",
+            actor.id, actor.binding_version, socket, thread, runtime).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    /// Disable Codex wake delivery while preserving mail and work.
+    ///
+    /// # Errors
+    /// The actor is stale or the database transaction fails.
+    pub async fn detach_codex(&self, actor: &Mailbox) -> Result<()> {
+        self.detach_native(actor, Kind::Codex).await
+    }
+    /// Disable Claude wake delivery while preserving mail and work.
+    ///
+    /// # Errors
+    /// The actor is stale or the database transaction fails.
+    pub async fn detach_claude(&self, actor: &Mailbox) -> Result<()> {
+        self.detach_native(actor, Kind::Claude).await
+    }
+    async fn detach_native(&self, actor: &Mailbox, kind: Kind) -> Result<()> {
+        let runtime = kind.as_str();
+        let mut tx = self.pool().begin().await?;
+        Self::lock_actor(&mut tx, actor).await?;
+        sqlx::query!(
+            "DELETE FROM runtime_wakes WHERE recipient=? AND runtime=?",
+            actor.id,
+            runtime
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    /// Report configured native endpoints and their durable retry budgets.
+    ///
+    /// # Errors
+    /// The database query fails.
+    pub async fn native_status(&self) -> Result<Value> {
+        let rows = sqlx::query!("SELECT m.group_name,m.name,c.runtime,c.binding_version,m.binding_version AS current_version,c.socket,c.thread,c.delivered,c.attempted,c.attempts,c.next_attempt FROM runtime_wakes c JOIN mailboxes m ON m.id=c.recipient").fetch_all(self.pool()).await?;
+        Ok(Value::Array(rows.into_iter().map(|r| json!({"group":r.group_name,"participant":r.name,"runtime":r.runtime,"socket":r.socket,"thread":r.thread,"binding_current":r.binding_version==r.current_version,"delivered_through":r.delivered,"attempted_through":r.attempted,"attempts":r.attempts,"next_attempt":r.next_attempt})).collect()))
+    }
+    pub(crate) async fn has_native(&self, actor: &Mailbox) -> Result<bool> {
+        Ok(sqlx::query!(
+            "SELECT recipient FROM runtime_wakes WHERE recipient=? AND binding_version=?",
+            actor.id,
+            actor.binding_version
+        )
+        .fetch_optional(self.pool())
+        .await?
+        .is_some())
+    }
+}
+
+pub(crate) async fn tick(store: &Store, time: i64) -> Result<Vec<Observation>> {
+    let targets = sqlx::query!("SELECT m.group_name,m.name FROM runtime_wakes c JOIN mailboxes m ON m.id=c.recipient AND m.binding_version=c.binding_version").fetch_all(store.pool()).await?;
+    let mut observations = Vec::new();
+    for target in targets {
+        let actor = store.mailbox(&target.group_name, &target.name).await?;
+        let state = match tokio::time::timeout(Duration::from_secs(5), deliver(store, &actor, time))
+            .await
+        {
+            Ok(Ok(state)) => state.to_string(),
+            Ok(Err(error)) => format!("Runtime wake uncertain: {error:#}"),
+            Err(_) => "Runtime wake timed out; receipt unknown".into(),
+        };
+        observations.push(Observation {
+            group: target.group_name,
+            participant: target.name,
+            state,
+        });
+    }
+    Ok(observations)
+}
+
+async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<&'static str> {
+    let group = store.group(&actor.group_name).await?;
+    if group.paused != 0 {
+        return Ok("Runtime wake disabled or group paused");
+    }
+    let Some(endpoint) = sqlx::query!("SELECT runtime,socket,thread,scanned,delivered,attempted,attempts,next_attempt FROM runtime_wakes WHERE recipient=? AND binding_version=?",actor.id,actor.binding_version).fetch_optional(store.pool()).await? else { return Ok("binding changed; attach explicitly"); };
+    let latest = sqlx::query!(
+        "SELECT COALESCE(MAX(id),0) AS \"id!: i64\" FROM coordination_events WHERE recipient=?",
+        actor.id
+    )
+    .fetch_one(store.pool())
+    .await?
+    .id;
+    if latest <= endpoint.scanned {
+        return Ok("Runtime notifications settled; work progress reported separately");
+    }
+    let actionable = store.needs_wake(actor, endpoint.scanned).await?;
+    let cancellation = store.needs_cancellation(actor, endpoint.scanned).await?;
+    if !actionable && !cancellation {
+        store.scan_passive(actor, latest).await?;
+        return Ok("Runtime passive changes retained for recovery; no turn needed");
+    }
+    if latest == endpoint.attempted && endpoint.attempts >= 3 {
+        return Ok("Runtime delivery attempts exhausted; inspect status");
+    }
+    if latest == endpoint.attempted && endpoint.next_attempt > time {
+        return Ok("Runtime waiting for delivery deadline");
+    }
+    let thread = Uuid::parse_str(&endpoint.thread)?;
+    let kind = Kind::parse(&endpoint.runtime)?;
+    let mut peer = Peer::connect(kind, Path::new(&endpoint.socket), thread).await?;
+    let active = match peer.state().await? {
+        State::Active if cancellation => true,
+        State::Idle if actionable => false,
+        State::Idle => {
+            store.scan_passive(actor, latest).await?;
+            return Ok("Runtime idle cancellation retained for recovery; no turn needed");
+        }
+        _ => return Ok("Runtime not idle; changes retained"),
+    };
+    peer.prepare(active).await?;
+    let text = store.delivery_text(actor).await?;
+    // Persist the attempt before I/O. A crash or lost response consumes its budget.
+    let mut tx = store.pool().begin().await?;
+    Store::lock_actor(&mut tx, actor).await?;
+    let next = time + 300;
+    let reserved = sqlx::query!("UPDATE runtime_wakes SET attempts=CASE WHEN attempted=? THEN attempts+1 ELSE 1 END, attempted=?,next_attempt=? WHERE recipient=? AND binding_version=? AND socket=? AND thread=? AND scanned<? AND (attempted<>? OR next_attempt<=?) AND (attempted<>? OR attempts<3) AND EXISTS(SELECT 1 FROM groups WHERE name=? AND paused=0)",latest,latest,next,actor.id,actor.binding_version,endpoint.socket,endpoint.thread,latest,latest,time,latest,actor.group_name).execute(&mut *tx).await?.rows_affected();
+    tx.commit().await?;
+    if reserved == 0 {
+        return Ok("Runtime reservation no longer eligible");
+    }
+    // Hold the binding lock during the bounded send: replacement/detachment cannot race it.
+    let mut tx = store.pool().begin().await?;
+    Store::lock_actor(&mut tx, actor).await?;
+    let still_attached = sqlx::query!("SELECT recipient FROM runtime_wakes WHERE recipient=? AND binding_version=? AND socket=? AND thread=? AND EXISTS(SELECT 1 FROM groups WHERE name=? AND paused=0) AND NOT EXISTS(SELECT 1 FROM coordination_events WHERE recipient=? AND id>?)",actor.id,actor.binding_version,endpoint.socket,endpoint.thread,actor.group_name,actor.id,latest).fetch_optional(&mut *tx).await?.is_some();
+    ensure!(still_attached, "Runtime endpoint changed before delivery");
+    peer.send(
+        thread,
+        text,
+        active,
+        format!("agent-mail-{}-{}-{latest}", actor.id, actor.binding_version),
+    )
+    .await?;
+    sqlx::query!(
+        "UPDATE runtime_wakes SET delivered=?,scanned=?,attempts=0,next_attempt=0 WHERE recipient=?",
+        latest,
+        latest,
+        actor.id
+    )
+    .execute(&mut *tx)
+    .await?;
+    // Queue acceptance acknowledges transport only. Business deliveries remain pending.
+    sqlx::query!("INSERT OR IGNORE INTO event_receipts(recipient,binding_version,event) SELECT recipient,?,id FROM coordination_events WHERE recipient=? AND id<=?",actor.binding_version,actor.id,latest).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok("Runtime update queued; work and mail resolution unchanged")
+}

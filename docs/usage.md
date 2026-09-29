@@ -164,7 +164,8 @@ Context text is capped at 6,000 UTF-8 bytes and contains summaries plus change I
 changed work after manual compaction, and recovered changes after session resume,
 without model tool calls. In that version, manual compaction needed the
 `PostCompact` invalidation plus next-prompt fallback; immediate post-compaction
-`SessionStart` injection was not observed. Claude Code is protocol-tested only.
+`SessionStart` injection was not observed. Native Claude live results for the next
+release are recorded in [native acceptance](native-acceptance.md).
 
 **Limits:** each installed client must load and trust its hooks. A successful stdout write does not prove model
 consumption: hook attempts never manufacture delivery receipts. `status` shows
@@ -216,6 +217,44 @@ worker restarts. Codex does **not** deduplicate queue entries by client message 
 so a lost response can cause a duplicate wake. Idempotent sends and decisions
 protect business state. Queued input is not proof that the model acted on it.
 Herdr's `prompt-mode --enable-unguarded` is unrelated to Codex attachment.
+
+### Native Claude delivery (next release)
+
+Claude uses its own native streaming CLI; ACP is not required. The operator's
+stdio client launches the bridge instead of launching `claude` directly:
+
+```sh
+agent-mail claude-bridge --socket /absolute/path/to/claude.sock -- [CLAUDE_OPTIONS]
+```
+
+The client writes native JSON input to stdin and reads native JSON output from
+stdout, including permission requests. It must handle approvals and keep reading
+output. This is a client integration command, not an interactive terminal UI.
+The bridge launches only `claude` with native stream formats, forwards permission
+requests unchanged, and never grants approvals or injects Mail credentials.
+Configure the client's own participant environment and trusted hooks as above.
+
+After the client's initial prompt, obtain the session UUID from `system/init`:
+
+```sh
+agent-mail attach-claude --group project --name worker \
+  --socket /absolute/path/to/claude.sock --session-id SESSION_UUID
+agent-mail service run
+```
+
+Requires Claude's `msg_lifecycle_v1` capability (tested with Claude 2.1.284).
+Attachment fails until the session is initialized. Idle work receives the same
+bounded context, durable attempts, receipts, pause/rearm behavior and identity
+checks as Codex. For active cancellation Claude uses native `priority: now`,
+which cancels the current response and starts another; Codex steers its current
+turn. Neither receipt accepts work or resolves a request.
+
+Use `detach-claude --group project --name worker` to stop delivery. To resume,
+launch the bridge with native `--resume SESSION_UUID`, let the client initialize
+it, then reattach. Reattaching the same endpoint preserves its retry budget.
+An arbitrary existing Claude interactive terminal cannot be attached this way.
+`status.native` includes both runtimes; `status.codex` remains a Codex-only
+compatibility view. See [native acceptance evidence](native-acceptance.md).
 
 ### Submit one work decision
 

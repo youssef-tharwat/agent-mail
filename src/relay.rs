@@ -1,76 +1,135 @@
-//! Bounded store-and-forward exchange over an operator-configured SSH connection.
+//! Bounded store-and-forward exchange over operator-configured SSH connections.
+//!
+//! Only a group's home machine initiates synchronization. Events carry stable UUIDs
+//! for idempotent receipt, and acknowledgements are checked against their source.
+//! Both subprocess output streams are bounded while reading, and exchange failures
+//! kill and reap the child. Business operations accept Unix seconds from their caller.
 
-use crate::{BODY_LIMIT, SUMMARY_LIMIT, bounded, name, now, store::Store, work::WorkItem};
+use crate::{BODY_LIMIT, SUMMARY_LIMIT, bounded, name, store::Store, work::WorkItem};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sqlx::{Sqlite, Transaction};
 use std::{process::Stdio, time::Duration};
-use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    process::{Child, Command},
+    time::timeout,
+};
 use uuid::Uuid;
 
+// Keep each exchange small enough to fit the wire budget and avoid starving peers.
 const BATCH_LIMIT: usize = 16;
+// Shared by encoding and streaming reads; changing this changes the relay wire contract.
 const WIRE_LIMIT: usize = 256 * 1024;
+// Diagnostics need only a short tail-sized budget, independent of message payloads.
+const STDERR_LIMIT: usize = 16 * 1024;
+// Fail unreachable hosts promptly; leave the rest of the exchange budget for SQL and transfer.
+const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+// Bounds the entire write/read/wait exchange, allowing four connection-timeout intervals.
+const SSH_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// An idempotent relay event with explicit origin and destination machines.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
+    /// Stable UUID used to deduplicate this envelope.
     pub event_id: Uuid,
+    /// UUID of the machine that originated the event.
     pub origin: Uuid,
+    /// UUID of the machine that should receive the event.
     pub destination: Uuid,
+    /// Business event carried by this envelope.
     pub event: Event,
 }
 
+/// A mail disposition or work snapshot exchanged between machines.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Event {
+    /// A message to deliver to the destination participant.
     Message(WireMessage),
+    /// An explicit resolution of a received message.
     Resolution {
+        /// Group owning the referenced message.
         group: String,
+        /// Message UUID or protocol failure description.
         message: Uuid,
+        /// Participant whose delivery disposition changed.
         recipient: String,
+        /// Serialized explicit resolution recorded by the recipient.
         resolution: String,
     },
+    /// A sender’s withdrawal of outstanding delivery.
     Withdrawal {
+        /// Group owning the referenced message.
         group: String,
+        /// Message UUID or protocol failure description.
         message: Uuid,
+        /// Participant whose delivery disposition changed.
         recipient: String,
     },
+    /// An authoritative work revision from the group home.
     WorkSnapshot(WorkItem),
 }
 
+/// Portable message content identified by UUIDs across installations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireMessage {
+    /// Persistent identifier for this record.
     pub id: Uuid,
+    /// Enrolled group containing the referenced participant or record.
     pub group: String,
+    /// Name of the participant that published this message.
     pub sender: String,
+    /// Participant name receiving this event or delivery.
     pub recipient: String,
+    /// Caller-supplied idempotency key; retries must preserve their original content.
     pub key: String,
+    /// Short UTF-8 summary used in inbox and recovery views.
     pub summary: String,
+    /// Full UTF-8 message body, subject to the message byte limit.
     pub body: String,
+    /// Creation timestamp in Unix seconds.
     pub created: i64,
+    /// Deadline timestamp in Unix seconds.
     pub due: i64,
+    /// Optional work identifier associated with this message.
     pub work_id: Option<String>,
+    /// Optional identifier of the message being answered.
     pub reply_to: Option<Uuid>,
 }
 
+/// Incoming envelopes and acknowledgements submitted atomically by a peer.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Exchange {
+    /// Bounded batch of envelopes to validate and apply.
     pub incoming: Vec<Envelope>,
+    /// UUIDs of envelopes confirmed as received.
     pub ack: Vec<Uuid>,
 }
 
+/// The UUIDs accepted by a relay exchange.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Receipt {
+    /// UUIDs of envelopes confirmed as received.
     pub ack: Vec<Uuid>,
 }
 
+/// A configured peer’s queue size and latest synchronization result.
 #[derive(Debug, Serialize)]
 pub struct PeerStatus {
+    /// Persistent UUID of the remote machine.
     pub machine_id: String,
+    /// Restricted operator-configured SSH alias.
     pub ssh_target: String,
+    /// Whether the worker may synchronize this peer automatically.
     pub auto_sync: bool,
+    /// Most recent successful synchronization time in Unix seconds.
     pub last_sync: Option<i64>,
+    /// Bounded description of the latest synchronization failure.
     pub last_error: Option<String>,
+    /// Number of envelopes waiting for this peer.
     pub queued: i64,
+    /// Earliest queued creation timestamp in Unix seconds, when available.
     pub oldest: Option<i64>,
 }
 
@@ -203,11 +262,15 @@ pub(crate) async fn enqueue_snapshot(
 }
 
 impl Store {
+    /// Join an empty group to a remote home machine.
+    ///
+    /// # Errors
+    /// The home conflicts, the group contains local work or mail, or persistence fails.
     pub async fn set_home(&self, group: &str, home: Uuid) -> Result<()> {
         name(group)?;
         let local = parse_id(&self.machine_id().await?)?;
         ensure!(home != local, "this machine already owns the group");
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         let record = sqlx::query!("SELECT home_machine FROM groups WHERE name=?", group)
             .fetch_one(&mut *tx)
             .await?;
@@ -238,6 +301,10 @@ impl Store {
         Ok(())
     }
 
+    /// Configure a remote machine’s restricted SSH alias.
+    ///
+    /// # Errors
+    /// The machine is local, the alias is invalid, or persistence fails.
     pub async fn add_peer(&self, machine: Uuid, ssh_target: &str) -> Result<()> {
         ensure!(
             machine != parse_id(&self.machine_id().await?)?,
@@ -250,10 +317,14 @@ impl Store {
         );
         let machine = machine.to_string();
         sqlx::query!("INSERT INTO peers(machine_id,ssh_target) VALUES (?,?) ON CONFLICT(machine_id) DO UPDATE SET auto_sync=CASE WHEN peers.ssh_target=excluded.ssh_target THEN peers.auto_sync ELSE 0 END,last_sync=CASE WHEN peers.ssh_target=excluded.ssh_target THEN peers.last_sync ELSE NULL END,last_error=NULL,ssh_target=excluded.ssh_target",
-            machine, ssh_target).execute(&self.pool).await?;
+            machine, ssh_target).execute(self.pool()).await?;
         Ok(())
     }
 
+    /// Set whether the worker automatically synchronizes a configured peer.
+    ///
+    /// # Errors
+    /// The peer is absent, enabling is not on a group home machine, or persistence fails.
     pub async fn set_auto_sync(&self, machine: Uuid, enabled: bool) -> Result<()> {
         if enabled {
             let local = self.machine_id().await?;
@@ -269,13 +340,23 @@ impl Store {
             enabled,
             machine
         )
-        .execute(&self.pool)
+        .execute(self.pool())
         .await?;
         ensure!(result.rows_affected() == 1, "peer is not configured");
         Ok(())
     }
 
-    pub async fn route(&self, group: &str, participant: &str, machine: Uuid) -> Result<()> {
+    /// Register a remote participant and queue applicable work snapshots.
+    ///
+    /// # Errors
+    /// The route is local or conflicts, the group is missing, or persistence fails.
+    pub async fn route(
+        &self,
+        group: &str,
+        participant: &str,
+        machine: Uuid,
+        time: i64,
+    ) -> Result<()> {
         name(participant)?;
         self.group(group).await?;
         ensure!(
@@ -283,7 +364,7 @@ impl Store {
             "use bind for a local mailbox"
         );
         let machine = machine.to_string();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         let existing = sqlx::query!(
             "SELECT remote_machine FROM mailboxes WHERE group_name=? AND name=?",
             group,
@@ -308,7 +389,7 @@ impl Store {
                         &mut tx,
                         parse_id(&machine)?,
                         Event::WorkSnapshot(item),
-                        now()?,
+                        time,
                     )
                     .await?;
                 }
@@ -318,32 +399,48 @@ impl Store {
         Ok(())
     }
 
+    /// List configured peers, queued events, and last synchronization results.
+    ///
+    /// # Errors
+    /// The database query fails.
     pub async fn peers_status(&self) -> Result<Vec<PeerStatus>> {
         Ok(sqlx::query_as!(PeerStatus,
             "SELECT p.machine_id AS 'machine_id!',p.ssh_target AS 'ssh_target!',p.auto_sync AS 'auto_sync!: bool',p.last_sync,p.last_error,COUNT(o.event_id) AS 'queued!: i64',MIN(o.created) AS oldest FROM peers p LEFT JOIN outbox o ON o.dest_machine=p.machine_id GROUP BY p.machine_id ORDER BY p.machine_id")
-            .fetch_all(&self.pool).await?)
+            .fetch_all(self.pool()).await?)
     }
 
+    /// Return the queued event count and oldest creation timestamp.
+    ///
+    /// # Errors
+    /// The database query fails.
     pub async fn outbox_status(&self) -> Result<(i64, Option<i64>)> {
         let row =
             sqlx::query!("SELECT COUNT(*) AS 'queued!: i64', MIN(created) AS oldest FROM outbox")
-                .fetch_one(&self.pool)
+                .fetch_one(self.pool())
                 .await?;
         Ok((row.queued, row.oldest))
     }
 
+    /// Export a bounded batch of queued envelopes.
+    ///
+    /// # Errors
+    /// The query fails or a stored envelope cannot be decoded.
     pub async fn export(&self) -> Result<Vec<Envelope>> {
         let rows = sqlx::query!(
             "SELECT payload FROM outbox ORDER BY rowid LIMIT ?",
             BATCH_LIMIT as i64
         )
-        .fetch_all(&self.pool)
+        .fetch_all(self.pool())
         .await?;
         rows.into_iter()
             .map(|row| serde_json::from_str(&row.payload).map_err(Into::into))
             .collect()
     }
 
+    /// Export a bounded batch of envelopes destined for one machine.
+    ///
+    /// # Errors
+    /// The query fails or a stored envelope cannot be decoded.
     pub async fn export_for(&self, machine: Uuid) -> Result<Vec<Envelope>> {
         let machine = machine.to_string();
         let rows = sqlx::query!(
@@ -351,20 +448,24 @@ impl Store {
             machine,
             BATCH_LIMIT as i64
         )
-        .fetch_all(&self.pool)
+        .fetch_all(self.pool())
         .await?;
         rows.into_iter()
             .map(|row| serde_json::from_str(&row.payload).map_err(Into::into))
             .collect()
     }
 
+    /// Apply validated incoming events and acknowledgements in one transaction.
+    ///
+    /// # Errors
+    /// Source authority, event content, or acknowledgement validation fails, or persistence fails.
     pub async fn exchange(&self, source: Uuid, exchange: Exchange, time: i64) -> Result<Receipt> {
         ensure!(
             exchange.incoming.len() <= BATCH_LIMIT && exchange.ack.len() <= BATCH_LIMIT,
             "relay batch exceeds limit"
         );
         let local = parse_id(&self.machine_id().await?)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         let mut accepted = Vec::new();
         for envelope in &exchange.incoming {
             ensure!(
@@ -440,11 +541,15 @@ impl Store {
                 .await?;
         }
         tx.commit().await?;
-        crate::stream::hint(&self.root).await;
+        crate::stream::hint(self.root()).await;
         Ok(Receipt { ack: accepted })
     }
 
-    pub async fn sync_peer(&self, peer: Uuid) -> Result<usize> {
+    /// Synchronize one configured peer using the supplied Unix timestamp.
+    ///
+    /// # Errors
+    /// This is not a home machine, peer I/O or validation fails, or persistence fails.
+    pub async fn sync_peer(&self, peer: Uuid, time: i64) -> Result<usize> {
         let local = parse_id(&self.machine_id().await?)?;
         ensure!(
             self.groups()
@@ -455,12 +560,12 @@ impl Store {
         );
         let peer_id = peer.to_string();
         let target = sqlx::query!("SELECT ssh_target FROM peers WHERE machine_id=?", peer_id)
-            .fetch_one(&self.pool)
+            .fetch_one(self.pool())
             .await?
             .ssh_target;
-        let result = self.sync_peer_inner(local, peer, &target).await;
+        let result = self.sync_peer_inner(local, peer, &target, time).await;
         let (last_sync, last_error) = match &result {
-            Ok(_) => (Some(now()?), None),
+            Ok(_) => (Some(time), None),
             Err(e) => (
                 None,
                 Some(format!("{e:#}").chars().take(512).collect::<String>()),
@@ -472,12 +577,18 @@ impl Store {
             last_error,
             peer_id
         )
-        .execute(&self.pool)
+        .execute(self.pool())
         .await?;
         result
     }
 
-    async fn sync_peer_inner(&self, local: Uuid, peer: Uuid, target: &str) -> Result<usize> {
+    async fn sync_peer_inner(
+        &self,
+        local: Uuid,
+        peer: Uuid,
+        target: &str,
+        time: i64,
+    ) -> Result<usize> {
         // The remote command is fixed; SSH aliases are restricted to plain names.
         let bytes = ssh(target, &["bridge", "export"], None).await?;
         let remote: Vec<Envelope> = serde_json::from_slice(&bytes)?;
@@ -492,7 +603,7 @@ impl Store {
                     incoming: remote,
                     ack: vec![],
                 },
-                now()?,
+                time,
             )
             .await?;
         let outgoing = self.export_for(peer).await?;
@@ -529,7 +640,7 @@ impl Store {
                 incoming: vec![],
                 ack: receipt.ack,
             },
-            now()?,
+            time,
         )
         .await?;
         Ok(sent)
@@ -735,12 +846,12 @@ async fn ssh(target: &str, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8
         target.as_bytes()[0].is_ascii_alphanumeric(),
         "SSH alias must start with a letter or digit"
     );
-    let mut child = Command::new("ssh")
+    let child = Command::new("ssh")
         .args([
             "-o",
             "BatchMode=yes",
             "-o",
-            "ConnectTimeout=5",
+            &format!("ConnectTimeout={}", SSH_CONNECT_TIMEOUT.as_secs()),
             target,
             "agent-mail",
         ])
@@ -754,30 +865,65 @@ async fn ssh(target: &str, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
-    if let Some(input) = input {
-        timeout(
-            Duration::from_secs(20),
-            child
-                .stdin
-                .take()
-                .context("missing SSH stdin")?
-                .write_all(input),
-        )
-        .await??;
-    }
-    let output = timeout(Duration::from_secs(20), child.wait_with_output()).await??;
-    ensure!(
-        output.status.success(),
-        "SSH relay failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    ensure!(
-        output.stdout.len() <= WIRE_LIMIT,
-        "SSH relay response exceeds limit"
-    );
-    Ok(output.stdout)
+    collect_output(child, input).await
 }
 
+async fn read_bounded(
+    reader: impl AsyncRead + Unpin,
+    limit: usize,
+    label: &str,
+) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take((limit + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await?;
+    ensure!(bytes.len() <= limit, "SSH {label} exceeds limit");
+    Ok(bytes)
+}
+
+async fn collect_output(mut child: Child, input: Option<&[u8]>) -> Result<Vec<u8>> {
+    let result = timeout(SSH_EXCHANGE_TIMEOUT, async {
+        let stdout = child.stdout.take().context("missing SSH stdout")?;
+        let stderr = child.stderr.take().context("missing SSH stderr")?;
+        let stdin = child.stdin.take();
+        // Drain both pipes while writing input: a peer may respond before consuming stdin.
+        let write = async {
+            if let Some(input) = input {
+                let mut stdin = stdin.context("missing SSH stdin")?;
+                stdin.write_all(input).await?;
+                stdin.shutdown().await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let (_, stdout, stderr, status) = tokio::try_join!(
+            write,
+            read_bounded(stdout, WIRE_LIMIT, "relay response"),
+            read_bounded(stderr, STDERR_LIMIT, "diagnostics"),
+            async { Ok::<_, anyhow::Error>(child.wait().await?) },
+        )?;
+        ensure!(
+            status.success(),
+            "SSH relay failed: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        Ok(stdout)
+    })
+    .await
+    .context("SSH relay exchange timed out")
+    .and_then(|result| result);
+    if result.is_err() {
+        // Reap the process on size, I/O, and timeout failures; kill_on_drop also
+        // covers cancellation of this future by the worker.
+        let _ = child.kill().await;
+    }
+    result
+}
+
+/// Decode a relay exchange within the protocol byte budget.
+///
+/// # Errors
+/// Input exceeds the wire limit or is not a valid exchange.
 pub fn decode_exchange(input: &[u8]) -> Result<Exchange> {
     ensure!(
         input.len() <= WIRE_LIMIT,
@@ -786,6 +932,76 @@ pub fn decode_exchange(input: &[u8]) -> Result<Exchange> {
     Ok(serde_json::from_slice(input)?)
 }
 
+/// Parse a machine identifier as a UUID.
+///
+/// # Errors
+/// The string is not a valid UUID.
 pub fn machine(value: &str) -> Result<Uuid> {
     parse_id(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn child(script: &str) -> Result<Child> {
+        Ok(Command::new("sh")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?)
+    }
+
+    #[tokio::test]
+    async fn rejects_unending_stdout_and_stderr_before_deadline() -> Result<()> {
+        for script in ["exec yes oversized", "exec yes oversized >&2"] {
+            let error = timeout(Duration::from_secs(3), collect_output(child(script)?, None))
+                .await?
+                .unwrap_err();
+            assert!(error.to_string().contains("exceeds limit"), "{error:#}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drains_output_while_writing_input() -> Result<()> {
+        let input = vec![b'x'; 100_000];
+        let output = timeout(
+            Duration::from_secs(3),
+            collect_output(child("head -c 100000 /dev/zero; cat")?, Some(&input)),
+        )
+        .await??;
+        assert_eq!(output.len(), 200_000);
+        assert!(output[..100_000].iter().all(|byte| *byte == 0));
+        assert_eq!(&output[100_000..], &input);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retains_bounded_remote_failure_diagnostics() -> Result<()> {
+        let error = collect_output(child("printf 'permission denied' >&2; exit 7")?, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("permission denied"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepts_exact_wire_limit_and_rejects_one_more_byte() -> Result<()> {
+        let bytes = vec![0; WIRE_LIMIT + 1];
+        assert_eq!(
+            read_bounded(&bytes[..WIRE_LIMIT], WIRE_LIMIT, "test")
+                .await?
+                .len(),
+            WIRE_LIMIT
+        );
+        assert!(
+            read_bounded(bytes.as_slice(), WIRE_LIMIT, "test")
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
 }

@@ -14,7 +14,7 @@ Use the assigned group and identity. A Herdr pane uses its verified binding with
 
 ## Automatic recovery when configured
 
-On v0.3 or later with trusted lifecycle hooks or a configured Codex queue adapter, use the supplied Agent Mail
+On v0.3 or later with trusted lifecycle hooks or a configured native delivery adapter, use the supplied Agent Mail
 recovery context directly. Do not run another `context` merely to repeat it.
 Fetch details by ID when the supplied view is insufficient. Hook delivery and
 `ack` receipts never mean a request was handled; acknowledgment is the runtime
@@ -40,7 +40,7 @@ operator that automatic recovery is not configured.
 - On v0.2 or for initial creation, the designated home writer creates or updates work records. Inspect the current version first, then update with `agent-mail work update --group <group> <work-id> --version <version> --reason <reason>` and the intended fields. On a version conflict, reread the record and reconsider the change.
 - Other participants send results or correction requests through Mail. A reply, an idle agent, or a passing test does not itself accept work or change its owner or state. Follow the active workflow's acceptance rules.
 
-Only the operator attaches or detaches Codex wake endpoints. Do not rearm a delivery budget yourself or poll while waiting for the other agent. A queued update may be repeated after a lost transport response; use stable operation keys.
+Only the operator attaches or detaches native Codex or Claude wake endpoints. Do not rearm a delivery budget yourself or poll while waiting for the other agent. A queued update may be repeated after a lost transport response; use stable operation keys.
 
 Herdr prompts remain off by default. Trusted client hooks supply recovery automatically; manual checkpoints are the fallback when hooks are unavailable.
 

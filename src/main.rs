@@ -1,3 +1,4 @@
+//! Agent Mail command-line interface and supervised delivery worker.
 use agent_mail::{
     BODY_LIMIT, herdr, now, relay, service,
     store::{Publish, Store},
@@ -8,6 +9,10 @@ use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::{io::Read, path::PathBuf};
+
+// Use the application allocator consistently across the CLI and long-lived worker.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser)]
 #[command(version, about = "Durable mail and work records for coding agents")]
@@ -28,6 +33,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Native Claude streaming session bridge; stdin/stdout remain the client protocol.
+    ClaudeBridge {
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
     /// Inspect setup without starting agents or changing configuration.
     Doctor {
         #[arg(long, default_value = "default")]
@@ -77,6 +89,24 @@ enum Command {
         socket: PathBuf,
         #[arg(long)]
         thread: uuid::Uuid,
+    },
+    /// Operator: attach a verified native Claude streaming session.
+    AttachClaude {
+        #[arg(long, default_value = "default")]
+        group: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long)]
+        session_id: uuid::Uuid,
+    },
+    /// Operator: disable native Claude delivery.
+    DetachClaude {
+        #[arg(long, default_value = "default")]
+        group: String,
+        #[arg(long)]
+        name: String,
     },
     /// Operator: disable the Codex wake endpoint for this participant.
     DetachCodex {
@@ -362,6 +392,15 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    if let Command::ClaudeBridge { socket, args } = cli.command {
+        let result = agent_mail::claude::run(&socket, args).await;
+        if let Err(error) = &result {
+            eprintln!("agent-mail: {error:#}");
+        }
+        // Tokio stdin uses a blocking reader; exit after the bridge has joined/aborted
+        // its tasks and closed its child so a quiet stdin cannot stall shutdown.
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
     if matches!(cli.command, Command::HooksConfig) {
         let command = "agent-mail hook";
         let mut hooks = serde_json::Map::new();
@@ -415,7 +454,7 @@ async fn run(cli: Cli) -> Result<()> {
         _ => {}
     }
     let setup = matches!(cli.command, Command::Setup { .. });
-    let (store, guard) = Store::open(&root, setup).await?;
+    let store = Store::open(&root, setup).await?;
     let output: Value = match cli.command {
         Command::Setup {
             group,
@@ -424,17 +463,11 @@ async fn run(cli: Cli) -> Result<()> {
             install_service,
         } => {
             let socket = if standalone { None } else { socket };
-            let socket = socket
-                .as_deref()
-                .map(|path| path.to_str().context("socket path is not UTF-8"))
-                .transpose()?
-                .unwrap_or("");
-            store.enroll(&group, socket).await?;
+            store.enroll(&group, socket.as_deref()).await?;
             if !explicit_state {
                 supervision::save_locator(&root)?;
             }
-            store.pool.close().await;
-            drop(guard);
+            store.close().await;
             if install_service {
                 supervision::install(&root)?;
             }
@@ -477,6 +510,21 @@ async fn run(cli: Cli) -> Result<()> {
             store.attach_codex(&actor, &socket, thread).await?;
             json!({"attached":name,"thread":thread,"group":group})
         }
+        Command::AttachClaude {
+            group,
+            name,
+            socket,
+            session_id,
+        } => {
+            let actor = store.mailbox(&group, &name).await?;
+            store.attach_claude(&actor, &socket, session_id).await?;
+            json!({"attached":name,"session_id":session_id,"group":group})
+        }
+        Command::DetachClaude { group, name } => {
+            let actor = store.mailbox(&group, &name).await?;
+            store.detach_claude(&actor).await?;
+            json!({"detached":name,"group":group})
+        }
         Command::DetachCodex { group, name } => {
             let actor = store.mailbox(&group, &name).await?;
             store.detach_codex(&actor).await?;
@@ -512,7 +560,7 @@ async fn run(cli: Cli) -> Result<()> {
             machine,
         } => {
             store
-                .route(&group, &name, relay::machine(&machine)?)
+                .route(&group, &name, relay::machine(&machine)?, now()?)
                 .await?;
             json!({"group":group,"name":name,"machine_id":machine})
         }
@@ -529,7 +577,7 @@ async fn run(cli: Cli) -> Result<()> {
                     continue;
                 }
                 let machine = relay::machine(&configured.machine_id)?;
-                match store.sync_peer(machine).await {
+                match store.sync_peer(machine, now()?).await {
                     Ok(sent) => {
                         synced.push(json!({"machine_id":configured.machine_id,"sent":sent}))
                     }
@@ -622,7 +670,7 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             let actor = store.authenticate(&group, cli.session.as_ref()).await?;
             if withdraw {
-                store.withdraw(&actor, message).await?;
+                store.withdraw(&actor, message, now()?).await?;
                 json!({"id":message,"withdrawn":true})
             } else {
                 let reply = reply_key
@@ -795,7 +843,7 @@ async fn run(cli: Cli) -> Result<()> {
                 Value::Null
             };
             let (outbox_pending, outbox_oldest) = store.outbox_status().await?;
-            json!({"service_running":service::running(&root),"now":now()?,"groups":store.groups().await?,"inboxes":store.pending().await?,"notifications":store.notification_status().await?,"codex":store.codex_status().await?,"attention":store.attention(now()?).await?,"peers":store.peers_status().await?,"outbox_pending":outbox_pending,"outbox_oldest":outbox_oldest,"last_scan":diagnostics})
+            json!({"service_running":service::running(&root),"now":now()?,"groups":store.groups().await?,"inboxes":store.pending().await?,"notifications":store.notification_status().await?,"native":store.native_status().await?,"codex":store.native_status().await?.as_array().context("native status must be an array")?.iter().filter(|endpoint| endpoint["runtime"] == "codex").collect::<Vec<_>>(),"attention":store.attention(now()?).await?,"peers":store.peers_status().await?,"outbox_pending":outbox_pending,"outbox_oldest":outbox_oldest,"last_scan":diagnostics})
         }
         Command::Pause { group } => {
             store.pause(&group, true).await?;
@@ -824,12 +872,15 @@ async fn run(cli: Cli) -> Result<()> {
             service::run(&store, once).await?;
             return Ok(());
         }
-        Command::Doctor { .. } | Command::Service(_) | Command::Restore | Command::HooksConfig => {
+        Command::ClaudeBridge { .. }
+        | Command::Doctor { .. }
+        | Command::Service(_)
+        | Command::Restore
+        | Command::HooksConfig => {
             unreachable!("handled before opening database")
         }
     };
     println!("{}", serde_json::to_string(&output)?);
-    store.pool.close().await;
-    drop(guard);
+    store.close().await;
     Ok(())
 }

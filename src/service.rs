@@ -1,3 +1,10 @@
+//! Bounded retry workers for Herdr, native clients, and remote relay peers.
+//!
+//! [`run`] owns an exclusive worker lock and writes a private status snapshot.
+//! Continuous mode also owns an event server; shutdown drains clients before the
+//! lock is released. [`tick`] accepts Unix seconds for deterministic retry decisions.
+//! Wake attempts reserve their durable budget before external delivery.
+
 use crate::{
     herdr,
     identity::Binding,
@@ -12,14 +19,20 @@ use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
     os::unix::fs::OpenOptionsExt,
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 use tokio::task::{JoinError, JoinSet};
 
+/// Exclusive ownership of one installation’s delivery worker.
+#[derive(Debug)]
 pub struct WorkerLock(File);
 
 impl WorkerLock {
+    /// Acquire an exclusive worker lock for this installation.
+    ///
+    /// # Errors
+    /// Another worker holds the lock or filesystem access fails.
     pub fn acquire(root: &Path) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -40,6 +53,7 @@ impl Drop for WorkerLock {
     }
 }
 
+/// Check whether an existing worker lock is currently held.
 pub fn running(root: &Path) -> bool {
     let Ok(file) = OpenOptions::new()
         .read(true)
@@ -57,10 +71,14 @@ pub fn running(root: &Path) -> bool {
     }
 }
 
+/// A delivery scan result for one group participant.
 #[derive(Debug, Serialize)]
 pub struct Observation {
+    /// Enrolled group containing the referenced participant or record.
     pub group: String,
+    /// Name of the participant addressed by this result.
     pub participant: String,
+    /// Stored business state; it does not imply transport delivery.
     pub state: String,
 }
 
@@ -76,7 +94,7 @@ impl Observation {
 
 async fn session_tick(
     store: Store,
-    socket: String,
+    socket: PathBuf,
     groups: Vec<Group>,
     pending: Vec<Pending>,
     time: i64,
@@ -92,12 +110,11 @@ async fn session_tick(
 
 async fn session_tick_inner(
     store: &Store,
-    socket: &str,
+    socket: &Path,
     groups: Vec<Group>,
     pending: &[Pending],
     time: i64,
 ) -> Result<Vec<Observation>> {
-    let socket = Path::new(socket);
     if !herdr::plugin_enabled(socket).await? {
         return Ok(pending
             .iter()
@@ -199,13 +216,17 @@ async fn wake(
     Ok("wake-up submitted; messages remain pending".into())
 }
 
+/// Check native and Herdr delivery eligibility at the supplied Unix timestamp.
+///
+/// # Errors
+/// Database access or a spawned session task fails.
 pub async fn tick(store: &Store, time: i64) -> Result<Vec<Observation>> {
     let mut pending = Vec::new();
-    let mut observations = crate::codex::tick(store, time).await?;
+    let mut observations = crate::native::tick(store, time).await?;
     for item in store.pending().await? {
         let mailbox = store.mailbox(&item.group_name, &item.name).await?;
         if matches!(mailbox.binding, Binding::Standalone { .. }) {
-            if store.has_codex(&mailbox).await? {
+            if store.has_native(&mailbox).await? {
                 continue;
             }
             let state = if item.due <= time {
@@ -218,7 +239,7 @@ pub async fn tick(store: &Store, time: i64) -> Result<Vec<Observation>> {
             pending.push(item);
         }
     }
-    let mut sessions: BTreeMap<String, Vec<Group>> = BTreeMap::new();
+    let mut sessions: BTreeMap<PathBuf, Vec<Group>> = BTreeMap::new();
     for group in store.groups().await? {
         if pending.iter().any(|p| p.group_name == group.name) {
             let socket = group
@@ -256,7 +277,7 @@ pub async fn tick(store: &Store, time: i64) -> Result<Vec<Observation>> {
     Ok(observations)
 }
 
-async fn relay_tick(store: &Store) -> Result<Vec<Value>> {
+async fn relay_tick(store: &Store, time: i64) -> Result<Vec<Value>> {
     let mut jobs = JoinSet::new();
     let mut reports = Vec::new();
     for peer in store
@@ -268,7 +289,7 @@ async fn relay_tick(store: &Store) -> Result<Vec<Value>> {
         let store = store.clone();
         jobs.spawn(async move {
             let result = match crate::relay::machine(&peer.machine_id) {
-                Ok(machine) => store.sync_peer(machine).await,
+                Ok(machine) => store.sync_peer(machine, time).await,
                 Err(error) => Err(error),
             };
             match result {
@@ -294,8 +315,16 @@ fn relay_result(job: std::result::Result<Result<Vec<Value>>, JoinError>) -> Vec<
     }
 }
 
+/// Run one worker scan or serve continuously until interrupted.
+///
+/// # Errors
+/// Worker locking, state I/O, clock reading, signal handling, or server shutdown fails.
 pub async fn run(store: &Store, once: bool) -> Result<()> {
-    let guard = WorkerLock::acquire(&store.root)?;
+    let _once_lock = if once {
+        Some(WorkerLock::acquire(store.root())?)
+    } else {
+        None
+    };
     let stream = if once {
         None
     } else {
@@ -311,7 +340,7 @@ pub async fn run(store: &Store, once: bool) -> Result<()> {
             && last_relay.is_none_or(|last| last.elapsed() >= Duration::from_secs(30))
         {
             let store = store.clone();
-            relay_jobs.spawn(async move { relay_tick(&store).await });
+            relay_jobs.spawn(async move { relay_tick(&store, time).await });
             last_relay = Some(tokio::time::Instant::now());
         }
         let finished = if once {
@@ -337,7 +366,7 @@ pub async fn run(store: &Store, once: bool) -> Result<()> {
                 &json!({"checked_at":time,"error":"status exceeded limit; inspect inboxes with status"}),
             )?;
         }
-        let path = store.root.join("service-status.tmp");
+        let path = store.root().join("service-status.tmp");
         use std::io::Write;
         let mut file = OpenOptions::new()
             .create(true)
@@ -346,19 +375,21 @@ pub async fn run(store: &Store, once: bool) -> Result<()> {
             .mode(0o600)
             .open(&path)?;
         file.write_all(&bytes)?;
-        std::fs::rename(path, store.root.join("service-status.json"))?;
+        std::fs::rename(path, store.root().join("service-status.json"))?;
         if once {
             println!("{}", String::from_utf8(bytes)?);
             break;
         }
         tokio::select! {
             () = tokio::time::sleep(Duration::from_secs(5)) => {},
-            () = async { if let Some(server)=&stream { server.changed.notified().await } else { std::future::pending::<()>().await } } => {},
+            () = async { if let Some(server)=&stream { server.changed().await } else { std::future::pending::<()>().await } } => {},
             result = tokio::signal::ctrl_c() => { result?; break; }
         }
     }
     relay_jobs.abort_all();
     while relay_jobs.join_next().await.is_some() {}
-    drop(guard);
+    if let Some(server) = stream {
+        server.shutdown().await?;
+    }
     Ok(())
 }

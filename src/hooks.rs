@@ -1,28 +1,48 @@
-//! Client lifecycle adapter. Hook emission is not proof of client consumption.
+//! Bounded recovery payloads for client lifecycle hooks.
+//!
+//! [`Store::hook`] persists emission reservations before returning client-specific
+//! JSON. Stop continuations are limited per recovery epoch. Client output does not
+//! confirm transport delivery and cannot complete mail or work automatically.
+
 use crate::store::{Mailbox, Store};
 use anyhow::{Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+/// Lifecycle events supported by the recovery hook adapter.
 #[derive(Debug, Deserialize)]
 pub enum HookEvent {
+    /// A new or restored client session needs current state.
     SessionStart,
+    /// The user submitted new input to the client.
     UserPromptSubmit,
+    /// The client is about to invoke a tool.
     PreToolUse,
+    /// Client context was compacted and recovery must be invalidated.
     PostCompact,
+    /// The client finished a tool invocation.
     PostToolUse,
+    /// The client is considering ending its current turn.
     Stop,
 }
 
+/// A client lifecycle event and its recovery-session context.
 #[derive(Debug, Deserialize)]
 pub struct HookInput {
+    /// Lifecycle transition reported by the client.
     pub hook_event_name: HookEvent,
+    /// Client recovery-session identifier; this is not a Mail credential.
     pub session_id: String,
+    /// Whether the client is already processing a Stop-hook continuation.
     #[serde(default)]
     pub stop_hook_active: bool,
 }
 
 impl Store {
+    /// Return a reserved, bounded recovery payload for a lifecycle hook.
+    ///
+    /// # Errors
+    /// The actor or session is invalid, payload limits are exceeded, or persistence fails.
     pub async fn hook(&self, actor: &Mailbox, input: HookInput, now: i64) -> Result<Value> {
         if matches!(input.hook_event_name, HookEvent::PostCompact) {
             self.invalidate_hook(actor, &input.session_id).await?;

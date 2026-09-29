@@ -1,3 +1,5 @@
+//! Regression coverage for migration behavior.
+mod support;
 use agent_mail::store::Store;
 use anyhow::Result;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -36,11 +38,11 @@ async fn existing_version_four_state_upgrades_to_opt_in_sync() -> Result<()> {
         .await?;
     pool.close().await;
 
-    let (store, _guard) = Store::open(&root, true).await?;
+    let store = Store::open(&root, true).await?;
     let version = sqlx::query!("PRAGMA user_version")
-        .fetch_one(&store.pool)
+        .fetch_one(&support::pool(&store).await?)
         .await?;
-    assert_eq!(version.user_version, Some(9));
+    assert_eq!(version.user_version, Some(10));
     let peer = uuid::Uuid::new_v4();
     store.add_peer(peer, "test-host").await?;
     assert!(!store.peers_status().await?[0].auto_sync);
@@ -70,7 +72,7 @@ async fn populated_version_five_keeps_mail_work_bindings_and_foreign_keys() -> R
     "#).execute(&pool).await?;
     pool.close().await;
     assert!(Store::open(&root, false).await.is_err());
-    let (store, _guard) = Store::open(&root, true).await?;
+    let store = Store::open(&root, true).await?;
     let worker = store.mailbox("g", "b").await?;
     assert_eq!(worker.id, 42);
     assert_eq!(
@@ -93,7 +95,7 @@ async fn populated_version_five_keeps_mail_work_bindings_and_foreign_keys() -> R
     );
     assert!(
         sqlx::query!("DELETE FROM mailboxes WHERE id=42")
-            .execute(&store.pool)
+            .execute(&support::pool(&store).await?)
             .await
             .is_err()
     );
@@ -180,8 +182,8 @@ async fn invalid_legacy_references_abort_the_migration_atomically() -> Result<()
 }
 
 #[tokio::test]
-async fn published_six_and_eight_upgrade_with_binding_and_receipts_intact() -> Result<()> {
-    for version in [6, 8] {
+async fn published_six_eight_and_nine_upgrade_with_binding_and_receipts_intact() -> Result<()> {
+    for version in [6, 8, 9] {
         let temp = tempfile::tempdir()?;
         let root = temp.path().join("state");
         let migrations = temp.path().join("migrations");
@@ -213,20 +215,24 @@ async fn published_six_and_eight_upgrade_with_binding_and_receipts_intact() -> R
           INSERT INTO mailboxes(id,group_name,name,binding) VALUES (1,'g','owner','{"runtime":"standalone","session":"00000000-0000-4000-8000-000000000002"}');
           INSERT INTO work_items(group_name,id,scope,owner,writer,state,next_action,updated) VALUES ('g','task','Review','owner','owner','custom','Review',100);
         "#).execute(&pool).await?;
-        if version == 8 {
+        if version >= 8 {
             sqlx::raw_sql("INSERT INTO codex_wakes(recipient,binding_version,socket,thread,delivered,attempts,next_attempt) VALUES(1,1,'/tmp/test.sock','00000000-0000-4000-8000-000000000003',1,2,400);").execute(&pool).await?;
         }
         pool.close().await;
-        let (store, _guard) = Store::open(&root, true).await?;
+        let store = Store::open(&root, true).await?;
         let actor = store.mailbox("g", "owner").await?;
         assert_eq!(store.work_show(&actor, "task").await?.version, 1);
-        if version == 8 {
+        if version >= 8 {
             let endpoint = sqlx::query!(
-                "SELECT scanned,delivered,attempts,next_attempt FROM codex_wakes WHERE recipient=1"
+                "SELECT runtime,scanned,delivered,attempts,next_attempt FROM runtime_wakes WHERE recipient=1"
             )
-            .fetch_one(&store.pool)
+            .fetch_one(&support::pool(&store).await?)
             .await?;
-            assert_eq!(endpoint.scanned, endpoint.delivered);
+            assert_eq!(endpoint.runtime, "codex");
+            assert_eq!(
+                endpoint.scanned,
+                if version == 8 { endpoint.delivered } else { 0 }
+            );
             assert_eq!((endpoint.attempts, endpoint.next_attempt), (2, 400));
         }
     }

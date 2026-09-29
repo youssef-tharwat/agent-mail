@@ -1,4 +1,10 @@
-//! Durable, recipient-scoped notifications. Receipts are transport facts, not decisions.
+//! Recipient-scoped coordination events and durable transport receipts.
+//!
+//! Replay is bounded and checked against the actor's binding generation. A receipt
+//! acknowledges one event for that generation, never a business decision. Hook
+//! reservations consume a retry budget before emission; emission is not proof that
+//! the client consumed the payload.
+
 use crate::{
     bounded,
     store::{Mailbox, Store},
@@ -6,19 +12,27 @@ use crate::{
 use anyhow::{Result, ensure};
 use serde::Serialize;
 
+/// A durable change hint addressed to one participant.
 #[derive(Debug, Serialize)]
 pub struct Notification {
+    /// Persistent identifier for this record.
     pub id: i64,
+    /// Event or diagnostic category.
     pub kind: String,
+    /// Identifier of the message, work record, or other changed subject.
     pub subject: String,
+    /// Record or protocol version used to validate this operation.
     pub version: i64,
 }
 
 impl Store {
-    /// Replay unacknowledged events for this binding; old sessions cannot hide new work.
+    /// Replay a bounded page of unacknowledged events for this binding.
+    ///
+    /// # Errors
+    /// The cursor is negative, the binding is stale, or the query fails.
     pub async fn notifications(&self, actor: &Mailbox, after: i64) -> Result<Vec<Notification>> {
         ensure!(after >= 0, "event cursor must be nonnegative");
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         Self::check_actor(&mut tx, actor).await?;
         let rows = sqlx::query_as!(Notification,
             "SELECT e.id,e.kind,e.subject,e.version FROM coordination_events e WHERE e.recipient=? AND e.id>? AND NOT EXISTS(SELECT 1 FROM event_receipts r WHERE r.recipient=e.recipient AND r.binding_version=? AND r.event=e.id) ORDER BY e.id LIMIT 6",
@@ -27,9 +41,12 @@ impl Store {
         Ok(rows)
     }
 
-    /// Coalesced current change hints, newest first. Detailed event replay uses notifications.
+    /// Read bounded, coalesced change hints for this participant.
+    ///
+    /// # Errors
+    /// The binding is stale or the query fails.
     pub async fn latest_changes(&self, actor: &Mailbox) -> Result<Vec<Notification>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         Self::check_actor(&mut tx, actor).await?;
         let rows = sqlx::query_as!(Notification,
             "SELECT e.id,e.kind,e.subject,e.version FROM coordination_events e WHERE e.recipient=? AND NOT EXISTS(SELECT 1 FROM coordination_events newer WHERE newer.recipient=e.recipient AND newer.kind=e.kind AND newer.subject=e.subject AND newer.id>e.id) ORDER BY e.id DESC LIMIT 6",actor.id).fetch_all(&mut *tx).await?;
@@ -37,17 +54,24 @@ impl Store {
         Ok(rows)
     }
 
+    /// Report outstanding notifications and persisted hook emission budgets.
+    ///
+    /// # Errors
+    /// The database queries fail.
     pub async fn notification_status(&self) -> Result<serde_json::Value> {
-        let rows = sqlx::query!("SELECT b.group_name,b.name,b.binding_version,COUNT(e.id) AS count FROM mailboxes b JOIN coordination_events e ON e.recipient=b.id WHERE b.remote_machine IS NULL AND NOT EXISTS(SELECT 1 FROM event_receipts r WHERE r.recipient=b.id AND r.binding_version=b.binding_version AND r.event=e.id) GROUP BY b.id ORDER BY b.id").fetch_all(&self.pool).await?;
-        let emissions = sqlx::query!("SELECT b.group_name,b.name,h.attempts,h.next_attempt,h.stop_used FROM hook_emissions h JOIN mailboxes b ON b.id=h.recipient AND b.binding_version=h.binding_version ORDER BY h.next_attempt DESC LIMIT 20").fetch_all(&self.pool).await?;
+        let rows = sqlx::query!("SELECT b.group_name,b.name,b.binding_version,COUNT(e.id) AS count FROM mailboxes b JOIN coordination_events e ON e.recipient=b.id WHERE b.remote_machine IS NULL AND NOT EXISTS(SELECT 1 FROM event_receipts r WHERE r.recipient=b.id AND r.binding_version=b.binding_version AND r.event=e.id) GROUP BY b.id ORDER BY b.id").fetch_all(self.pool()).await?;
+        let emissions = sqlx::query!("SELECT b.group_name,b.name,h.attempts,h.next_attempt,h.stop_used FROM hook_emissions h JOIN mailboxes b ON b.id=h.recipient AND b.binding_version=h.binding_version ORDER BY h.next_attempt DESC LIMIT 20").fetch_all(self.pool()).await?;
         Ok(
             serde_json::json!({"unacknowledged":rows.into_iter().map(|r|serde_json::json!({"group":r.group_name,"participant":r.name,"binding_version":r.binding_version,"count":r.count})).collect::<Vec<_>>(),"hook_attempts":emissions.into_iter().map(|r|serde_json::json!({"group":r.group_name,"participant":r.name,"attempts":r.attempts,"next_attempt":r.next_attempt,"stop_used":r.stop_used,"delivery_confirmed":false})).collect::<Vec<_>>()}),
         )
     }
 
-    /// Acknowledge one confirmed transport delivery, never a whole unverified cursor range.
+    /// Acknowledge one transport event for the current binding generation.
+    ///
+    /// # Errors
+    /// The actor is stale, the event belongs elsewhere, or persistence fails.
     pub async fn acknowledge(&self, actor: &Mailbox, event: i64) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
         let exists = sqlx::query!(
             "SELECT id FROM coordination_events WHERE id=? AND recipient=?",
@@ -73,20 +97,26 @@ impl Store {
         Ok(())
     }
 
-    /// Older clients may not emit SessionStart(compact). Mark recovery dirty without
+    /// Mark a client session’s recovery state dirty.
     /// pretending PostCompact stdout is injected into the model's context.
+    ///
+    /// # Errors
+    /// The session identifier is invalid, the actor is stale, or persistence fails.
     pub async fn invalidate_hook(&self, actor: &Mailbox, session: &str) -> Result<()> {
         bounded(session, 160, "client session")?;
         ensure!(!session.is_empty(), "hook requires a client session ID");
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
         sqlx::query!("DELETE FROM hook_emissions WHERE recipient=? AND binding_version=? AND client_session=?",actor.id,actor.binding_version,session).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
     }
 
-    /// Reserve a bounded hook emission. This is an attempt, never a delivery receipt.
+    /// Reserve a bounded hook emission at the supplied Unix timestamp.
     /// SessionStart always restores state, including after an ambiguous previous emission.
+    ///
+    /// # Errors
+    /// The session is invalid, the actor is stale, time overflows, or persistence fails.
     pub async fn reserve_hook(
         &self,
         actor: &Mailbox,
@@ -97,7 +127,7 @@ impl Store {
     ) -> Result<bool> {
         bounded(session, 160, "client session")?;
         ensure!(!session.is_empty(), "hook requires a client session ID");
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
         sqlx::query!("INSERT OR IGNORE INTO hook_emissions(recipient,binding_version,client_session) VALUES(?,?,?)",actor.id,actor.binding_version,session)
             .execute(&mut *tx).await?;
@@ -154,7 +184,7 @@ impl Store {
             actor.id,
             after
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.pool())
         .await?
         .is_some())
     }
@@ -164,14 +194,14 @@ impl Store {
             actor.id,
             after
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.pool())
         .await?
         .is_some())
     }
     pub(crate) async fn scan_passive(&self, actor: &Mailbox, through: i64) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
-        sqlx::query!("UPDATE codex_wakes SET scanned=MAX(scanned,?) WHERE recipient=? AND binding_version=? AND NOT EXISTS(SELECT 1 FROM wake_events WHERE recipient=? AND id>scanned AND id<=?)",through,actor.id,actor.binding_version,actor.id,through).execute(&mut *tx).await?;
+        sqlx::query!("UPDATE runtime_wakes SET scanned=MAX(scanned,?) WHERE recipient=? AND binding_version=? AND NOT EXISTS(SELECT 1 FROM wake_events WHERE recipient=? AND id>scanned AND id<=?)",through,actor.id,actor.binding_version,actor.id,through).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
     }

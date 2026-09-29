@@ -1,30 +1,48 @@
-//! Read-only diagnostics: configuration is evidence, not proof of hook trust.
+//! Read-only diagnostics for configuration, credentials, and runtime endpoints.
+//!
+//! [`inspect`] opens existing state and probes configured endpoints without creating
+//! registrations or starting agent turns. Individual failures become report entries;
+//! configuration alone cannot prove that a client trusts or consumes hook output.
+
 use crate::{identity::Binding, store::Store};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
 use uuid::Uuid;
 
+/// The diagnostic outcome and degree of certainty.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Level {
+    /// The inspected condition was confirmed.
     Pass,
+    /// The inspected condition conclusively failed.
     Fail,
+    /// A condition requires attention without proving failure.
     Warning,
+    /// Available evidence cannot determine the outcome.
     Unknown,
 }
+/// One diagnostic observation and an optional corrective action.
 #[derive(Debug, Serialize)]
 pub struct Check {
+    /// Stable identifier of the diagnostic being performed.
     pub check: &'static str,
+    /// Outcome of this diagnostic.
     pub status: Level,
+    /// Evidence or explanation associated with this diagnostic.
     pub detail: Value,
+    /// Suggested corrective action when the diagnostic needs attention.
     pub next_action: Option<&'static str>,
 }
+/// The ordered results of a configuration and endpoint inspection.
 #[derive(Debug, Serialize, Default)]
 pub struct Report {
+    /// Individual diagnostic results in evaluation order.
     pub checks: Vec<Check>,
 }
 impl Report {
+    /// Check whether any diagnostic conclusively failed.
     pub fn failed(&self) -> bool {
         self.checks.iter().any(|c| c.status == Level::Fail)
     }
@@ -43,7 +61,7 @@ impl Report {
         });
     }
 }
-/// Never initializes state, rotates identities, or starts an agent.
+/// Inspect existing configuration and runtime endpoints without starting agent turns.
 pub async fn inspect(
     root: &Path,
     group: &str,
@@ -60,7 +78,7 @@ pub async fn inspect(
         );
         return report;
     }
-    let (store, _guard) = match Store::open(root, false).await {
+    let store = match Store::open(root, false).await {
         Ok(pair) => pair,
         Err(_) => {
             report.add(
@@ -146,10 +164,10 @@ pub async fn inspect(
         );
     }
     let endpoint = sqlx::query!(
-        "SELECT socket,thread,binding_version FROM codex_wakes WHERE recipient=?",
+        "SELECT runtime,socket,thread,binding_version FROM runtime_wakes WHERE recipient=?",
         actor.id
     )
-    .fetch_optional(&store.pool)
+    .fetch_optional(store.pool())
     .await;
     match endpoint {
         Ok(Some(e)) if e.binding_version != actor.binding_version => report.add(
@@ -160,20 +178,23 @@ pub async fn inspect(
         ),
         Ok(Some(e)) => {
             let probe = match Uuid::parse_str(&e.thread) {
-                Ok(thread) => crate::codex::probe(Path::new(&e.socket), thread).await,
+                Ok(thread) => match crate::native::Kind::parse(&e.runtime) {
+                    Ok(kind) => crate::native::probe(kind, Path::new(&e.socket), thread).await,
+                    Err(error) => Err(error),
+                },
                 Err(e) => Err(e.into()),
             };
             match probe {
                 Ok(info) if info["state"] == "not_loaded" || info["state"] == "system_error" => report.add(
                     "endpoint", Level::Fail, info,
-                    Some("Open or resume the intended thread in its Codex client, then rerun doctor"),
+                    Some("Open or resume the intended thread in its Native client, then rerun doctor"),
                 ),
                 Ok(info) => report.add("endpoint", Level::Pass, info, None),
                 Err(_) => report.add(
                     "endpoint",
                     Level::Fail,
-                    "Codex session or queue capability is unavailable",
-                    Some("Verify the persistent thread and app-server, then repeat attach-codex"),
+                    "Native session or queue capability is unavailable",
+                    Some("Verify the persistent thread and app-server, then repeat the matching attach command"),
                 ),
             }
         }

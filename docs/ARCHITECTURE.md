@@ -27,7 +27,7 @@ execute a model's tools exactly once.
 
 | Component | Owns |
 | --- | --- |
-| Agent runtime (Herdr or Codex) | Live agent inventory, processes, sessions, machine connections, lifecycle observations, and wake prompts |
+| Agent runtime (Herdr, Codex or Claude) | Live agent inventory, processes, sessions, machine connections, lifecycle observations, and wake prompts |
 | Mail | Durable participant identities, runtime/routing bindings, delivery, request resolution, reminders, a small work register, and recovery views |
 | Workflow using Mail | Meaning of work states, review criteria, who may accept or reassign work |
 | Git and CI | Code revisions, artifacts, test results, and other underlying evidence |
@@ -343,3 +343,24 @@ Attention reports facts, never infers workflow progress. The work writer still o
 acceptance. `doctor` probes setup without launching runtimes or approving hooks.
 ACP and standalone Claude idle delivery are deferred. Claude hook fixtures do not
 establish live recovery compatibility. See the implementation plan for release scope.
+
+
+## Native runtime parity (schema 10, v0.4 source)
+
+Mail's shared native adapter owns bounded payloads, durable retry budgets,
+notification receipts and binding-generation checks. Codex uses its native
+app-server queue/steer API. Claude uses a client-owned native streaming process
+through `claude-bridge`, with a private Unix socket for status and delivery.
+The client owns permission responses, session startup and resume. The bridge
+never answers approvals and never generates or exports a Mail credential.
+
+Claude attachment requires an initialized matching session and the advertised
+`msg_lifecycle_v1` capability. Only a matching runtime queued lifecycle event
+confirms delivery. Captured activity generations reject stale sends. Active
+cancellation uses Claude's native priority-now input; work decisions remain the
+writer's responsibility. The two runtimes share delivery semantics, not wire APIs.
+
+Schema 10 renames the endpoint table and labels existing endpoints as Codex,
+retaining their cursor and retry budget. All published migrations remain intact.
+ACP remains deferred. See [live native acceptance](native-acceptance.md) for
+Claude/Claude, mixed-runtime, resume and compaction evidence and client limits.

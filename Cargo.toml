@@ -1,6 +1,6 @@
 [package]
 name = "agent-mail"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Durable mail and work records for coding agents"
@@ -13,11 +13,12 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
 fs2 = "0.4"
+mimalloc = "0.1"
 futures-util = { version = "0.3", features = ["sink"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal", "process", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "signal", "process", "sync"] }
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
@@ -30,6 +31,7 @@ tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"
+missing_docs = "warn"
 
 [lints.clippy]
 all = "warn"

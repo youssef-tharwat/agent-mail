@@ -1,3 +1,10 @@
+//! Explicit macOS service installation and state-directory discovery.
+//!
+//! Installation copies the executable and writes a launchd plist; restoration and
+//! uninstallation verify that the plist belongs to this state directory. Lifecycle
+//! operations invoke launchctl and must run without holding the database schema lock.
+//! Other Unix systems can run the worker through their own supervisor.
+
 use anyhow::{Context, Result, ensure};
 use std::{
     fs::OpenOptions,
@@ -17,6 +24,10 @@ fn xml(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// Render a launchd property list for an executable and state directory.
+///
+/// # Errors
+/// Either path cannot be represented as UTF-8.
 pub fn plist(binary: &Path, state: &Path) -> Result<String> {
     let binary = xml(binary.to_str().context("binary path is not UTF-8")?);
     let state = xml(state.to_str().context("state path is not UTF-8")?);
@@ -66,6 +77,10 @@ fn launch(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Install the current executable and start its macOS launchd service.
+///
+/// # Errors
+/// The platform is unsupported, configuration conflicts, a worker is running, or filesystem or launchctl operations fail.
 pub fn install(root: &Path) -> Result<()> {
     let (domain, path) = target()?;
     let root = root.canonicalize()?;
@@ -111,6 +126,10 @@ pub fn install(root: &Path) -> Result<()> {
     launch(&["kickstart", &service_target])
 }
 
+/// Restart an existing service after verifying its state-directory ownership.
+///
+/// # Errors
+/// The platform is unsupported, ownership conflicts, or filesystem or launchctl operations fail.
 pub fn restore(root: &Path) -> Result<bool> {
     let (domain, path) = target()?;
     if !path.exists() {
@@ -138,6 +157,10 @@ pub fn restore(root: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// Unload the owned service and remove its plist while preserving state.
+///
+/// # Errors
+/// The platform is unsupported, ownership conflicts, or filesystem or launchctl operations fail.
 pub fn uninstall(root: &Path) -> Result<()> {
     let (domain, path) = target()?;
     if !path.exists() {
@@ -161,12 +184,20 @@ pub fn uninstall(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Return the per-user configuration path for state-directory discovery.
+///
+/// # Errors
+/// The platform cannot provide a configuration directory.
 pub fn locator() -> Result<PathBuf> {
     Ok(dirs::config_dir()
         .context("config directory unavailable")?
         .join("agent-mail/state-path"))
 }
 
+/// Resolve explicit, plugin, saved, or default state-directory configuration.
+///
+/// # Errors
+/// Required environment or platform directories are absent, or the locator cannot be read.
 pub fn state_root(explicit: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(root) = explicit {
         return Ok(root);
@@ -185,6 +216,10 @@ pub fn state_root(explicit: Option<PathBuf>) -> Result<PathBuf> {
         .join("agent-mail"))
 }
 
+/// Persist a canonical state-directory locator with private permissions.
+///
+/// # Errors
+/// The path cannot be canonicalized or encoded as UTF-8, or filesystem operations fail.
 pub fn save_locator(root: &Path) -> Result<()> {
     let path = locator()?;
     std::fs::create_dir_all(path.parent().context("config parent missing")?)?;

@@ -1,4 +1,9 @@
-//! Versioned work records stored beside durable mail.
+//! Versioned work records and atomic decisions stored beside durable mail.
+//!
+//! Creation and updates are restricted to the group's home machine. Decisions
+//! validate actor generations and expected versions, and may resolve a related
+//! message in the same transaction. Work states are caller-defined names; `open`
+//! controls whether an assignment remains actionable. Times are Unix seconds.
 
 use crate::{
     bounded, name, relay,
@@ -11,36 +16,52 @@ const SCOPE_LIMIT: usize = 1024;
 const ACTION_LIMIT: usize = 512;
 const EVIDENCE_LIMIT: usize = 16;
 
+/// Initial work fields before versioning and actor metadata are assigned.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkDraft {
+    /// Persistent identifier for this record.
     pub id: String,
+    /// Description of the work’s boundaries and intended outcome.
     pub scope: String,
+    /// Participant responsible for the assignment.
     pub owner: String,
+    /// Stored business state; it does not imply transport delivery.
     pub state: String,
+    /// Next business action expected from the owner.
     pub next_action: String,
+    /// Deadline in Unix seconds; in patches, Some(None) explicitly clears it.
     pub deadline: Option<i64>,
+    /// References or notes supporting the current work state.
     pub evidence: Vec<String>,
 }
 
+/// Partial work changes; missing fields retain their current values.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkPatch {
+    /// Participant responsible for the assignment.
     pub owner: Option<String>,
+    /// Stored business state; it does not imply transport delivery.
     pub state: Option<String>,
+    /// Whether the assignment remains actionable.
     pub open: Option<bool>,
+    /// Next business action expected from the owner.
     pub next_action: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "nullable_update"
     )]
+    /// Deadline in Unix seconds; in patches, Some(None) explicitly clears it.
     pub deadline: Option<Option<i64>>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "nullable_update"
     )]
+    /// Accepted revision; in patches, Some(None) explicitly clears it.
     pub accepted_revision: Option<Option<String>>,
+    /// References or notes supporting the current work state.
     pub evidence: Option<Vec<String>>,
 }
 
@@ -57,53 +78,90 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkDecision {
+    /// Caller-supplied idempotency key; retries must preserve their original content.
     pub key: String,
+    /// Record or protocol version used to validate this operation.
     pub version: i64,
+    /// Partial changes applied after validating the expected version.
     pub patch: WorkPatch,
+    /// Explicit explanation for the business change.
     pub reason: String,
+    /// Optional message to resolve in the same work-decision transaction.
     pub resolve_message: Option<i64>,
 }
 
+/// A versioned work record with ownership, progress, and synchronization metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkItem {
+    /// Enrolled group containing this record.
     pub group_name: String,
+    /// Persistent identifier for this record.
     pub id: String,
+    /// Description of the work’s boundaries and intended outcome.
     pub scope: String,
+    /// Participant responsible for the assignment.
     pub owner: String,
+    /// Participant that originally created the work record.
     pub writer: String,
+    /// Stored business state; it does not imply transport delivery.
     pub state: String,
+    /// Whether the assignment remains actionable.
     pub open: bool,
+    /// Next business action expected from the owner.
     pub next_action: String,
+    /// Deadline in Unix seconds; in patches, Some(None) explicitly clears it.
     pub deadline: Option<i64>,
+    /// Accepted revision; in patches, Some(None) explicitly clears it.
     pub accepted_revision: Option<String>,
+    /// References or notes supporting the current work state.
     pub evidence: Vec<String>,
+    /// Record or protocol version used to validate this operation.
     pub version: i64,
+    /// Last business update timestamp in Unix seconds.
     pub updated: i64,
+    /// Last remote snapshot receipt time in Unix seconds, when applicable.
     #[serde(default)]
     pub synced_at: Option<i64>,
+    /// Message identifiers associated with this work record.
     #[serde(default)]
     pub linked_messages: Vec<i64>,
 }
 
+/// Compact work fields used in paginated recovery views.
 #[derive(Debug, Serialize)]
 pub struct WorkSummary {
+    /// Persistent identifier for this record.
     pub id: String,
+    /// Description of the work’s boundaries and intended outcome.
     pub scope: String,
+    /// Participant responsible for the assignment.
     pub owner: String,
+    /// Stored business state; it does not imply transport delivery.
     pub state: String,
+    /// Next business action expected from the owner.
     pub next_action: String,
+    /// Deadline in Unix seconds; in patches, Some(None) explicitly clears it.
     pub deadline: Option<i64>,
+    /// Accepted revision; in patches, Some(None) explicitly clears it.
     pub accepted_revision: Option<String>,
+    /// Record or protocol version used to validate this operation.
     pub version: i64,
+    /// Last remote snapshot receipt time in Unix seconds, when applicable.
     pub synced_at: Option<i64>,
 }
 
+/// An audit entry containing a work revision and its change reason.
 #[derive(Debug, Serialize)]
 pub struct WorkChange {
+    /// Record or protocol version used to validate this operation.
     pub version: i64,
+    /// Participant responsible for this recorded revision.
     pub actor: String,
+    /// Explicit explanation for the business change.
     pub reason: String,
+    /// Complete work state at this revision.
     pub snapshot: WorkItem,
+    /// Revision creation timestamp in Unix seconds.
     pub changed: i64,
 }
 
@@ -182,6 +240,10 @@ fn validate_fields(item: &WorkItem) -> Result<()> {
 }
 
 impl Store {
+    /// Create a versioned work record and notify its owner atomically.
+    ///
+    /// # Errors
+    /// The actor or fields are invalid, this is not the home machine, the owner is missing, or persistence fails.
     pub async fn work_create(
         &self,
         actor: &Mailbox,
@@ -208,7 +270,7 @@ impl Store {
         validate_fields(&item)?;
         let evidence = serde_json::to_string(&item.evidence)?;
         let snapshot = serde_json::to_string(&item)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
         let home = sqlx::query!(
             "SELECT home_machine FROM groups WHERE name=?",
@@ -245,13 +307,17 @@ impl Store {
             .execute(&mut *tx).await?;
         relay::enqueue_snapshot(&mut tx, &item, None, now).await?;
         tx.commit().await?;
-        crate::stream::hint(&self.root).await;
+        crate::stream::hint(self.root()).await;
         Ok(item)
     }
 
+    /// Read a work record visible to the participant’s group.
+    ///
+    /// # Errors
+    /// The actor is stale, the record is absent, or decoding or querying fails.
     pub async fn work_show(&self, actor: &Mailbox, id: &str) -> Result<WorkItem> {
         name(id)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         Self::check_actor(&mut tx, actor).await?;
         let row = sqlx::query_as!(WorkRow,
             "SELECT group_name,id,scope,owner,writer,state,open,next_action,deadline,accepted_revision,evidence,version,updated FROM work_items WHERE group_name=? AND id=?",
@@ -279,11 +345,15 @@ impl Store {
         Ok(item)
     }
 
+    /// Read a bounded page of open work after an identifier cursor.
+    ///
+    /// # Errors
+    /// The actor is stale or stored work cannot be queried or decoded.
     pub async fn work_list(&self, actor: &Mailbox, after: &str) -> Result<Vec<WorkSummary>> {
         if !after.is_empty() {
             name(after)?;
         }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         Self::check_actor(&mut tx, actor).await?;
         let locals = sqlx::query_as!(WorkRow,
             "SELECT group_name,id,scope,owner,writer,state,open,next_action,deadline,accepted_revision,evidence,version,updated FROM work_items WHERE group_name=? AND (owner=? OR writer=?) AND open=1 AND id>? ORDER BY id LIMIT 6",
@@ -327,6 +397,10 @@ impl Store {
         Ok(rows)
     }
 
+    /// Update work using an expected version and an explicit change reason.
+    ///
+    /// # Errors
+    /// Authority, version, fields, or reason validation fails, or persistence fails.
     pub async fn work_update(
         &self,
         actor: &Mailbox,
@@ -351,6 +425,10 @@ impl Store {
         .await
     }
 
+    /// Atomically apply an idempotent work decision and optional message resolution.
+    ///
+    /// # Errors
+    /// The decision key conflicts, authority or version validation fails, or persistence fails.
     pub async fn work_decide(
         &self,
         actor: &Mailbox,
@@ -380,7 +458,7 @@ impl Store {
         name(id)?;
         bounded(&reason, 512, "change reason")?;
         ensure!(!reason.trim().is_empty(), "change reason is required");
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
         if !key.is_empty() {
             if let Some(old) = sqlx::query!(
@@ -504,10 +582,14 @@ impl Store {
             .await?;
         }
         tx.commit().await?;
-        crate::stream::hint(&self.root).await;
+        crate::stream::hint(self.root()).await;
         Ok(item)
     }
 
+    /// Read the recorded revisions of work in the participant’s group.
+    ///
+    /// # Errors
+    /// The actor is stale, the work is absent, or querying or decoding fails.
     pub async fn work_history(&self, actor: &Mailbox, id: &str) -> Result<Vec<WorkChange>> {
         name(id)?;
         self.work_show(actor, id).await?;
@@ -517,13 +599,13 @@ impl Store {
                 actor.group_name,
                 id
             )
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.pool())
             .await?
             .is_some(),
             "change history is available on the home machine"
         );
         let rows = sqlx::query!("SELECT version,actor,reason,snapshot,changed FROM work_changes WHERE group_name=? AND work_id=? ORDER BY version DESC LIMIT 20",
-            actor.group_name, id).fetch_all(&self.pool).await?;
+            actor.group_name, id).fetch_all(self.pool()).await?;
         rows.into_iter()
             .map(|row| {
                 Ok(WorkChange {
