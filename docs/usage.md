@@ -11,7 +11,7 @@ brew install youssef-tharwat/tap/agent-mail
 agent-mail --version
 ```
 
-No Cargo or Rust compiler is required. Prebuilt binaries support macOS and Linux
+No Cargo or Rust compiler is required. Prebuilt binaries support macOS 14+ and Linux
 (glibc 2.35+), on Apple Silicon/ARM64 and Intel/x86-64.
 
 ### Direct download
