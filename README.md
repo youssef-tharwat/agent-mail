@@ -8,14 +8,21 @@ supplies current context through Claude Code, Codex or Herdr integrations.
 
 One native CLI. No account or hosted service. Herdr and Fleet Campaign are optional.
 
+![Agent Mail: assign a task, recover after a reset, send a result, and accept it.](assets/agent-mail-demo.gif)
+
 ## Install
+
+Install both the CLI and the required agent skill:
 
 ```sh
 brew install youssef-tharwat/tap/agent-mail
+npx skills add youssef-tharwat/agent-mail --skill agent-mail -g
 ```
 
 Prebuilt macOS and Linux binaries for ARM64 and x86-64. **No Cargo or Rust compiler
-required.** [Direct downloads and installation details](docs/usage.md#install).
+required.** The skill installer uses Node/npm; select every agent client that
+will use Mail. The [skill](skills/agent-mail/SKILL.md) supplies the handoff and
+decision rules agents need. [Installation details](docs/usage.md#install).
 
 ## Quick start
 
@@ -74,15 +81,6 @@ agent-mail status
 agent-mail status --check worker
 ```
 
-## Agent skill (optional)
-
-```sh
-npx skills add youssef-tharwat/agent-mail --skill agent-mail -g
-```
-
-The [skill](skills/agent-mail/SKILL.md) teaches agents the handoff workflow. This
-installer requires Node/npm and installs instructions, not the CLI.
-
 ## Herdr plugin (optional)
 
 ```sh
@@ -90,6 +88,7 @@ herdr plugin install youssef-tharwat/agent-mail
 ```
 
 The plugin downloads a verified release binary; it does not require Cargo.
+Install the required agent skill above for the clients running inside Herdr too.
 [Setup and binding](docs/usage.md#optional-herdr-integration).
 
 ## Documentation and help

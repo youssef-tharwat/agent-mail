@@ -4,15 +4,21 @@
 
 ## Install
 
+Setup requires the CLI and the Agent Mail skill in each participating agent client.
 With Homebrew:
 
 ```sh
 brew install youssef-tharwat/tap/agent-mail
+npx skills add youssef-tharwat/agent-mail --skill agent-mail -g
 agent-mail --version
 ```
 
 No Cargo or Rust compiler is required. Prebuilt binaries support macOS 14+ and Linux
 (glibc 2.35+), on Apple Silicon/ARM64 and Intel/x86-64.
+
+The skill installer uses Node/npm. Select every participating client and start
+a new agent session after installation. See [required agent skill](#agent-skill)
+for manual installation.
 
 ### Direct download
 
@@ -302,6 +308,9 @@ v0.4 before exchanging messages without deadlines.
 
 ## Agent skill
 
+The skill is required for agents using Mail, including agents running in Herdr.
+Binary installation alone does not complete agent setup.
+
 ```sh
 npx skills add youssef-tharwat/agent-mail --skill agent-mail -g
 ```
@@ -309,6 +318,12 @@ npx skills add youssef-tharwat/agent-mail --skill agent-mail -g
 This installs workflow instructions, not the binary. This installer uses Node/npm;
 the CLI and Homebrew installation do not require Node. The bundled skill targets
 v0.4 and must be upgraded alongside the CLI.
+
+For manual installation without Node, copy the repository’s `skills/agent-mail/`
+directory into each client’s discoverable skills directory. Start a new session
+and confirm `agent-mail` is listed among its available skills. Install the skill
+for coordinators and workers alike; it teaches ownership, resolution and retry
+rules. Hooks still supply current state automatically when configured.
 
 ## Upgrading
 
@@ -350,3 +365,7 @@ cargo test --locked --all-features
 
 MIT licensed. Report issues with OS, Mail/runtime versions and reproduction steps;
 omit credentials and private message contents.
+
+The README animation is reproducible with `python3 scripts/render-demo.py` on
+macOS with Pillow installed. It illustrates current CLI commands and labels its
+output as state summaries.
