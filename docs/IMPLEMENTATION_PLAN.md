@@ -44,9 +44,16 @@ An accepted notification never proves progress or completes work.
 - [x] Final formatting, Clippy (`--all-targets --all-features -- -D warnings`),
   and tests (`--locked --all-features`) on the narrowed implementation.
 - [x] Update user guide, concise README, bundled skill and release notes.
-- [ ] Commit and require Linux/macOS CI to pass.
-- [ ] Build and smoke-test macOS ARM64/x86-64 and Linux ARM64/x86-64 archives;
+- [x] Commit and require Linux/macOS CI to pass.
+- [x] Build and smoke-test macOS ARM64/x86-64 and Linux ARM64/x86-64 archives;
   publish binaries and source with matching v0.3.0 instructions.
+
+Release: [v0.3.0](https://github.com/youssef-tharwat/agent-mail/releases/tag/v0.3.0),
+source commit `c1222ce`. [Linux/macOS CI](https://github.com/youssef-tharwat/agent-mail/actions/runs/36573011737)
+and [four-platform release checks](https://github.com/youssef-tharwat/agent-mail/actions/runs/36573236160)
+passed. All 46 tests passed. The downloaded Apple Silicon archive additionally
+passed checksum verification, version reporting, fresh setup, status, and CLI help
+checks in disposable local state. No user installation or database was replaced.
 
 ## Deferred
 
