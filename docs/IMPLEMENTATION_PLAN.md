@@ -173,3 +173,21 @@ Acceptance and observed limitations: [managed launch](native-launch-acceptance.m
 - [x] Type finite mail, event, identity, runtime, lifecycle and delivery states.
 - [x] Validate legacy states and snapshots atomically before migration.
 - [x] Verify invalid input, migration rollback, terminal/reopen events and full suite (77 tests + 1 doc test).
+
+## v0.6.0 publication — 2026-09-30
+
+Published [v0.6.0](https://github.com/youssef-tharwat/agent-mail/releases/tag/v0.6.0)
+from `91754f485a48ce65b7768dff7e8482665cee8222`.
+[Linux/macOS CI](https://github.com/youssef-tharwat/agent-mail/actions/runs/36642509532)
+and [four-platform release gates](https://github.com/youssef-tharwat/agent-mail/actions/runs/36642688602)
+passed. The README workflow refresh is in `00cc27d`; its CI also passed.
+
+The downloaded Apple Silicon archive passed checksum verification and the
+assignment/blocker/review/correction/acceptance/reply flow in disposable state.
+The public installer produced the identical tested binary and bundled operating
+skill in an isolated directory. Existing user installations and databases were
+not replaced. Homebrew was updated to v0.6.0 with all four published checksums.
+[Homebrew installation and bundled-skill checks](https://github.com/youssef-tharwat/homebrew-tap/actions/runs/36643766115)
+passed on macOS and Linux, ARM64 and x86-64.
+
+Typed resource attachments remain a proposal, not a shipped feature.
