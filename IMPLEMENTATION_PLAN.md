@@ -207,8 +207,31 @@ and recovered a new assignment after resume. PostCompact invalidation was needed
 because this client did not invoke SessionStart(compact); the next prompt supplied
 recovery. The test used the normal hook trust UI and left existing Mail state alone.
 
-Remaining acceptance: live two-agent behavior, immediate mid-turn compaction
-recovery across supported client versions, and live Claude Code validation; safe idle standalone wake support. Codex skips untrusted hooks until
-its native `/hooks` review is completed. No user hook configuration or live Mail
-store has been changed automatically. Do not advertise autonomous progress or
-mark the section's full exit criteria complete until those checks pass.
+### Local Codex idle wake — implemented
+
+- Added an explicit `attach-codex` endpoint for an existing persistent thread on
+  a local app-server Unix socket; `detach-codex` removes it. No runtime spawning
+  or process supervision was added.
+- Schema 8 stores generation-bound endpoints, notification cursors and attempt
+  budgets. The existing worker waits for idle, queues a bounded state snapshot,
+  and records a transport receipt. Work acceptance and mail resolution remain
+  explicit atomic decisions.
+- Worker restart retains progress. A lost response consumes an attempt; three
+  attempts per batch, five minutes apart. New changes bypass an older retry
+  deadline. Pause, rearm, replacement invalidation and status are supported.
+- Codex 0.157.0 does not deduplicate `clientUserMessageId`; duplicate wakes are
+  possible after ambiguous delivery. Idempotent business operations remain the
+  boundary. Queue acceptance is not proof of model action.
+- Live local worker/reviewer flow reached version 3 accepted after initial
+  submission, correction and resubmission, with both linked deliveries resolved.
+  Every scan used a fresh Mail process. No manual inbox/context polling or
+  handoff prompts were supplied. One ambiguous response exposed and led to fixing
+  the old-cooldown/new-change delay. A repeat on the completed adapter verified
+  final quiescence. See `docs/local-codex-acceptance.md` for final evidence.
+
+Supported default: local Codex queue delivery plus trusted lifecycle hooks for
+resume/compaction recovery. Codex 0.157's compaction recovery remains the observed
+PostCompact invalidation and next-boundary fallback. Immediate mid-turn injection
+is not promised. Claude hooks remain protocol-tested only; no Claude idle wake
+adapter is claimed. Remote SSH acceptance remains outside this local increment.
+No user hook configuration or live Mail store was changed automatically.

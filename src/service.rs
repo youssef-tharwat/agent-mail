@@ -201,10 +201,13 @@ async fn wake(
 
 pub async fn tick(store: &Store, time: i64) -> Result<Vec<Observation>> {
     let mut pending = Vec::new();
-    let mut observations = Vec::new();
+    let mut observations = crate::codex::tick(store, time).await?;
     for item in store.pending().await? {
         let mailbox = store.mailbox(&item.group_name, &item.name).await?;
         if matches!(mailbox.binding, Binding::Standalone { .. }) {
+            if store.has_codex(&mailbox).await? {
+                continue;
+            }
             let state = if item.due <= time {
                 "overdue; standalone availability unknown; check context"
             } else {

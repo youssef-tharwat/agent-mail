@@ -60,6 +60,24 @@ enum Command {
         #[arg(long)]
         replace: bool,
     },
+    /// Operator: attach automatic wake to an existing, persistent Codex thread.
+    AttachCodex {
+        #[arg(long, default_value = "default")]
+        group: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long)]
+        thread: uuid::Uuid,
+    },
+    /// Operator: disable the Codex wake endpoint for this participant.
+    DetachCodex {
+        #[arg(long, default_value = "default")]
+        group: String,
+        #[arg(long)]
+        name: String,
+    },
     /// List registered participants without exposing session credentials.
     Participants {
         #[arg(long, default_value = "default")]
@@ -426,6 +444,21 @@ async fn run(cli: Cli) -> Result<()> {
             let session = store.register(&group, &name, replace).await?;
             json!({"group":group,"name":name,"session":session,"runtime":"standalone"})
         }
+        Command::AttachCodex {
+            group,
+            name,
+            socket,
+            thread,
+        } => {
+            let actor = store.mailbox(&group, &name).await?;
+            store.attach_codex(&actor, &socket, thread).await?;
+            json!({"attached":name,"thread":thread,"group":group})
+        }
+        Command::DetachCodex { group, name } => {
+            let actor = store.mailbox(&group, &name).await?;
+            store.detach_codex(&actor).await?;
+            json!({"detached":name,"group":group})
+        }
         Command::Participants { group } => serde_json::to_value(store.participants(&group).await?)?,
         Command::MachineId => json!({"machine_id":store.machine_id().await?}),
         Command::Join { group, home } => {
@@ -719,7 +752,7 @@ async fn run(cli: Cli) -> Result<()> {
                 Value::Null
             };
             let (outbox_pending, outbox_oldest) = store.outbox_status().await?;
-            json!({"service_running":service::running(&root),"now":now()?,"groups":store.groups().await?,"inboxes":store.pending().await?,"notifications":store.notification_status().await?,"peers":store.peers_status().await?,"outbox_pending":outbox_pending,"outbox_oldest":outbox_oldest,"last_scan":diagnostics})
+            json!({"service_running":service::running(&root),"now":now()?,"groups":store.groups().await?,"inboxes":store.pending().await?,"notifications":store.notification_status().await?,"codex":store.codex_status().await?,"peers":store.peers_status().await?,"outbox_pending":outbox_pending,"outbox_oldest":outbox_oldest,"last_scan":diagnostics})
         }
         Command::Pause { group } => {
             store.pause(&group, true).await?;

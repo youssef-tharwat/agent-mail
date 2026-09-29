@@ -40,3 +40,5 @@ pub mod events;
 
 pub mod hooks;
 pub mod recovery;
+
+pub mod codex;

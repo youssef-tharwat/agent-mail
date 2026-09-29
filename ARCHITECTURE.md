@@ -116,7 +116,7 @@ uses compile-time checked SQLx queries and no dynamic SQL.
 Status: v0.3 source implements transactional event subscriptions, generation-scoped
 receipts, atomic writer decisions, bounded client hook output, and work-event
 wake reconciliation. v0.2.0 lacks these features. Trusted Codex 0.157 prompt/resume recovery and the post-compaction fallback
-have been exercised; broader client acceptance and safe idle standalone waking remain open; checkpoint polling is
+have been exercised; the local Codex queue adapter supplies idle wake; broader client acceptance remains scoped below. Checkpoint polling is
 an incomplete fallback, not the target reliability contract.
 
 Fixed subscriptions are derived from recipients and work ownership. SQLite
@@ -220,9 +220,16 @@ committed operations remain valid. Remote routes cannot be taken over by a
 local registration. Existing schema-5 addresses migrate with their IDs, bindings,
 messages, work records, and reminder budgets intact.
 
-The reminder worker handles standalone mail as pending or overdue with unknown
-availability. It makes no runtime calls for those participants and does not
-claim to have notified them. Herdr participants retain fresh identity checks,
+Standalone participants without a configured adapter remain pending with unknown
+availability. An explicitly attached Codex endpoint binds a local Unix socket and
+persistent thread UUID to the mailbox generation. The existing worker delivers
+bounded recovery snapshots through Codex's queue when the thread is idle. A
+durable cursor and bounded retry budget survive restarts; a successful queue
+receipt acknowledges transport only. Binding replacement invalidates the
+endpoint. The send holds the binding write lock within a five-second operation
+timeout, excluding detach/rebind during delivery. Codex queue IDs are not
+idempotency keys: uncertain delivery can duplicate a wake. Mail never starts,
+resumes, or supervises a Codex runtime. Herdr participants retain fresh identity checks,
 idle-state checks, and the existing bounded wake policy. A last-moment pane
 replacement can still receive a generic wake hint because Herdr's state read
 and prompt are separate operations; the hint contains no message or work body.

@@ -86,7 +86,7 @@ another identity. Leave it unset for the normal Herdr pane binding.
 
 `agent-mail participants --group project` lists addresses and runtime bindings
 without exposing credentials. This is a registration view; it does not infer
-whether a worker is alive. Standalone agents check `context` at checkpoints.
+whether a worker is alive. Without an adapter, standalone agents check `context` at checkpoints.
 No background worker is needed for local mail or work operations. When run,
 the worker reports pending/overdue standalone mail and unknown availability;
 it cannot wake a standalone agent or send an operator notification without a
@@ -135,7 +135,7 @@ Agent Mail task. Other agent tools can read the same `SKILL.md` directly.
 
 This section describes the source checkout. The published v0.2.0 binaries do
 not include these commands. Build this revision with `cargo install --path . --locked`.
-Stop existing Mail workers and run `setup` to migrate a backed-up store to schema 7;
+Stop existing Mail workers and run `setup` to migrate a backed-up store to schema 8;
 v0.2.0 cannot open the upgraded database.
 
 Mail and work changes automatically publish recipient-scoped events in the same
@@ -184,11 +184,51 @@ without model tool calls. In that version, manual compaction needed the
 **Limits:** each installed client must load and trust its hooks. A successful stdout write does not prove model
 consumption: hook attempts never manufacture delivery receipts. `status` shows
 unacknowledged notifications and emission attempts. Hooks need client lifecycle
-activity; they cannot wake an idle standalone session. Herdr's optional wake
+activity; use the Codex queue adapter below for idle sessions. Herdr's optional wake
 path retains its existing safety hold. Neither mode guarantees agent progress.
 
 Hook contracts: [Codex](https://learn.chatgpt.com/docs/hooks),
 [Claude Code](https://code.claude.com/docs/en/hooks).
+
+### Wake an idle Codex session
+
+For an existing persistent thread on a running local Codex app-server:
+
+```sh
+agent-mail attach-codex --group project --name worker \
+  --socket /absolute/path/to/codex.sock --thread THREAD_UUID
+agent-mail service run
+```
+
+Attachment is explicit permission to queue Mail updates to that thread. Use the
+thread's actual UUID and its server's Unix socket; Mail verifies it exists and is
+persistent. Start a dedicated server with `codex app-server --listen
+unix:///absolute/path/to/codex.sock` if your client needs one, then connect your
+client to that server. Mail does not start or resume Codex processes. Give the
+client its participant credential as described above; attachment only configures
+delivery, it does not set the client's environment. One thread can serve one Mail
+participant per store.
+
+The worker waits until the thread is idle, then queues a summary capped at 6,000
+UTF-8 bytes. Codex starts the turn; no agent poll or separate `context` call is
+needed. Changes made while busy remain durable. Install the lifecycle hooks too
+for recovery during compaction and session resume. The queue adapter was tested
+against Codex 0.157.0's experimental app-server API.
+
+`pause --group project` holds delivery; `resume` restores it.
+`detach-codex --group project --name worker` disables the endpoint.
+Replacing a participant invalidates its attachment; attach the replacement
+explicitly. `status` reports delivery cursors, binding validity, attempts and the
+latest worker result. `resume --group project --rearm worker` resets an exhausted
+retry budget.
+
+A confirmed queue receipt advances the notification cursor, never resolves mail
+or accepts work. An uncertain send gets at most three attempts per change batch,
+spaced five minutes apart; a new change gets a fresh budget. Retry state survives
+worker restarts. Codex does **not** deduplicate queue entries by client message ID,
+so a lost response can cause a duplicate wake. Idempotent sends and decisions
+protect business state. Queued input is not proof that the model acted on it.
+Herdr's `prompt-mode --enable-unguarded` is unrelated to Codex attachment.
 
 ### Submit one work decision
 

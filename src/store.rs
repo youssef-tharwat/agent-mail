@@ -211,7 +211,7 @@ impl Store {
             .await?
             .user_version
             .context("SQLite did not report its schema version")?;
-        ensure!(version <= 7, "database schema is newer than this binary");
+        ensure!(version <= 8, "database schema is newer than this binary");
         if setup {
             // Rebuilding a referenced table requires FK enforcement off outside
             // the migration transaction. The migration checks every FK before commit.
@@ -248,7 +248,7 @@ impl Store {
             .await?;
         } else {
             ensure!(
-                version == 7,
+                version == 8,
                 "database schema needs initialization or migration; run setup"
             );
         }
@@ -737,12 +737,16 @@ impl Store {
 
     pub async fn rearm(&self, group: &str, participant: &str) -> Result<()> {
         let actor = self.mailbox(group, participant).await?;
+        let mut tx = self.pool.begin().await?;
+        Self::lock_actor(&mut tx, &actor).await?;
         sqlx::query!(
             "UPDATE mailboxes SET attempts=0,next_wake=0,alerted=0 WHERE id=?",
             actor.id
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        sqlx::query!("UPDATE codex_wakes SET attempts=0,next_attempt=0 WHERE recipient=? AND binding_version=?",actor.id,actor.binding_version).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(())
     }
 }
