@@ -107,7 +107,7 @@ message appears; no queued message silently disappears.
 
 ## 4. Package and release-check
 
-Files: `README.md`, install/uninstall instructions, example Herdr setup,
+Files: [README.md](../README.md), install/uninstall instructions, example Herdr setup,
 CI workflow, release notes, and the existing MIT license.
 
 - Document the one-machine path first, then optional SSH. Explain what a local
@@ -227,7 +227,7 @@ recovery. The test used the normal hook trust UI and left existing Mail state al
   Every scan used a fresh Mail process. No manual inbox/context polling or
   handoff prompts were supplied. One ambiguous response exposed and led to fixing
   the old-cooldown/new-change delay. A repeat on the completed adapter verified
-  final quiescence. See `docs/local-codex-acceptance.md` for final evidence.
+  final quiescence. See [local-codex-acceptance.md](local-codex-acceptance.md) for final evidence.
 
 Supported default: local Codex queue delivery plus trusted lifecycle hooks for
 resume/compaction recovery. Codex 0.157's compaction recovery remains the observed

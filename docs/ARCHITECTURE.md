@@ -27,7 +27,7 @@ execute a model's tools exactly once.
 
 | Component | Owns |
 | --- | --- |
-| Runtime (Herdr integration today) | Live agent inventory, processes, sessions, machine connections, lifecycle observations, and wake prompts |
+| Agent runtime (Herdr or Codex) | Live agent inventory, processes, sessions, machine connections, lifecycle observations, and wake prompts |
 | Mail | Durable participant identities, runtime/routing bindings, delivery, request resolution, reminders, a small work register, and recovery views |
 | Workflow using Mail | Meaning of work states, review criteria, who may accept or reassign work |
 | Git and CI | Code revisions, artifacts, test results, and other underlying evidence |
@@ -111,7 +111,7 @@ succeeded. A failed commit never returns success. Missing or incompatible state
 fails visibly instead of silently creating a fresh database. The implementation
 uses compile-time checked SQLx queries and no dynamic SQL.
 
-## Forgetful-agent contract (required next increment)
+## Forgetful-agent contract
 
 Status: v0.3 source implements transactional event subscriptions, generation-scoped
 receipts, atomic writer decisions, bounded client hook output, and work-event
