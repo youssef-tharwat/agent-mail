@@ -6,7 +6,7 @@ use agent_mail::{
     stream::{self, Frame, Server},
     work::{WorkDraft, WorkPatch},
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::time::Duration;
 
 async fn setup() -> Result<(tempfile::TempDir, Store)> {
@@ -196,18 +196,26 @@ async fn missed_hint_reconciles_and_unread_subscriber_does_not_block_writes() ->
     store
         .work_create(&writer, draft("missed-hint"), 100)
         .await?;
-    let frame = tokio::time::timeout(Duration::from_secs(7), stream::next(&mut live)).await??;
+    let frame = tokio::time::timeout(Duration::from_secs(7), stream::next(&mut live))
+        .await
+        .context("stream did not reconcile the committed event")??;
     assert!(matches!(frame,Frame::Event{subject,..} if subject=="missed-hint"));
-    // Stop reading. Writes remain independent of subscriber progress.
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // Stop reading. Writes remain independent of subscriber progress. This is a
+    // liveness check, not a 100-fsync benchmark: shared CI disks vary in latency.
+    let mut committed = 0;
+    tokio::time::timeout(Duration::from_secs(30), async {
         for i in 0..100 {
             store
                 .work_create(&writer, draft(&format!("unread-{i}")), 101 + i)
                 .await?;
+            committed += 1;
         }
         Ok::<_, anyhow::Error>(())
     })
-    .await??;
+    .await
+    .with_context(|| {
+        format!("writes blocked after {committed}/100 commits with an unread subscriber")
+    })??;
     Ok(())
 }
 
