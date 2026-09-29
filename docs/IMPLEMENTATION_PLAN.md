@@ -84,6 +84,52 @@ No ACP launcher or automatic credential export ships in v0.3.
 - [x] Version source and the plugin manifest as 0.4.0.
 - [ ] Publish after integrated review and CI; binaries are still v0.3.0.
 
-ACP and remote SSH acceptance remain deferred. Native Claude is a client-owned
-streaming process; attaching arbitrary existing interactive Claude terminals is
-outside this implementation.
+ACP and remote SSH acceptance remain deferred. The schema 10 streaming bridge
+is complemented by native terminal inbox integration in schema 11 below.
+
+
+## Simplify Claude setup with its native inbox (schema 11)
+
+- [x] Probe the official per-session inbox in an isolated runtime. It accepts
+  native user frames but returns no delivery acknowledgment.
+- [x] Generate an opt-in Claude hook configuration that registers the exported
+  endpoint automatically; preserve native UI and permission ownership.
+- [x] Correlate automatic UserPromptSubmit receipts with opaque pending markers;
+  inject fresh state there, never count a socket write as confirmed delivery.
+- [x] Preserve bounded retries across same-session resume and reject stale or
+  replaced identities and socket files. Exclude runtime tokens from diagnostics.
+- [x] Verify a live Claude/Claude correction and acceptance flow, resume and compact.
+- [x] Finish ordinary-terminal, mixed-runtime and refusal acceptance checks.
+- [x] Pass formatting, full regression tests (61 plus one doctest) and strict
+  Clippy on the final diff.
+
+Keep the streaming bridge as an advanced integration. Do not build a terminal
+client, approval UI, model-driven acknowledgment loop or ACP dependency.
+
+
+## Release hold: CLI workflow redesign
+
+The user paused v0.4.0 publication to simplify installation, defaults and the
+command model. No backward CLI compatibility is required; stored data must survive.
+The proposed keep/merge/automate/remove mapping and workflow acceptance criteria
+are in [CLI redesign](CLI_REDESIGN.md). This is a design proposal, not implemented
+behavior. Do not publish the release or tap until this pass is complete and the
+release hold is lifted.
+
+
+## Approved CLI and distribution pass
+
+The user approved implementing the redesign and publishing afterward. Public
+assignments are named `task`, not `work` or `job`. This approval lifts the earlier
+release hold after validation. Schema 12 preserves data while adding task creation
+provenance, durable runtime delivery policy and optional business deadlines.
+
+- [x] Implement group inference and the grouped task/mail/runtime CLI without aliases.
+- [x] Merge task mutations and derive retry identities; split reply/resolve/withdraw.
+- [x] Persist detach across hooks and runtime restarts.
+- [x] Generate runtime settings safely; align the README, user guide and skill.
+- [x] Prepare binary installer, Herdr binary consumption and personal Homebrew tap.
+- [x] Complete regression and live acceptance on the final interface: 66 tests
+  and one doctest, strict Clippy, mixed Claude/Codex correction and acceptance,
+  then Claude resume and compaction recovery.
+- [ ] Publish v0.4.0 binaries and verify Homebrew/direct installation.

@@ -22,6 +22,8 @@ jobs:
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '14.0'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -34,6 +36,8 @@ jobs:
         run: |
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
           test "$RELEASE_TAG" = "v$version"
+          test "$(sed -n 's/^version=//p' scripts/install.sh)" = "$version"
+          test "$(sed -n 's/^version = "\(.*\)"/\1/p' herdr-plugin.toml)" = "$version"
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-features
@@ -47,10 +51,10 @@ jobs:
           test "$(rustc -vV | sed -n 's/^host: //p')" = "$RELEASE_TARGET"
           ./target/release/agent-mail --version
           smoke_root=$(mktemp -d)
-          ./target/release/agent-mail --state-dir "$smoke_root/state" setup --standalone >/dev/null
+          ./target/release/agent-mail --state-dir "$smoke_root/state" init smoke >/dev/null
           ./target/release/agent-mail --state-dir "$smoke_root/state" status | jq -e '.attention.work == []' >/dev/null
-          ./target/release/agent-mail watch --help >/dev/null
-          ./target/release/agent-mail doctor --help >/dev/null
+          ./target/release/agent-mail adapter watch --help >/dev/null
+          ./target/release/agent-mail status --help >/dev/null
           mkdir -p dist package
           cp target/release/agent-mail LICENSE package/
           archive="agent-mail-$RELEASE_TAG-$RELEASE_TARGET.tar.gz"
@@ -69,6 +73,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -78,4 +83,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
-        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --title "Agent Mail $RELEASE_TAG" --generate-notes
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --title "Agent Mail $RELEASE_TAG" --notes-file "docs/releases/$RELEASE_TAG.md"

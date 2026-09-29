@@ -103,7 +103,7 @@ impl Store {
                 state,
             });
         }
-        let overdue = sqlx::query!("SELECT b.group_name,b.name,m.id FROM deliveries d JOIN messages m ON m.id=d.message JOIN mailboxes b ON b.id=d.recipient WHERE d.state='pending' AND m.due<=? ORDER BY m.due LIMIT 101",now).fetch_all(self.pool()).await?;
+        let overdue = sqlx::query!("SELECT b.group_name,b.name,m.id FROM deliveries d JOIN messages m ON m.id=d.message JOIN mailboxes b ON b.id=d.recipient WHERE d.state='pending' AND m.deadline<=? ORDER BY m.deadline LIMIT 101",now).fetch_all(self.pool()).await?;
         more |= overdue.len() > 100;
         for row in overdue.into_iter().take(100) {
             items.push(AttentionItem {
@@ -117,7 +117,7 @@ impl Store {
         let missing=sqlx::query!("SELECT b.group_name,b.name FROM mailboxes b WHERE b.pane IS NULL AND b.remote_machine IS NULL AND NOT EXISTS(SELECT 1 FROM runtime_wakes c WHERE c.recipient=b.id AND c.binding_version=b.binding_version) AND (EXISTS(SELECT 1 FROM work_items w WHERE w.group_name=b.group_name AND w.owner=b.name AND w.open=1) OR EXISTS(SELECT 1 FROM deliveries d WHERE d.recipient=b.id AND d.state='pending')) LIMIT 101").fetch_all(self.pool()).await?;
         more |= missing.len() > 100;
         for row in missing.into_iter().take(100) {
-            items.push(AttentionItem{group:row.group_name,participant:row.name,kind:AttentionKind::MissingEndpoint,subject:None,detail:"No current idle-wake endpoint; hooks alone cannot wake an idle client. Run doctor for setup guidance".into()});
+            items.push(AttentionItem{group:row.group_name,participant:row.name,kind:AttentionKind::MissingEndpoint,subject:None,detail:"No current idle-wake endpoint; hooks alone cannot wake an idle client. Run status --check for setup guidance".into()});
         }
         let exhausted=sqlx::query!("SELECT b.group_name,b.name,c.attempts FROM runtime_wakes c JOIN mailboxes b ON b.id=c.recipient AND b.binding_version=c.binding_version WHERE c.attempts>0 AND EXISTS(SELECT 1 FROM wake_events e WHERE e.recipient=b.id AND e.id>c.scanned) LIMIT 101").fetch_all(self.pool()).await?;
         more |= exhausted.len() > 100;

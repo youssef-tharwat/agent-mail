@@ -18,12 +18,12 @@ impl Demo {
             writer: String::new(),
             worker: String::new(),
         };
-        d.call(None, &["setup", "--standalone"], None, false)?;
-        d.writer = d.call(None, &["register", "--name", "writer"], None, false)?["session"]
+        d.call(None, &["init", "default"], None, false)?;
+        d.writer = d.call(None, &["participant", "add", "writer"], None, false)?["session"]
             .as_str()
             .unwrap()
             .into();
-        d.worker = d.call(None, &["register", "--name", "worker"], None, false)?["session"]
+        d.worker = d.call(None, &["participant", "add", "worker"], None, false)?["session"]
             .as_str()
             .unwrap()
             .into();
@@ -39,6 +39,8 @@ impl Demo {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_agent-mail"));
         cmd.args(["--state-dir", self.temp.path().to_str().unwrap()])
             .args(args)
+            .env_remove("AGENT_MAIL_GROUP")
+            .env_remove("AGENT_MAIL_GROUP")
             .env_remove("AGENT_MAIL_SESSION")
             .env_remove("HERDR_ENV")
             .env_remove("HERDR_SOCKET_PATH")
@@ -73,11 +75,9 @@ impl Demo {
         self.call(
             Some(&self.writer),
             &[
-                "work",
-                "create",
-                "--id",
                 "task",
-                "--scope",
+                "create",
+                "task",
                 "Review",
                 "--owner",
                 "worker",
@@ -89,17 +89,17 @@ impl Demo {
         )
     }
     fn events(&self, session: &str) -> Result<Value> {
-        self.call(Some(session), &["events"], None, false)
+        self.call(Some(session), &["adapter", "events"], None, false)
     }
     fn hook(&self, event: &str, active: bool) -> Result<Value> {
-        self.call(Some(&self.worker), &["hook"],Some(json!({"hook_event_name":event,"session_id":"test-client","stop_hook_active":active})),false)
+        self.call(Some(&self.worker), &["adapter", "hook"],Some(json!({"hook_event_name":event,"session_id":"test-client","stop_hook_active":active})),false)
     }
     fn decide(&self, value: Value, fail: bool) -> Result<Value> {
         let path = self.temp.path().join("decision.json");
         std::fs::write(&path, serde_json::to_vec(&value)?)?;
         self.call(
             Some(&self.writer),
-            &["work", "decide", "task", "--file", path.to_str().unwrap()],
+            &["task", "update", "task", "--file", path.to_str().unwrap()],
             None,
             fail,
         )
@@ -113,25 +113,20 @@ fn changes_publish_without_a_separate_send_and_receipts_do_not_resolve() -> Resu
     let events = d.events(&d.worker)?;
     assert_eq!(events["items"][0]["kind"], "work_changed");
     let id = events["items"][0]["id"].to_string();
-    d.call(Some(&d.worker), &["ack", &id], None, false)?;
+    d.call(Some(&d.worker), &["adapter", "ack", &id], None, false)?;
     assert_eq!(d.events(&d.worker)?["items"], json!([]));
     assert_eq!(
         d.call(Some(&d.worker), &["context"], None, false)?["work"][0]["id"],
         "task"
     );
     // Another participant cannot acknowledge this event.
-    d.call(Some(&d.writer), &["ack", &id], None, true)?;
-    let rotated = d.call(
-        None,
-        &["register", "--name", "worker", "--replace"],
-        None,
-        false,
-    )?;
+    d.call(Some(&d.writer), &["adapter", "ack", &id], None, true)?;
+    let rotated = d.call(None, &["participant", "replace", "worker"], None, false)?;
     let new = rotated["session"].as_str().unwrap();
-    d.call(Some(&d.worker), &["ack", &id], None, true)?;
+    d.call(Some(&d.worker), &["adapter", "ack", &id], None, true)?;
     assert_eq!(d.events(new)?["items"][0]["id"], events["items"][0]["id"]);
     d.decide(
-        json!({"key":"assign","version":1,"reason":"Reassign","patch":{"owner":"writer"}}),
+        json!({"version":1,"reason":"Reassign","patch":{"owner":"writer"}}),
         false,
     )?;
     let former = d.events(new)?;
@@ -159,37 +154,36 @@ fn decisions_resolve_and_publish_once_or_roll_back_everything() -> Result<()> {
     let sent = d.call(
         Some(&d.worker),
         &[
+            "mail",
             "send",
-            "--to",
             "writer",
+            "Ready for review",
             "--key",
             "result",
-            "--summary",
-            "Ready for review",
-            "--work-id",
+            "--task",
             "task",
         ],
         None,
         false,
     )?;
     let before = d.events(&d.worker)?;
-    let invalid = json!({"key":"invalid","version":1,"reason":"Accept","patch":{"state":"accepted","open":false},"resolve_message":9999});
+    let invalid = json!({"version":1,"reason":"Accept","patch":{"state":"accepted","open":false},"resolve_message":9999});
     d.decide(invalid, true)?;
     assert_eq!(d.events(&d.worker)?, before);
     assert_eq!(
-        d.call(Some(&d.writer), &["work", "show", "task"], None, false)?["version"],
+        d.call(Some(&d.writer), &["task", "show", "task"], None, false)?["version"],
         1
     );
-    let decision = json!({"key":"accept","version":1,"reason":"Evidence verified","patch":{"state":"accepted","open":false,"accepted_revision":"abc123"},"resolve_message":sent["id"]});
+    let decision = json!({"version":1,"reason":"Evidence verified","patch":{"state":"accepted","open":false,"accepted_revision":"abc123"},"resolve_message":sent["id"]});
     let first = d.decide(decision.clone(), false)?;
     let events = d.events(&d.worker)?;
     assert_eq!(d.decide(decision.clone(), false)?, first);
     assert_eq!(d.events(&d.worker)?, events);
     assert_eq!(
-        d.call(Some(&d.writer), &["inbox"], None, false)?["items"],
+        d.call(Some(&d.writer), &["mail", "list"], None, false)?["items"],
         json!([])
     );
-    let reopened=d.decide(json!({"key":"reopen","version":2,"reason":"New evidence","patch":{"state":"active","open":true,"accepted_revision":null}}),false)?;
+    let reopened=d.decide(json!({"version":2,"reason":"New evidence","patch":{"state":"active","open":true,"accepted_revision":null}}),false)?;
     assert_eq!(reopened["accepted_revision"], Value::Null);
     assert_eq!(reopened["version"], 3);
     let mut changed = decision;
@@ -212,14 +206,23 @@ fn hooks_restore_after_reset_suppress_repeats_and_bound_stop_continuations() -> 
     assert!(serde_json::to_vec(&start)?.len() < 6144);
     assert_eq!(d.hook("PostToolUse", false)?, json!({}));
     // New state is injected automatically at the next tool boundary.
-    d.decide(json!({"key":"next","version":1,"reason":"Clarify","patch":{"next_action":"Check changed contract"}}),false)?;
+    d.decide(
+        json!({"version":1,"reason":"Clarify","patch":{"next_action":"Check changed contract"}}),
+        false,
+    )?;
     let update = d.hook("PostToolUse", false)?;
     assert!(update.to_string().contains("Check changed contract"));
     assert_eq!(d.hook("Stop", false)?, json!({}));
-    d.decide(json!({"key":"next2","version":2,"reason":"Clarify again","patch":{"next_action":"Check tests"}}),false)?;
+    d.decide(
+        json!({"version":2,"reason":"Clarify again","patch":{"next_action":"Check tests"}}),
+        false,
+    )?;
     assert_eq!(d.hook("Stop", false)?["decision"], "block");
     assert_eq!(d.hook("Stop", true)?, json!({}));
-    d.decide(json!({"key":"next3","version":3,"reason":"More work","patch":{"next_action":"Check diff"}}),false)?;
+    d.decide(
+        json!({"version":3,"reason":"More work","patch":{"next_action":"Check diff"}}),
+        false,
+    )?;
     assert_eq!(d.hook("Stop", false)?, json!({}));
     // Older clients invalidate at PostCompact, then restore at the next boundary.
     assert_eq!(d.hook("PostCompact", false)?, json!({}));
@@ -305,14 +308,13 @@ fn assignment_review_correction_and_acceptance_surface_without_manual_context() 
         d.call(
             Some(&d.worker),
             &[
+                "mail",
                 "send",
-                "--to",
                 "writer",
+                "Submitted evidence",
                 "--key",
                 key,
-                "--summary",
-                "Submitted evidence",
-                "--work-id",
+                "--task",
                 "task",
             ],
             None,
@@ -323,7 +325,7 @@ fn assignment_review_correction_and_acceptance_surface_without_manual_context() 
     let writer_hook = |event: &str| {
         d.call(
             Some(&d.writer),
-            &["hook"],
+            &["adapter", "hook"],
             Some(json!({"hook_event_name":event,"session_id":"writer-client"})),
             false,
         )
@@ -333,7 +335,7 @@ fn assignment_review_correction_and_acceptance_surface_without_manual_context() 
             .to_string()
             .contains("Submitted evidence")
     );
-    d.decide(json!({"key":"correction","version":1,"reason":"Missing regression case","patch":{"state":"active","next_action":"Add regression case"},"resolve_message":first["id"]}),false)?;
+    d.decide(json!({"version":1,"reason":"Missing regression case","patch":{"state":"active","next_action":"Add regression case"},"resolve_message":first["id"]}),false)?;
     assert!(
         d.hook("PostToolUse", false)?
             .to_string()
@@ -345,7 +347,7 @@ fn assignment_review_correction_and_acceptance_surface_without_manual_context() 
             .to_string()
             .contains("Submitted evidence")
     );
-    d.decide(json!({"key":"accept-final","version":2,"reason":"Evidence passed","patch":{"state":"accepted","open":false,"accepted_revision":"abc123"},"resolve_message":second["id"]}),false)?;
+    d.decide(json!({"version":2,"reason":"Evidence passed","patch":{"state":"accepted","open":false,"accepted_revision":"abc123"},"resolve_message":second["id"]}),false)?;
     let final_hook = d.hook("PostToolUse", false)?;
     assert!(final_hook.to_string().contains("work_changed"));
     let text = final_hook["hookSpecificOutput"]["additionalContext"]

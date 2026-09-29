@@ -197,37 +197,43 @@ async fn lost_receipts_use_durable_bounded_retries_and_pause_is_respected() -> R
     // A new revision bypasses an older uncertain attempt's cooldown.
     server.lose.store(true, Ordering::SeqCst);
     store
-        .work_update(
+        .update_work(
             &actor,
             "task",
-            1,
-            agent_mail::work::WorkPatch {
-                state: Some("review".into()),
-                ..Default::default()
+            agent_mail::work::WorkUpdate {
+                version: 1,
+                patch: agent_mail::work::WorkPatch {
+                    state: Some("review".into()),
+                    ..Default::default()
+                },
+                reason: ("Review").to_owned(),
+                resolve_message: None,
             },
-            "Review",
             2001,
         )
         .await?;
     service::tick(&store, 2001).await?;
     assert_eq!(server.received.load(Ordering::SeqCst), 5);
     store
-        .work_update(
+        .update_work(
             &actor,
             "task",
-            2,
-            agent_mail::work::WorkPatch {
-                state: Some("active".into()),
-                ..Default::default()
+            agent_mail::work::WorkUpdate {
+                version: 2,
+                patch: agent_mail::work::WorkPatch {
+                    state: Some("active".into()),
+                    ..Default::default()
+                },
+                reason: ("New evidence").to_owned(),
+                resolve_message: None,
             },
-            "New evidence",
             2002,
         )
         .await?;
     server.lose.store(false, Ordering::SeqCst);
     service::tick(&store, 2002).await?;
     assert_eq!(server.received.load(Ordering::SeqCst), 6);
-    store.detach_codex(&actor).await?;
+    store.set_runtime_enabled(&actor, false).await?;
     service::tick(&store, 2400).await?;
     assert_eq!(server.received.load(Ordering::SeqCst), 6);
     Ok(())
@@ -271,16 +277,19 @@ async fn cancellation_reaches_active_owner_but_idle_closure_does_not_wake() -> R
         assert_eq!(server.received.load(Ordering::SeqCst), 1);
         server.active.store(active, Ordering::SeqCst);
         store
-            .work_update(
+            .update_work(
                 &writer,
                 "task",
-                1,
-                agent_mail::work::WorkPatch {
-                    open: (!reassigned).then_some(false),
-                    owner: reassigned.then(|| "new-owner".into()),
-                    ..Default::default()
+                agent_mail::work::WorkUpdate {
+                    version: 1,
+                    patch: agent_mail::work::WorkPatch {
+                        open: (!reassigned).then_some(false),
+                        owner: reassigned.then(|| "new-owner".into()),
+                        ..Default::default()
+                    },
+                    reason: ("Cancelled").to_owned(),
+                    resolve_message: None,
                 },
-                "Cancelled",
                 1201,
             )
             .await?;

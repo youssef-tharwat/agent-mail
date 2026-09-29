@@ -82,6 +82,11 @@ impl Store {
     /// # Errors
     /// The group or name is invalid, replacement is disallowed, or persistence fails.
     pub async fn register(&self, group: &str, name: &str, replace: bool) -> Result<Uuid> {
+        if replace {
+            self.mailbox(group, name)
+                .await
+                .context("participant does not exist; use participant add NAME first")?;
+        }
         let session = Uuid::new_v4();
         self.set_binding(group, name, &Binding::Standalone { session }, replace)
             .await?;
@@ -98,5 +103,72 @@ impl Store {
             return self.standalone_caller(group, session).await;
         }
         self.authenticate_herdr(group).await.context("supply AGENT_MAIL_SESSION for a registered standalone participant, or use a bound Herdr pane")
+    }
+}
+
+impl Store {
+    /// Select an explicit group, an authenticated identity's group, or the sole group.
+    ///
+    /// # Errors
+    /// Selection is ambiguous, a supplied identity is invalid, or storage fails.
+    pub async fn select_group(
+        &self,
+        requested: Option<&str>,
+        session: Option<&Uuid>,
+        agent: bool,
+    ) -> Result<String> {
+        let groups = self.groups().await?;
+        if let Some(group) = requested {
+            self.group(group).await?;
+            if session.is_some() {
+                self.authenticate(group, session).await?;
+            }
+            return Ok(group.into());
+        }
+        if let Some(session) = session {
+            let credential = session.to_string();
+            let rows = sqlx::query!(
+                "SELECT group_name FROM mailboxes WHERE standalone_session=?",
+                credential
+            )
+            .fetch_all(self.pool())
+            .await?;
+            anyhow::ensure!(
+                !rows.is_empty(),
+                "standalone credential is unknown or replaced; obtain the current credential from the operator"
+            );
+            anyhow::ensure!(
+                rows.len() == 1,
+                "credential matches multiple groups; select --group explicitly"
+            );
+            return Ok(rows[0].group_name.clone());
+        }
+        if agent && std::env::var("HERDR_ENV").as_deref() == Ok("1") {
+            let mut matches = Vec::new();
+            for group in &groups {
+                if self.authenticate_herdr(&group.name).await.is_ok() {
+                    matches.push(group.name.clone());
+                }
+            }
+            anyhow::ensure!(
+                matches.len() == 1,
+                "Herdr identity has no unique verified group; select --group and verify its participant binding"
+            );
+            return Ok(matches.remove(0));
+        }
+        anyhow::ensure!(
+            !groups.is_empty(),
+            "no groups configured; run agent-mail init GROUP"
+        );
+        anyhow::ensure!(
+            groups.len() == 1,
+            "multiple groups configured ({}); select --group GROUP or AGENT_MAIL_GROUP",
+            groups
+                .iter()
+                .map(|g| g.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        Ok(groups[0].name.clone())
     }
 }

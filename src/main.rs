@@ -3,10 +3,10 @@ use agent_mail::{
     BODY_LIMIT, herdr, now, relay, service,
     store::{Publish, Store},
     supervision,
-    work::{WorkDraft, WorkPatch},
+    work::WorkDraft,
 };
 use anyhow::{Context, Result, ensure};
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use serde_json::{Value, json};
 use std::{io::Read, path::PathBuf};
 
@@ -14,264 +14,189 @@ use std::{io::Read, path::PathBuf};
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[derive(Parser)]
-#[command(version, about = "Durable mail and work records for coding agents")]
-struct Cli {
-    #[arg(long, global = true, env = "AGENT_MAIL_STATE_DIR")]
+mod cli;
+
+struct RunArgs {
     state_dir: Option<PathBuf>,
-    /// Standalone registration credential. Omit to use the verified Herdr pane.
-    #[arg(
-        long,
-        global = true,
-        env = "AGENT_MAIL_SESSION",
-        hide_env_values = true
-    )]
     session: Option<uuid::Uuid>,
-    #[command(subcommand)]
     command: Command,
 }
 
-#[derive(Subcommand)]
 enum Command {
     /// Native Claude streaming session bridge; stdin/stdout remain the client protocol.
     ClaudeBridge {
-        #[arg(long)]
         socket: PathBuf,
-        #[arg(last = true)]
         args: Vec<String>,
     },
     /// Inspect setup without starting agents or changing configuration.
     Doctor {
-        #[arg(long, default_value = "default")]
         group: String,
-        #[arg(long)]
         name: Option<String>,
     },
     /// Create the database and enroll a group. Does not bind or prompt agents.
     Setup {
-        #[arg(long, default_value = "default")]
         group: String,
-        #[arg(long, env = "HERDR_SOCKET_PATH")]
         socket: Option<PathBuf>,
         /// Create a group without Herdr, ignoring an inherited socket environment.
-        #[arg(long)]
         standalone: bool,
-        #[arg(long)]
         install_service: bool,
     },
     /// Operator: associate an inbox with a verified native agent session.
     Bind {
-        #[arg(long, default_value = "default")]
         group: String,
-        #[arg(long)]
         name: String,
-        #[arg(long)]
         target: String,
-        #[arg(long)]
         replace: bool,
     },
     /// Operator: register a standalone participant; --replace rotates its session.
     Register {
-        #[arg(long, default_value = "default")]
         group: String,
-        #[arg(long)]
         name: String,
-        #[arg(long)]
         replace: bool,
     },
     /// Operator: attach automatic wake to an existing, persistent Codex thread.
     AttachCodex {
-        #[arg(long, default_value = "default")]
         group: String,
-        #[arg(long)]
         name: String,
-        #[arg(long)]
         socket: PathBuf,
-        #[arg(long)]
         thread: uuid::Uuid,
     },
     /// Operator: attach a verified native Claude streaming session.
     AttachClaude {
-        #[arg(long, default_value = "default")]
         group: String,
-        #[arg(long)]
         name: String,
-        #[arg(long)]
         socket: PathBuf,
-        #[arg(long)]
         session_id: uuid::Uuid,
     },
     /// Operator: disable native Claude delivery.
     DetachClaude {
-        #[arg(long, default_value = "default")]
         group: String,
-        #[arg(long)]
         name: String,
     },
     /// Operator: disable the Codex wake endpoint for this participant.
-    DetachCodex {
-        #[arg(long, default_value = "default")]
+    EnableRuntime {
         group: String,
-        #[arg(long)]
         name: String,
     },
     /// List registered participants without exposing session credentials.
     Participants {
-        #[arg(long, default_value = "default")]
         group: String,
     },
     /// Show this installation's stable machine identity.
     MachineId,
     /// Set this group's authoritative home after local setup on a remote host.
     Join {
-        #[arg(long, default_value = "default")]
         group: String,
-        #[arg(long)]
         home: String,
     },
     /// Configure an SSH alias for a peer installation.
     Peer {
-        #[arg(long)]
         machine: String,
-        #[arg(long)]
         ssh_target: String,
     },
     /// Operator: explicitly allow or stop periodic SSH sync for a configured peer.
     AutoSync {
-        #[arg(long)]
         peer: String,
-        #[arg(long, conflicts_with = "disable")]
         enable: bool,
-        #[arg(long)]
         disable: bool,
     },
     /// Register a named inbox on another machine.
     Route {
-        #[arg(long, default_value = "default")]
         group: String,
-        #[arg(long)]
         name: String,
-        #[arg(long)]
         machine: String,
     },
     /// Exchange durable events with configured peers over SSH.
     Sync {
-        #[arg(long)]
         peer: Option<String>,
     },
     /// Internal SSH stdio protocol.
-    #[command(subcommand, hide = true)]
     Bridge(Bridge),
     /// Publish one durable message. Reuse its key when retrying.
     Send {
-        #[arg(long, default_value = "default")]
         group: String,
-        #[arg(long = "to", required = true)]
         recipients: Vec<String>,
-        #[arg(long)]
         key: String,
-        #[arg(long)]
         summary: String,
-        #[arg(long)]
         body_file: Option<PathBuf>,
-        #[arg(long, default_value_t = 900)]
-        due_after: i64,
-        #[arg(long)]
+        due_after: Option<i64>,
         work_id: Option<String>,
     },
     /// List pending summaries, or fetch a single message body.
     Inbox {
-        #[arg(long, default_value = "default")]
         group: String,
         message: Option<i64>,
-        #[arg(long, default_value_t = 0)]
         after: i64,
     },
     /// Resolve your delivery, optionally publishing a reply in the same transaction.
     Resolve {
-        #[arg(long, default_value = "default")]
         group: String,
         message: i64,
-        #[arg(long, default_value = "handled")]
         note: String,
-        #[arg(long, requires = "reply_file", conflicts_with = "withdraw")]
         reply_key: Option<String>,
-        #[arg(long, requires = "reply_key", conflicts_with = "withdraw")]
-        reply_file: Option<PathBuf>,
-        #[arg(long)]
+        reply_body: Option<String>,
         withdraw: bool,
     },
     /// Recover owned work and unresolved mail in one bounded response.
     Context {
-        #[arg(long, default_value = "default")]
         group: String,
-        #[arg(long, default_value = "")]
         work_after: String,
-        #[arg(long, default_value_t = 0)]
         mail_after: i64,
     },
     /// Print lifecycle hook configuration; merge it into the client's existing hooks.
-    HooksConfig,
+    /// Native Claude lifecycle adapter; reads runtime input and endpoint environment.
+    ClaudeHook {
+        group: String,
+    },
     /// Runtime adapter: receive bounded JSON lifecycle input on stdin.
     Hook {
-        #[arg(long, env = "AGENT_MAIL_GROUP", default_value = "default")]
         group: String,
     },
     /// Read durable notifications. Reading does not acknowledge or resolve them.
     Events {
-        #[arg(long, default_value = "default")]
         group: String,
-        #[arg(long, default_value_t = 0)]
         after: i64,
     },
     /// Adapter: acknowledge one successfully delivered event for this binding.
     Ack {
-        #[arg(long, default_value = "default")]
         group: String,
         event: i64,
     },
     /// Maintain small versioned work records in the same store as mail.
-    #[command(subcommand)]
     Work(WorkCommand),
     /// Stream committed events. Resume cursors must include their binding generation.
     Watch {
-        #[arg(long, default_value = "default")]
         group: String,
-        #[arg(long, default_value_t = 0)]
         after: i64,
-        #[arg(long)]
         generation: Option<i64>,
     },
     /// Operator: show durable pending work and the latest service diagnostics.
     Status,
     /// Operator: stop automatic prompts for a group. Message operations still work.
     Pause {
-        #[arg(long, default_value = "default")]
         group: String,
     },
     /// Operator: resume a group; optionally reset a participant's reminder budget.
     Resume {
-        #[arg(long, default_value = "default")]
         group: String,
-        #[arg(long)]
         rearm: Option<String>,
     },
     /// Opt in to unguarded agent prompts, or return to safe notification-only mode.
     PromptMode {
-        #[arg(long, default_value = "default")]
         group: String,
-        #[arg(long, conflicts_with = "disable")]
         enable_unguarded: bool,
-        #[arg(long)]
         disable: bool,
     },
-    #[command(subcommand)]
     Service(Service),
     /// Plugin startup hook: restore an already configured service.
     Restore,
+    Retry {
+        group: String,
+        name: String,
+    },
 }
 
-#[derive(Subcommand)]
+#[derive(clap::Subcommand)]
 enum Service {
     /// Foreground worker, suitable for a process supervisor.
     Run {
@@ -284,7 +209,7 @@ enum Service {
     Uninstall,
 }
 
-#[derive(Subcommand)]
+#[derive(clap::Subcommand)]
 enum Bridge {
     Export,
     Exchange {
@@ -293,78 +218,32 @@ enum Bridge {
     },
 }
 
-#[derive(Subcommand)]
 enum WorkCommand {
     /// Apply a JSON decision and optionally resolve a linked request atomically.
     Decide {
-        #[arg(long, default_value = "default")]
         group: String,
         id: String,
-        #[arg(long)]
-        file: PathBuf,
+        update: agent_mail::work::WorkUpdate,
     },
     Create {
-        #[arg(long, default_value = "default")]
         group: String,
-        #[arg(long)]
         id: String,
-        #[arg(long)]
         scope: String,
-        #[arg(long)]
         owner: String,
-        #[arg(long, default_value = "open")]
         state: String,
-        #[arg(long)]
         next_action: String,
-        #[arg(long)]
         deadline: Option<i64>,
-        #[arg(long)]
         evidence: Vec<String>,
     },
     Show {
-        #[arg(long, default_value = "default")]
         group: String,
         id: String,
     },
     List {
-        #[arg(long, default_value = "default")]
         group: String,
-        #[arg(long, default_value = "")]
         after: String,
     },
-    Update {
-        #[arg(long, default_value = "default")]
-        group: String,
-        id: String,
-        #[arg(long)]
-        version: i64,
-        #[arg(long)]
-        reason: String,
-        #[arg(long)]
-        owner: Option<String>,
-        #[arg(long)]
-        state: Option<String>,
-        #[arg(long)]
-        next_action: Option<String>,
-        #[arg(long, conflicts_with = "reopen")]
-        close: bool,
-        #[arg(long)]
-        reopen: bool,
-        #[arg(long, conflicts_with = "clear_deadline")]
-        deadline: Option<i64>,
-        #[arg(long)]
-        clear_deadline: bool,
-        #[arg(long, conflicts_with = "clear_accepted_revision")]
-        accepted_revision: Option<String>,
-        #[arg(long)]
-        clear_accepted_revision: bool,
-        #[arg(long)]
-        evidence: Vec<String>,
-        #[arg(long)]
-        clear_evidence: bool,
-    },
     History {
-        #[arg(long, default_value = "default")]
         group: String,
         id: String,
     },
@@ -372,8 +251,12 @@ enum WorkCommand {
 
 fn read_body(path: &std::path::Path) -> Result<String> {
     let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .with_context(|| format!("open {}", path.display()))?
+    let input: Box<dyn Read> = if path == std::path::Path::new("-") {
+        Box::new(std::io::stdin())
+    } else {
+        Box::new(std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?)
+    };
+    input
         .take((BODY_LIMIT + 1) as u64)
         .read_to_end(&mut bytes)?;
     ensure!(
@@ -385,13 +268,20 @@ fn read_body(path: &std::path::Path) -> Result<String> {
 
 #[tokio::main]
 async fn main() {
-    if let Err(error) = run(Cli::parse()).await {
+    if let Err(error) = execute().await {
         eprintln!("agent-mail: {error:#}");
         std::process::exit(1);
     }
 }
 
-async fn run(cli: Cli) -> Result<()> {
+async fn execute() -> Result<()> {
+    if let Some(args) = cli::Cli::parse().prepare().await? {
+        run(args).await?;
+    }
+    Ok(())
+}
+
+async fn run(cli: RunArgs) -> Result<()> {
     if let Command::ClaudeBridge { socket, args } = cli.command {
         let result = agent_mail::claude::run(&socket, args).await;
         if let Err(error) = &result {
@@ -400,25 +290,6 @@ async fn run(cli: Cli) -> Result<()> {
         // Tokio stdin uses a blocking reader; exit after the bridge has joined/aborted
         // its tasks and closed its child so a quiet stdin cannot stall shutdown.
         std::process::exit(if result.is_ok() { 0 } else { 1 });
-    }
-    if matches!(cli.command, Command::HooksConfig) {
-        let command = "agent-mail hook";
-        let mut hooks = serde_json::Map::new();
-        for event in [
-            "SessionStart",
-            "PostCompact",
-            "UserPromptSubmit",
-            "PreToolUse",
-            "PostToolUse",
-            "Stop",
-        ] {
-            hooks.insert(
-                event.into(),
-                json!([{"hooks":[{"type":"command","command":command,"timeout":10}]}]),
-            );
-        }
-        println!("{}", serde_json::to_string_pretty(&json!({"hooks":hooks}))?);
-        return Ok(());
     }
     let explicit_state = cli.state_dir.is_some();
     let root = supervision::state_root(cli.state_dir)?;
@@ -436,7 +307,10 @@ async fn run(cli: Cli) -> Result<()> {
     // Service lifecycle operations cannot hold a database lock while launchd starts a worker.
     match &cli.command {
         Command::Service(Service::Install) => {
-            ensure!(root.join("mail.db").is_file(), "run setup first");
+            ensure!(
+                root.join("mail.db").is_file(),
+                "run agent-mail init GROUP first"
+            );
             supervision::install(&root)?;
             println!("{}", json!({"installed":true}));
             return Ok(());
@@ -462,7 +336,16 @@ async fn run(cli: Cli) -> Result<()> {
             standalone,
             install_service,
         } => {
-            let socket = if standalone { None } else { socket };
+            let socket = if standalone {
+                store
+                    .groups()
+                    .await?
+                    .into_iter()
+                    .find(|existing| existing.name == group)
+                    .and_then(|existing| existing.socket)
+            } else {
+                socket
+            };
             store.enroll(&group, socket.as_deref()).await?;
             if !explicit_state {
                 supervision::save_locator(&root)?;
@@ -520,14 +403,18 @@ async fn run(cli: Cli) -> Result<()> {
             store.attach_claude(&actor, &socket, session_id).await?;
             json!({"attached":name,"session_id":session_id,"group":group})
         }
+        Command::EnableRuntime { group, name } => {
+            let actor = store.mailbox(&group, &name).await?;
+            store.set_runtime_enabled(&actor, true).await?;
+            json!({"enabled":name,"group":group,"next_action":"resume the native session to register its endpoint"})
+        }
+        Command::Retry { group, name } => {
+            store.rearm(&group, &name).await?;
+            json!({"rearmed":name,"group":group})
+        }
         Command::DetachClaude { group, name } => {
             let actor = store.mailbox(&group, &name).await?;
-            store.detach_claude(&actor).await?;
-            json!({"detached":name,"group":group})
-        }
-        Command::DetachCodex { group, name } => {
-            let actor = store.mailbox(&group, &name).await?;
-            store.detach_codex(&actor).await?;
+            store.set_runtime_enabled(&actor, false).await?;
             json!({"detached":name,"group":group})
         }
         Command::Participants { group } => serde_json::to_value(store.participants(&group).await?)?,
@@ -665,7 +552,7 @@ async fn run(cli: Cli) -> Result<()> {
             message,
             note,
             reply_key,
-            reply_file,
+            reply_body,
             withdraw,
         } => {
             let actor = store.authenticate(&group, cli.session.as_ref()).await?;
@@ -673,10 +560,7 @@ async fn run(cli: Cli) -> Result<()> {
                 store.withdraw(&actor, message, now()?).await?;
                 json!({"id":message,"withdrawn":true})
             } else {
-                let reply = reply_key
-                    .zip(reply_file)
-                    .map(|(key, path)| Ok::<_, anyhow::Error>((key, read_body(&path)?)))
-                    .transpose()?;
+                let reply = reply_key.zip(reply_body);
                 let reply_id = store.resolve(&actor, message, &note, reply, now()?).await?;
                 json!({"id":message,"resolved":true,"reply_id":reply_id})
             }
@@ -688,6 +572,47 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             let actor = store.authenticate(&group, cli.session.as_ref()).await?;
             store.context_value(&actor, work_after, mail_after).await?
+        }
+        Command::ClaudeHook { group } => {
+            let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+            let mut bytes = Vec::new();
+            std::io::stdin().take(65537).read_to_end(&mut bytes)?;
+            ensure!(bytes.len() <= 65536, "hook input exceeds 64 KiB");
+            let input: agent_mail::claude_inbox::Input = serde_json::from_slice(&bytes)?;
+            let socket = std::env::var("CLAUDE_CODE_MESSAGING_SOCKET").context(
+                "Claude inbox unavailable; requires supported Claude Code with messaging enabled",
+            )?;
+            let token = std::env::var("CLAUDE_CODE_MESSAGING_TOKEN")
+                .context("Claude messaging token missing")?;
+            match store
+                .claude_inbox_hook(
+                    &actor,
+                    &input,
+                    std::path::Path::new(socket.strip_prefix("uds:").unwrap_or(&socket)),
+                    &token,
+                )
+                .await?
+            {
+                Some(receipt_context) => {
+                    store
+                        .reserve_hook(&actor, &input.session_id.to_string(), false, false, now()?)
+                        .await?;
+                    receipt_context
+                }
+                None if matches!(
+                    input.hook_event_name,
+                    agent_mail::claude_inbox::Event::SessionEnd
+                        | agent_mail::claude_inbox::Event::StopFailure
+                ) =>
+                {
+                    json!({})
+                }
+                None => {
+                    store
+                        .hook(&actor, serde_json::from_slice(&bytes)?, now()?)
+                        .await?
+                }
+            }
         }
         Command::Hook { group } => {
             let actor = store.authenticate(&group, cli.session.as_ref()).await?;
@@ -711,10 +636,9 @@ async fn run(cli: Cli) -> Result<()> {
             json!({"event":event,"acknowledged":true,"resolved":false})
         }
         Command::Work(command) => match command {
-            WorkCommand::Decide { group, id, file } => {
+            WorkCommand::Decide { group, id, update } => {
                 let actor = store.authenticate(&group, cli.session.as_ref()).await?;
-                let decision = serde_json::from_str(&read_body(&file)?)?;
-                serde_json::to_value(store.work_decide(&actor, &id, decision, now()?).await?)?
+                serde_json::to_value(store.update_work(&actor, &id, update, now()?).await?)?
             }
             WorkCommand::Create {
                 group,
@@ -757,59 +681,6 @@ async fn run(cli: Cli) -> Result<()> {
                 let next_after = items.last().map(|item| item.id.clone()).unwrap_or(after);
                 json!({"items":items,"more":more,"next_after":next_after})
             }
-            WorkCommand::Update {
-                group,
-                id,
-                version,
-                reason,
-                owner,
-                state,
-                next_action,
-                close,
-                reopen,
-                deadline,
-                clear_deadline,
-                accepted_revision,
-                clear_accepted_revision,
-                evidence,
-                clear_evidence,
-            } => {
-                let actor = store.authenticate(&group, cli.session.as_ref()).await?;
-                let patch = WorkPatch {
-                    owner,
-                    state,
-                    next_action,
-                    open: if close {
-                        Some(false)
-                    } else if reopen {
-                        Some(true)
-                    } else {
-                        None
-                    },
-                    deadline: if clear_deadline {
-                        Some(None)
-                    } else {
-                        deadline.map(Some)
-                    },
-                    accepted_revision: if clear_accepted_revision {
-                        Some(None)
-                    } else {
-                        accepted_revision.map(Some)
-                    },
-                    evidence: if clear_evidence {
-                        Some(Vec::new())
-                    } else if evidence.is_empty() {
-                        None
-                    } else {
-                        Some(evidence)
-                    },
-                };
-                serde_json::to_value(
-                    store
-                        .work_update(&actor, &id, version, patch, &reason, now()?)
-                        .await?,
-                )?
-            }
             WorkCommand::History { group, id } => {
                 let actor = store.authenticate(&group, cli.session.as_ref()).await?;
                 serde_json::to_value(store.work_history(&actor, &id).await?)?
@@ -843,7 +714,7 @@ async fn run(cli: Cli) -> Result<()> {
                 Value::Null
             };
             let (outbox_pending, outbox_oldest) = store.outbox_status().await?;
-            json!({"service_running":service::running(&root),"now":now()?,"groups":store.groups().await?,"inboxes":store.pending().await?,"notifications":store.notification_status().await?,"native":store.native_status().await?,"codex":store.native_status().await?.as_array().context("native status must be an array")?.iter().filter(|endpoint| endpoint["runtime"] == "codex").collect::<Vec<_>>(),"attention":store.attention(now()?).await?,"peers":store.peers_status().await?,"outbox_pending":outbox_pending,"outbox_oldest":outbox_oldest,"last_scan":diagnostics})
+            json!({"service_running":service::running(&root),"now":now()?,"groups":store.groups().await?,"inboxes":store.pending().await?,"notifications":store.notification_status().await?,"runtime_policy":store.runtime_policy_status().await?,"native":store.native_status().await?,"codex":store.native_status().await?.as_array().context("native status must be an array")?.iter().filter(|endpoint| endpoint["runtime"] == "codex").collect::<Vec<_>>(),"attention":store.attention(now()?).await?,"peers":store.peers_status().await?,"outbox_pending":outbox_pending,"outbox_oldest":outbox_oldest,"last_scan":diagnostics})
         }
         Command::Pause { group } => {
             store.pause(&group, true).await?;
@@ -875,8 +746,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::ClaudeBridge { .. }
         | Command::Doctor { .. }
         | Command::Service(_)
-        | Command::Restore
-        | Command::HooksConfig => {
+        | Command::Restore => {
             unreachable!("handled before opening database")
         }
     };

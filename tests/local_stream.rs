@@ -130,15 +130,18 @@ async fn attention_does_not_infer_waiting_or_completion() -> Result<()> {
     assert_eq!(overdue[0]["subject"], "overdue");
     assert_eq!(store.work_show(&writer, "overdue").await?.version, 1);
     store
-        .work_update(
+        .update_work(
             &writer,
             "overdue",
-            1,
-            WorkPatch {
-                open: Some(false),
-                ..Default::default()
+            agent_mail::work::WorkUpdate {
+                version: 1,
+                patch: WorkPatch {
+                    open: Some(false),
+                    ..Default::default()
+                },
+                reason: ("Accepted").to_owned(),
+                resolve_message: None,
             },
-            "Accepted",
             10001,
         )
         .await?;

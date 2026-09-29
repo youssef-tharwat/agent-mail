@@ -12,6 +12,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=migrations/0008_codex_wake.sql");
     println!("cargo:rerun-if-changed=migrations/0009_attention.sql");
     println!("cargo:rerun-if-changed=migrations/0010_native.sql");
+    println!("cargo:rerun-if-changed=migrations/0011_claude_inbox.sql");
+    println!("cargo:rerun-if-changed=migrations/0012_cli_workflows.sql");
     let path = PathBuf::from(env::var("OUT_DIR")?).join("compile-schema.db");
     if path.exists() {
         std::fs::remove_file(&path)?;
@@ -53,6 +55,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .execute(&mut connection)
                 .await?;
             sqlx::raw_sql(include_str!("migrations/0010_native.sql"))
+                .execute(&mut connection)
+                .await?;
+            sqlx::raw_sql(include_str!("migrations/0011_claude_inbox.sql"))
+                .execute(&mut connection)
+                .await?;
+            sqlx::raw_sql(include_str!("migrations/0012_cli_workflows.sql"))
                 .execute(&mut connection)
                 .await?;
             connection.close().await

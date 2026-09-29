@@ -74,10 +74,24 @@ where
     Ok(Some(Option::<T>::deserialize(deserializer)?))
 }
 
+/// A work transition whose retry identity is derived from its expected version.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkUpdate {
+    /// Version observed before deciding the change.
+    pub version: i64,
+    /// Explanation of the authorized change.
+    pub reason: String,
+    /// Fields to change; omitted fields remain unchanged.
+    pub patch: WorkPatch,
+    /// Linked inbox request resolved in the same transaction.
+    pub resolve_message: Option<i64>,
+}
+
 /// One authorized work decision, including the related obligation to resolve.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WorkDecision {
+struct WorkDecision {
     /// Caller-supplied idempotency key; retries must preserve their original content.
     pub key: String,
     /// Record or protocol version used to validate this operation.
@@ -250,6 +264,7 @@ impl Store {
         draft: WorkDraft,
         now: i64,
     ) -> Result<WorkItem> {
+        let canonical = serde_json::to_string(&draft)?;
         let item = WorkItem {
             group_name: actor.group_name.clone(),
             id: draft.id,
@@ -287,6 +302,31 @@ impl Store {
             home == local,
             "work records are writable only on the home machine"
         );
+        if let Some(old) = sqlx::query!(
+            "SELECT actor,canonical,result FROM work_creations WHERE group_name=? AND work_id=?",
+            actor.group_name,
+            item.id
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            ensure!(
+                old.actor == actor.id && old.canonical == canonical,
+                "work ID already created with different content or writer"
+            );
+            return Ok(serde_json::from_str(&old.result)?);
+        }
+        ensure!(
+            sqlx::query!(
+                "SELECT id FROM work_items WHERE group_name=? AND id=?",
+                actor.group_name,
+                item.id
+            )
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_none(),
+            "work ID already exists without creation provenance; inspect it with work show"
+        );
         ensure!(
             sqlx::query!(
                 "SELECT id FROM mailboxes WHERE group_name=? AND name=?",
@@ -305,6 +345,7 @@ impl Store {
         sqlx::query!("INSERT INTO work_changes(group_name,work_id,version,actor,reason,snapshot,changed) VALUES (?,?,?,?,?,?,?)",
             item.group_name, item.id, item.version, actor.name, "created", snapshot, now)
             .execute(&mut *tx).await?;
+        sqlx::query!("INSERT INTO work_creations(group_name,work_id,actor,canonical,result) VALUES(?,?,?,?,?)",actor.group_name,item.id,actor.id,canonical,snapshot).execute(&mut *tx).await?;
         relay::enqueue_snapshot(&mut tx, &item, None, now).await?;
         tx.commit().await?;
         crate::stream::hint(self.root()).await;
@@ -397,47 +438,30 @@ impl Store {
         Ok(rows)
     }
 
-    /// Update work using an expected version and an explicit change reason.
+    /// Apply a retry-safe work update and optional linked-message resolution.
     ///
     /// # Errors
-    /// Authority, version, fields, or reason validation fails, or persistence fails.
-    pub async fn work_update(
+    /// Authority, version, replay content, fields or persistence is invalid.
+    pub async fn update_work(
         &self,
         actor: &Mailbox,
         id: &str,
-        expected: i64,
-        patch: WorkPatch,
-        reason: &str,
+        update: WorkUpdate,
         now: i64,
     ) -> Result<WorkItem> {
         self.apply_work(
             actor,
             id,
             WorkDecision {
-                key: String::new(),
-                version: expected,
-                patch,
-                reason: reason.to_owned(),
-                resolve_message: None,
+                key: format!("update:{id}:{}", update.version),
+                version: update.version,
+                reason: update.reason,
+                patch: update.patch,
+                resolve_message: update.resolve_message,
             },
             now,
         )
         .await
-    }
-
-    /// Atomically apply an idempotent work decision and optional message resolution.
-    ///
-    /// # Errors
-    /// The decision key conflicts, authority or version validation fails, or persistence fails.
-    pub async fn work_decide(
-        &self,
-        actor: &Mailbox,
-        id: &str,
-        decision: WorkDecision,
-        now: i64,
-    ) -> Result<WorkItem> {
-        name(&decision.key)?;
-        self.apply_work(actor, id, decision, now).await
     }
 
     async fn apply_work(
@@ -460,23 +484,6 @@ impl Store {
         ensure!(!reason.trim().is_empty(), "change reason is required");
         let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
-        if !key.is_empty() {
-            if let Some(old) = sqlx::query!(
-                "SELECT canonical,result FROM work_decisions WHERE actor=? AND key=?",
-                actor.id,
-                key
-            )
-            .fetch_optional(&mut *tx)
-            .await?
-            {
-                ensure!(
-                    old.canonical == canonical,
-                    "decision key reused with different content"
-                );
-                return Ok(serde_json::from_str(&old.result)?);
-            }
-        }
-
         let home = sqlx::query!(
             "SELECT home_machine FROM groups WHERE name=?",
             actor.group_name
@@ -502,6 +509,23 @@ impl Store {
             item.writer == actor.name,
             "only the designated writer may update this work item"
         );
+        if !key.is_empty() {
+            if let Some(old) = sqlx::query!(
+                "SELECT canonical,result FROM work_decisions WHERE actor=? AND key=?",
+                actor.id,
+                key
+            )
+            .fetch_optional(&mut *tx)
+            .await?
+            {
+                ensure!(
+                    old.canonical == canonical,
+                    "decision key reused with different content"
+                );
+                return Ok(serde_json::from_str(&old.result)?);
+            }
+        }
+
         ensure!(
             item.version == expected,
             "work version conflict; read current record before retrying"

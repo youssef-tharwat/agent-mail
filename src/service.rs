@@ -229,7 +229,7 @@ pub async fn tick(store: &Store, time: i64) -> Result<Vec<Observation>> {
             if store.has_native(&mailbox).await? {
                 continue;
             }
-            let state = if item.due <= time {
+            let state = if item.due.is_some_and(|due| due <= time) {
                 "overdue; standalone availability unknown; check context"
             } else {
                 "standalone availability unknown; delivery requires client hooks or an explicit adapter"

@@ -51,6 +51,10 @@ enum State {
     Unavailable,
 }
 enum Peer {
+    ClaudeInbox {
+        socket: PathBuf,
+        endpoint: crate::claude_inbox::Endpoint,
+    },
     Codex {
         client: Box<crate::codex::Client>,
         thread: Uuid,
@@ -77,6 +81,13 @@ impl Peer {
     }
     async fn state(&mut self) -> Result<State> {
         Ok(match self {
+            Self::ClaudeInbox { endpoint, .. } => {
+                if endpoint.activity == "active" {
+                    State::Active
+                } else {
+                    State::Idle
+                }
+            }
             Self::Codex { client, thread, .. } => match client.thread(*thread).await?.status {
                 crate::codex::ThreadStatus::Idle => State::Idle,
                 crate::codex::ThreadStatus::Active => State::Active,
@@ -147,6 +158,10 @@ impl Peer {
                 }
                 Ok(())
             }
+            Self::ClaudeInbox { socket, endpoint } => {
+                crate::claude_inbox::send(socket, thread, &endpoint.token, &message_id, active)
+                    .await
+            }
             Self::Claude { socket, status } => {
                 ensure!(status.active == active, "Claude state changed");
                 crate::claude::deliver(socket, thread, status, text).await
@@ -209,47 +224,71 @@ impl Store {
         let thread = thread.to_string();
         let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
+        sqlx::query!("INSERT INTO runtime_policy(recipient,binding_version,enabled) VALUES(?,?,1) ON CONFLICT(recipient) DO UPDATE SET binding_version=excluded.binding_version,enabled=1",actor.id,actor.binding_version).execute(&mut *tx).await?;
         // Repeating identical attachment preserves its cursor and retry budget.
         sqlx::query!("INSERT INTO runtime_wakes(recipient,binding_version,socket,thread,runtime) VALUES (?,?,?,?,?) ON CONFLICT(recipient) DO UPDATE SET binding_version=excluded.binding_version,socket=excluded.socket,thread=excluded.thread,runtime=excluded.runtime,scanned=0,delivered=0,attempted=0,attempts=0,next_attempt=0 WHERE runtime_wakes.binding_version<>excluded.binding_version OR runtime_wakes.socket<>excluded.socket OR runtime_wakes.thread<>excluded.thread OR runtime_wakes.runtime<>excluded.runtime",
             actor.id, actor.binding_version, socket, thread, runtime).execute(&mut *tx).await?;
+        sqlx::query!("DELETE FROM claude_inboxes WHERE recipient=?", actor.id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
-    /// Disable Codex wake delivery while preserving mail and work.
+    /// Persist an operator's delivery preference for the current binding.
     ///
     /// # Errors
-    /// The actor is stale or the database transaction fails.
-    pub async fn detach_codex(&self, actor: &Mailbox) -> Result<()> {
-        self.detach_native(actor, Kind::Codex).await
-    }
-    /// Disable Claude wake delivery while preserving mail and work.
-    ///
-    /// # Errors
-    /// The actor is stale or the database transaction fails.
-    pub async fn detach_claude(&self, actor: &Mailbox) -> Result<()> {
-        self.detach_native(actor, Kind::Claude).await
-    }
-    async fn detach_native(&self, actor: &Mailbox, kind: Kind) -> Result<()> {
-        let runtime = kind.as_str();
+    /// The actor is stale or storage fails.
+    pub async fn set_runtime_enabled(&self, actor: &Mailbox, enabled: bool) -> Result<()> {
+        ensure!(
+            matches!(actor.binding, Binding::Standalone { .. }),
+            "native delivery controls require a standalone participant; use runtime pause for Herdr group delivery"
+        );
         let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
-        sqlx::query!(
-            "DELETE FROM runtime_wakes WHERE recipient=? AND runtime=?",
-            actor.id,
-            runtime
-        )
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query!("INSERT INTO runtime_policy(recipient,binding_version,enabled) VALUES(?,?,?) ON CONFLICT(recipient) DO UPDATE SET binding_version=excluded.binding_version,enabled=excluded.enabled",actor.id,actor.binding_version,enabled).execute(&mut *tx).await?;
+        if !enabled {
+            sqlx::query!("DELETE FROM runtime_wakes WHERE recipient=?", actor.id)
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         Ok(())
+    }
+    /// Whether automatic native attachment and delivery are permitted.
+    ///
+    /// # Errors
+    /// Reading the persisted preference fails.
+    pub async fn runtime_enabled(&self, actor: &Mailbox) -> Result<bool> {
+        Ok(sqlx::query!(
+            "SELECT enabled FROM runtime_policy WHERE recipient=? AND binding_version=?",
+            actor.id,
+            actor.binding_version
+        )
+        .fetch_optional(self.pool())
+        .await?
+        .is_none_or(|r| r.enabled != 0))
+    }
+    /// Report explicit delivery preferences without exposing credentials.
+    ///
+    /// # Errors
+    /// Querying current binding preferences fails.
+    pub async fn runtime_policy_status(&self) -> Result<Value> {
+        let rows=sqlx::query!("SELECT b.group_name,b.name,p.enabled FROM runtime_policy p JOIN mailboxes b ON b.id=p.recipient AND b.binding_version=p.binding_version ORDER BY b.group_name,b.name").fetch_all(self.pool()).await?;
+        Ok(Value::Array(
+            rows.into_iter()
+                .map(
+                    |r| json!({"group":r.group_name,"participant":r.name,"enabled":r.enabled != 0}),
+                )
+                .collect(),
+        ))
     }
     /// Report configured native endpoints and their durable retry budgets.
     ///
     /// # Errors
     /// The database query fails.
     pub async fn native_status(&self) -> Result<Value> {
-        let rows = sqlx::query!("SELECT m.group_name,m.name,c.runtime,c.binding_version,m.binding_version AS current_version,c.socket,c.thread,c.delivered,c.attempted,c.attempts,c.next_attempt FROM runtime_wakes c JOIN mailboxes m ON m.id=c.recipient").fetch_all(self.pool()).await?;
-        Ok(Value::Array(rows.into_iter().map(|r| json!({"group":r.group_name,"participant":r.name,"runtime":r.runtime,"socket":r.socket,"thread":r.thread,"binding_current":r.binding_version==r.current_version,"delivered_through":r.delivered,"attempted_through":r.attempted,"attempts":r.attempts,"next_attempt":r.next_attempt})).collect()))
+        let rows = sqlx::query!("SELECT m.group_name,m.name,c.runtime,c.binding_version,m.binding_version AS current_version,c.socket,c.thread,c.delivered,c.attempted,c.attempts,c.next_attempt,i.activity AS inbox_activity FROM runtime_wakes c JOIN mailboxes m ON m.id=c.recipient LEFT JOIN claude_inboxes i ON i.recipient=c.recipient").fetch_all(self.pool()).await?;
+        Ok(Value::Array(rows.into_iter().map(|r| json!({"group":r.group_name,"participant":r.name,"runtime":r.runtime,"transport":if r.inbox_activity.is_some(){"inbox"}else{"native"},"activity":r.inbox_activity,"socket":r.socket,"thread":r.thread,"binding_current":r.binding_version==r.current_version,"delivered_through":r.delivered,"attempted_through":r.attempted,"attempts":r.attempts,"next_attempt":r.next_attempt})).collect()))
     }
     pub(crate) async fn has_native(&self, actor: &Mailbox) -> Result<bool> {
         Ok(sqlx::query!(
@@ -314,7 +353,21 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<&'static s
     }
     let thread = Uuid::parse_str(&endpoint.thread)?;
     let kind = Kind::parse(&endpoint.runtime)?;
-    let mut peer = Peer::connect(kind, Path::new(&endpoint.socket), thread).await?;
+    let mut peer = if let Some(inbox) = store.claude_inbox(actor).await? {
+        crate::claude_inbox::verify(store, Path::new(&endpoint.socket), &inbox)?;
+        Peer::ClaudeInbox {
+            socket: endpoint.socket.clone().into(),
+            endpoint: inbox,
+        }
+    } else {
+        Peer::connect(kind, Path::new(&endpoint.socket), thread).await?
+    };
+    let inbox = matches!(peer, Peer::ClaudeInbox { .. });
+    let message_id = if inbox {
+        Uuid::new_v4().to_string()
+    } else {
+        format!("agent-mail-{}-{}-{latest}", actor.id, actor.binding_version)
+    };
     let active = match peer.state().await? {
         State::Active if cancellation => true,
         State::Idle if actionable => false,
@@ -331,6 +384,16 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<&'static s
     Store::lock_actor(&mut tx, actor).await?;
     let next = time + 300;
     let reserved = sqlx::query!("UPDATE runtime_wakes SET attempts=CASE WHEN attempted=? THEN attempts+1 ELSE 1 END, attempted=?,next_attempt=? WHERE recipient=? AND binding_version=? AND socket=? AND thread=? AND scanned<? AND (attempted<>? OR next_attempt<=?) AND (attempted<>? OR attempts<3) AND EXISTS(SELECT 1 FROM groups WHERE name=? AND paused=0)",latest,latest,next,actor.id,actor.binding_version,endpoint.socket,endpoint.thread,latest,latest,time,latest,actor.group_name).execute(&mut *tx).await?.rows_affected();
+    if reserved != 0 && inbox {
+        sqlx::query!(
+            "UPDATE claude_inboxes SET pending_id=?,pending_event=? WHERE recipient=?",
+            message_id,
+            latest,
+            actor.id
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await?;
     if reserved == 0 {
         return Ok("Runtime reservation no longer eligible");
@@ -340,13 +403,14 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<&'static s
     Store::lock_actor(&mut tx, actor).await?;
     let still_attached = sqlx::query!("SELECT recipient FROM runtime_wakes WHERE recipient=? AND binding_version=? AND socket=? AND thread=? AND EXISTS(SELECT 1 FROM groups WHERE name=? AND paused=0) AND NOT EXISTS(SELECT 1 FROM coordination_events WHERE recipient=? AND id>?)",actor.id,actor.binding_version,endpoint.socket,endpoint.thread,actor.group_name,actor.id,latest).fetch_optional(&mut *tx).await?.is_some();
     ensure!(still_attached, "Runtime endpoint changed before delivery");
-    peer.send(
-        thread,
-        text,
-        active,
-        format!("agent-mail-{}-{}-{latest}", actor.id, actor.binding_version),
-    )
-    .await?;
+    if let Peer::ClaudeInbox { socket, endpoint } = &peer {
+        crate::claude_inbox::verify(store, socket, endpoint)?;
+    }
+    peer.send(thread, text, active, message_id).await?;
+    if inbox {
+        tx.commit().await?;
+        return Ok("Claude inbox write submitted; awaiting automatic hook receipt");
+    }
     sqlx::query!(
         "UPDATE runtime_wakes SET delivered=?,scanned=?,attempts=0,next_attempt=0 WHERE recipient=?",
         latest,

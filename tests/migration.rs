@@ -42,7 +42,7 @@ async fn existing_version_four_state_upgrades_to_opt_in_sync() -> Result<()> {
     let version = sqlx::query!("PRAGMA user_version")
         .fetch_one(&support::pool(&store).await?)
         .await?;
-    assert_eq!(version.user_version, Some(10));
+    assert_eq!(version.user_version, Some(12));
     let peer = uuid::Uuid::new_v4();
     store.add_peer(peer, "test-host").await?;
     assert!(!store.peers_status().await?[0].auto_sync);
@@ -182,8 +182,8 @@ async fn invalid_legacy_references_abort_the_migration_atomically() -> Result<()
 }
 
 #[tokio::test]
-async fn published_six_eight_and_nine_upgrade_with_binding_and_receipts_intact() -> Result<()> {
-    for version in [6, 8, 9] {
+async fn published_six_eight_nine_and_ten_upgrade_with_binding_and_receipts_intact() -> Result<()> {
+    for version in [6, 8, 9, 10] {
         let temp = tempfile::tempdir()?;
         let root = temp.path().join("state");
         let migrations = temp.path().join("migrations");
@@ -215,7 +215,9 @@ async fn published_six_eight_and_nine_upgrade_with_binding_and_receipts_intact()
           INSERT INTO mailboxes(id,group_name,name,binding) VALUES (1,'g','owner','{"runtime":"standalone","session":"00000000-0000-4000-8000-000000000002"}');
           INSERT INTO work_items(group_name,id,scope,owner,writer,state,next_action,updated) VALUES ('g','task','Review','owner','owner','custom','Review',100);
         "#).execute(&pool).await?;
-        if version >= 8 {
+        if version == 10 {
+            sqlx::raw_sql("INSERT INTO runtime_wakes(recipient,binding_version,socket,thread,delivered,attempts,next_attempt) VALUES(1,1,'/tmp/test.sock','00000000-0000-4000-8000-000000000003',1,2,400);").execute(&pool).await?;
+        } else if version >= 8 {
             sqlx::raw_sql("INSERT INTO codex_wakes(recipient,binding_version,socket,thread,delivered,attempts,next_attempt) VALUES(1,1,'/tmp/test.sock','00000000-0000-4000-8000-000000000003',1,2,400);").execute(&pool).await?;
         }
         pool.close().await;

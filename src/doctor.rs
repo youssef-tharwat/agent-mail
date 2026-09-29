@@ -74,7 +74,7 @@ pub async fn inspect(
             "database",
             Level::Fail,
             "Mail database is missing",
-            Some("Run agent-mail setup with this state directory"),
+            Some("Run agent-mail init GROUP with this state directory"),
         );
         return report;
     }
@@ -85,7 +85,7 @@ pub async fn inspect(
                 "database",
                 Level::Fail,
                 "Database cannot be opened with the current schema",
-                Some("Stop the worker, back up state, and run agent-mail setup to migrate"),
+                Some("Stop the worker, back up state, and run agent-mail init GROUP to migrate"),
             );
             return report;
         }
@@ -103,7 +103,7 @@ pub async fn inspect(
                 "group",
                 Level::Fail,
                 "Group is not configured",
-                Some("Run agent-mail setup --group GROUP"),
+                Some("Run agent-mail init GROUP"),
             );
             return report;
         }
@@ -177,17 +177,32 @@ pub async fn inspect(
             Some("Attach the current participant to its intended runtime session"),
         ),
         Ok(Some(e)) => {
-            let probe = match Uuid::parse_str(&e.thread) {
-                Ok(thread) => match crate::native::Kind::parse(&e.runtime) {
-                    Ok(kind) => crate::native::probe(kind, Path::new(&e.socket), thread).await,
-                    Err(error) => Err(error),
+            let inbox = store.claude_inbox(&actor).await;
+            let probe = match inbox {
+                Ok(Some(inbox)) => {
+                    crate::claude_inbox::verify(&store, Path::new(&e.socket), &inbox).map(|()| {
+                        json!({
+                            "transport": "claude_inbox",
+                            "receipt": "UserPromptSubmit hook",
+                            "state": inbox.activity,
+                            "socket_identity_verified": true,
+                            "runtime_acceptance": "confirmed only after a matching delivery hook"
+                        })
+                    })
+                }
+                Err(error) => Err(error),
+                Ok(None) => match Uuid::parse_str(&e.thread) {
+                    Ok(thread) => match crate::native::Kind::parse(&e.runtime) {
+                        Ok(kind) => crate::native::probe(kind, Path::new(&e.socket), thread).await,
+                        Err(error) => Err(error),
+                    },
+                    Err(e) => Err(e.into()),
                 },
-                Err(e) => Err(e.into()),
             };
             match probe {
                 Ok(info) if info["state"] == "not_loaded" || info["state"] == "system_error" => report.add(
                     "endpoint", Level::Fail, info,
-                    Some("Open or resume the intended thread in its Native client, then rerun doctor"),
+                    Some("Open or resume the intended thread in its Native client, then rerun status --check"),
                 ),
                 Ok(info) => report.add("endpoint", Level::Pass, info, None),
                 Err(_) => report.add(

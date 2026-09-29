@@ -3,7 +3,7 @@ name = "agent-mail"
 version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Durable mail and work records for coding agents"
+description = "Durable tasks and messages for coding agents"
 repository = "https://github.com/youssef-tharwat/agent-mail"
 authors = ["Youssef Tharwat"]
 license = "MIT"
@@ -21,13 +21,12 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "signal", "process", "sync"] }
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+tempfile = "3"
+time = { version = "0.3", features = ["parsing"] }
 
 [build-dependencies]
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tokio = { version = "1", features = ["rt"] }
-
-[dev-dependencies]
-tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"

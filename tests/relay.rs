@@ -97,7 +97,7 @@ fn message(to: &str, key: &str, work_id: Option<&str>) -> Publish {
         key: key.into(),
         summary: "A bounded request".into(),
         body: "See revision abc123".into(),
-        due_after: 900,
+        due_after: Some(900),
         reply_to: None,
         work_id: work_id.map(str::to_owned),
     }
@@ -322,6 +322,7 @@ async fn bridge_commands_exchange_json_across_processes() -> Result<()> {
         .args([
             "--state-dir",
             home.store.root().to_str().unwrap(),
+            "adapter",
             "bridge",
             "export",
         ])
@@ -342,6 +343,7 @@ async fn bridge_commands_exchange_json_across_processes() -> Result<()> {
         .args([
             "--state-dir",
             remote.store.root().to_str().unwrap(),
+            "adapter",
             "bridge",
             "exchange",
             "--source",
@@ -393,7 +395,7 @@ async fn explicit_sync_uses_ssh_stdio_and_clears_both_outboxes() -> Result<()> {
         .publish(&coordinator, message("worker", "ssh-request", None), 1000)
         .await?;
     let output = fake_ssh
-        .command(&home, &["sync", "--peer", &remote_id])
+        .command(&home, &["remote", "sync", &remote_id])
         .output()
         .await?;
     assert!(
@@ -416,7 +418,7 @@ async fn explicit_sync_uses_ssh_stdio_and_clears_both_outboxes() -> Result<()> {
         )
         .await?;
     let output = fake_ssh
-        .command(&home, &["sync", "--peer", &remote_id])
+        .command(&home, &["remote", "sync", &remote_id])
         .output()
         .await?;
     assert!(
@@ -464,7 +466,7 @@ async fn worker_sync_requires_opt_in_and_target_change_revokes_it() -> Result<()
     assert!(!home.store.peers_status().await?[0].auto_sync);
 
     let output = fake_ssh
-        .command(&home, &["auto-sync", "--peer", &remote_id_text, "--enable"])
+        .command(&home, &["remote", "auto-sync", &remote_id_text, "enable"])
         .output()
         .await?;
     assert!(
@@ -516,10 +518,7 @@ async fn worker_sync_requires_opt_in_and_target_change_revokes_it() -> Result<()
     assert_eq!(home.store.inbox(&coordinator, 0).await?.len(), 1);
     assert_eq!(remote.store.outbox_status().await?.0, 0);
     let output = fake_ssh
-        .command(
-            &home,
-            &["auto-sync", "--peer", &remote_id_text, "--disable"],
-        )
+        .command(&home, &["remote", "auto-sync", &remote_id_text, "disable"])
         .output()
         .await?;
     assert!(

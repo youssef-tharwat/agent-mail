@@ -90,15 +90,18 @@ async fn claude_uses_shared_delivery_recovery_cancellation_and_retry_rules() -> 
     assert_eq!(delivered.load(Ordering::SeqCst), 1);
     active.store(true, Ordering::SeqCst);
     store
-        .work_update(
+        .update_work(
             &writer,
             "task",
-            1,
-            WorkPatch {
-                open: Some(false),
-                ..Default::default()
+            agent_mail::work::WorkUpdate {
+                version: 1,
+                patch: WorkPatch {
+                    open: Some(false),
+                    ..Default::default()
+                },
+                reason: ("Cancel").to_owned(),
+                resolve_message: None,
             },
-            "Cancel",
             1101,
         )
         .await?;
@@ -107,15 +110,18 @@ async fn claude_uses_shared_delivery_recovery_cancellation_and_retry_rules() -> 
     active.store(false, Ordering::SeqCst);
     lose.store(true, Ordering::SeqCst);
     store
-        .work_update(
+        .update_work(
             &writer,
             "task",
-            2,
-            WorkPatch {
-                open: Some(true),
-                ..Default::default()
+            agent_mail::work::WorkUpdate {
+                version: 2,
+                patch: WorkPatch {
+                    open: Some(true),
+                    ..Default::default()
+                },
+                reason: ("Reopen").to_owned(),
+                resolve_message: None,
             },
-            "Reopen",
             1200,
         )
         .await?;

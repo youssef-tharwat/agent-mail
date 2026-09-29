@@ -165,7 +165,7 @@ pub struct Publish {
     /// Full UTF-8 message body, subject to the message byte limit.
     pub body: String,
     /// Number of seconds after publication until the message becomes overdue.
-    pub due_after: i64,
+    pub due_after: Option<i64>,
     /// Optional identifier of the message being answered.
     pub reply_to: Option<i64>,
     /// Optional work identifier associated with this message.
@@ -193,7 +193,8 @@ impl Publish {
         ensure!(!self.summary.trim().is_empty(), "summary is required");
         bounded(&self.body, BODY_LIMIT, "body")?;
         ensure!(
-            (1..=31_536_000).contains(&self.due_after),
+            self.due_after
+                .is_none_or(|seconds| (1..=31_536_000).contains(&seconds)),
             "due-after must be 1–31536000 seconds"
         );
         if let Some(work_id) = &self.work_id {
@@ -215,7 +216,7 @@ pub struct InboxItem {
     /// Creation timestamp in Unix seconds.
     pub created: i64,
     /// Deadline timestamp in Unix seconds.
-    pub due: i64,
+    pub due: Option<i64>,
     /// Optional work identifier associated with this message.
     pub work_id: Option<String>,
 }
@@ -234,7 +235,7 @@ pub struct Message {
     /// Creation timestamp in Unix seconds.
     pub created: i64,
     /// Deadline timestamp in Unix seconds.
-    pub due: i64,
+    pub due: Option<i64>,
     /// Stored business state; it does not imply transport delivery.
     pub state: String,
     /// Identifier of the reply created while resolving this delivery, if any.
@@ -257,7 +258,7 @@ pub struct Pending {
     /// Earliest queued creation timestamp in Unix seconds, when available.
     pub oldest: i64,
     /// Deadline timestamp in Unix seconds.
-    pub due: i64,
+    pub due: Option<i64>,
     /// Persisted delivery attempt count for the current retry budget.
     pub attempts: i64,
     /// Earliest next reminder attempt, in Unix seconds.
@@ -281,7 +282,10 @@ impl Store {
             std::fs::create_dir_all(root)?;
             std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
         }
-        ensure!(root.is_dir(), "state directory missing; run setup first");
+        ensure!(
+            root.is_dir(),
+            "state directory missing; run agent-mail init GROUP first"
+        );
         let guard = DatabaseGuard::acquire(root, setup)?;
         let path = root.join("mail.db");
         if setup && !path.exists() {
@@ -293,7 +297,7 @@ impl Store {
         }
         ensure!(
             path.is_file(),
-            "database missing; run setup explicitly to create it"
+            "database missing; run agent-mail init GROUP explicitly to create it"
         );
         let options = SqliteConnectOptions::new()
             .filename(&path)
@@ -311,7 +315,7 @@ impl Store {
             .await?
             .user_version
             .context("SQLite did not report its schema version")?;
-        ensure!(version <= 10, "database schema is newer than this binary");
+        ensure!(version <= 12, "database schema is newer than this binary");
         if setup {
             // Rebuilding a referenced table requires FK enforcement off outside
             // the migration transaction. The migration checks every FK before commit.
@@ -348,8 +352,8 @@ impl Store {
             .await?;
         } else {
             ensure!(
-                version == 10,
-                "database schema needs initialization or migration; run setup"
+                version == 12,
+                "database schema needs initialization or migration; run agent-mail init GROUP"
             );
         }
         Ok(Self {
@@ -392,7 +396,7 @@ impl Store {
         .fetch_optional(self.pool())
         .await?
         .map(Group::from)
-        .context("group not enrolled; run setup --group NAME")
+        .context("group not enrolled; run agent-mail init NAME")
     }
 
     /// List enrolled groups in name order.
@@ -574,7 +578,7 @@ impl Store {
             );
             ensure!(
                 old.binding.same_identity(binding) || replace,
-                "binding changed; use --replace after confirming the intended participant"
+                "participant already exists with a different binding; use participant replace NAME for standalone identity or participant bind NAME --replace for Herdr"
             );
             if old.binding != *binding {
                 sqlx::query!(
@@ -686,12 +690,14 @@ impl Store {
             .with_context(|| format!("unknown recipient: {recipient}"))?;
             recipient_ids.push(record.id);
         }
-        let due = now
-            .checked_add(publish.due_after)
-            .context("deadline overflow")?;
+        let due = publish
+            .due_after
+            .map(|seconds| now.checked_add(seconds).context("deadline overflow"))
+            .transpose()?;
+        let legacy_due = due.unwrap_or(now);
         let global_id = uuid::Uuid::new_v4().to_string();
-        let result = sqlx::query!("INSERT INTO messages(sender,dedup_key,canonical,summary,body,created,due,reply_to,work_id,global_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            actor.id, publish.key, canonical, publish.summary, publish.body, now, due, publish.reply_to, publish.work_id, global_id).execute(&mut **tx).await?;
+        let result = sqlx::query!("INSERT INTO messages(sender,dedup_key,canonical,summary,body,created,due,reply_to,work_id,global_id,deadline) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            actor.id, publish.key, canonical, publish.summary, publish.body, now, legacy_due, publish.reply_to, publish.work_id, global_id, due).execute(&mut **tx).await?;
         let id = result.last_insert_rowid();
         for recipient in recipient_ids {
             sqlx::query!(
@@ -727,7 +733,7 @@ impl Store {
         let mut tx = self.pool().begin().await?;
         Self::check_actor(&mut tx, actor).await?;
         let items = sqlx::query_as!(InboxItem,
-            "SELECT m.id, b.name AS sender, m.summary, m.created, m.due, m.work_id FROM deliveries d JOIN messages m ON m.id=d.message JOIN mailboxes b ON b.id=m.sender WHERE d.recipient=? AND d.state='pending' AND m.id>? ORDER BY m.id LIMIT 6",
+            "SELECT m.id, b.name AS sender, m.summary, m.created, m.deadline AS due, m.work_id FROM deliveries d JOIN messages m ON m.id=d.message JOIN mailboxes b ON b.id=m.sender WHERE d.recipient=? AND d.state='pending' AND m.id>? ORDER BY m.id LIMIT 6",
             actor.id, after).fetch_all(&mut *tx).await?;
         tx.commit().await?;
         Ok(items)
@@ -741,7 +747,7 @@ impl Store {
         let mut tx = self.pool().begin().await?;
         Self::check_actor(&mut tx, actor).await?;
         let item = sqlx::query_as!(Message,
-            "SELECT m.id,b.name AS sender,m.summary,m.body,m.created,m.due,d.state,d.reply_id,m.work_id FROM messages m JOIN deliveries d ON d.message=m.id JOIN mailboxes b ON b.id=m.sender WHERE m.id=? AND d.recipient=?",
+            "SELECT m.id,b.name AS sender,m.summary,m.body,m.created,m.deadline AS due,d.state,d.reply_id,m.work_id FROM messages m JOIN deliveries d ON d.message=m.id JOIN mailboxes b ON b.id=m.sender WHERE m.id=? AND d.recipient=?",
             id, actor.id).fetch_optional(&mut *tx).await?.context("message is not in this inbox")?;
         tx.commit().await?;
         Ok(item)
@@ -812,7 +818,7 @@ impl Store {
                 key,
                 summary,
                 body,
-                due_after: 900,
+                due_after: None,
                 reply_to: Some(id),
                 work_id: sender.work_id,
             };
@@ -907,7 +913,7 @@ impl Store {
     /// The database query fails.
     pub async fn pending(&self) -> Result<Vec<Pending>> {
         Ok(sqlx::query_as!(Pending,
-            "SELECT b.id AS 'id!: i64',b.group_name AS 'group_name!: String',b.name AS 'name!: String',COUNT(*) AS 'pending!: i64',MIN(m.created) AS 'oldest!: i64',MIN(m.due) AS 'due!: i64',b.attempts AS 'attempts!: i64',b.next_wake AS 'next_wake!: i64',b.alerted AS 'alerted!: i64' FROM mailboxes b JOIN (SELECT d.recipient,m.created,m.due FROM deliveries d JOIN messages m ON m.id=d.message WHERE d.state='pending' UNION ALL SELECT recipient,created,created+900 AS due FROM pending_work_events) m ON m.recipient=b.id WHERE b.remote_machine IS NULL GROUP BY b.id ORDER BY b.group_name,b.id")
+            "SELECT b.id AS 'id!: i64',b.group_name AS 'group_name!: String',b.name AS 'name!: String',COUNT(*) AS 'pending!: i64',MIN(m.created) AS 'oldest!: i64',MIN(m.due) AS 'due?: i64',b.attempts AS 'attempts!: i64',b.next_wake AS 'next_wake!: i64',b.alerted AS 'alerted!: i64' FROM mailboxes b JOIN (SELECT d.recipient,m.created,m.deadline AS due FROM deliveries d JOIN messages m ON m.id=d.message WHERE d.state='pending' UNION ALL SELECT recipient,created,created+900 AS due FROM pending_work_events) m ON m.recipient=b.id WHERE b.remote_machine IS NULL GROUP BY b.id ORDER BY b.group_name,b.id")
             .fetch_all(self.pool()).await?)
     }
 
@@ -927,7 +933,7 @@ impl Store {
     /// # Errors
     /// The database update fails; an already reserved or ineligible alert returns false.
     pub async fn reserve_alert(&self, id: i64, now: i64) -> Result<bool> {
-        let result = sqlx::query!("UPDATE mailboxes SET alerted=1 WHERE id=? AND alerted=0 AND (EXISTS(SELECT 1 FROM deliveries d JOIN messages m ON m.id=d.message WHERE d.recipient=mailboxes.id AND d.state='pending' AND (m.due<=? OR mailboxes.attempts>=3)) OR EXISTS(SELECT 1 FROM pending_work_events WHERE recipient=mailboxes.id AND (created+900<=? OR mailboxes.attempts>=3)))", id, now, now).execute(self.pool()).await?;
+        let result = sqlx::query!("UPDATE mailboxes SET alerted=1 WHERE id=? AND alerted=0 AND (EXISTS(SELECT 1 FROM deliveries d JOIN messages m ON m.id=d.message WHERE d.recipient=mailboxes.id AND d.state='pending' AND (m.deadline<=? OR mailboxes.attempts>=3)) OR EXISTS(SELECT 1 FROM pending_work_events WHERE recipient=mailboxes.id AND (created+900<=? OR mailboxes.attempts>=3)))", id, now, now).execute(self.pool()).await?;
         Ok(result.rows_affected() == 1)
     }
 

@@ -162,6 +162,8 @@ impl Fixture {
             .env("HERDR_PANE_ID", pane)
             .env("HERDR_SOCKET_PATH", &self.socket)
             .env_remove("HERDR_PLUGIN_ID")
+            .env_remove("AGENT_MAIL_GROUP")
+            .env_remove("AGENT_MAIL_GROUP")
             .env_remove("AGENT_MAIL_SESSION");
         if let Some(session) = session {
             command.env("AGENT_MAIL_SESSION", session);
@@ -176,7 +178,7 @@ fn message(key: &str) -> Publish {
         key: key.into(),
         summary: "Inspect the contract".into(),
         body: "Durable body".into(),
-        due_after: 900,
+        due_after: Some(900),
         reply_to: None,
         work_id: None,
     }
@@ -405,15 +407,14 @@ async fn cli_roundtrip_bounds_identity_and_restart() -> Result<()> {
         .cli(
             "w1:p1",
             &[
+                "mail",
                 "send",
+                "b",
+                "Check report",
                 "--group",
                 "g",
-                "--to",
-                "b",
                 "--key",
                 "cli",
-                "--summary",
-                "Check report",
             ],
         )
         .await?;
@@ -423,14 +424,16 @@ async fn cli_roundtrip_bounds_identity_and_restart() -> Result<()> {
         String::from_utf8_lossy(&sent.stderr)
     );
     let id = serde_json::from_slice::<Value>(&sent.stdout)?["id"].to_string();
-    let inbox = f.cli("w1:p2", &["inbox", "--group", "g"]).await?;
+    let inbox = f.cli("w1:p2", &["mail", "list", "--group", "g"]).await?;
     assert!(
         inbox.status.success(),
         "{}",
         String::from_utf8_lossy(&inbox.stderr)
     );
     assert!(inbox.stdout.len() <= 2048);
-    let full = f.cli("w1:p2", &["inbox", "--group", "g", &id]).await?;
+    let full = f
+        .cli("w1:p2", &["mail", "show", "--group", "g", &id])
+        .await?;
     assert!(
         full.status.success(),
         "{}",
@@ -440,7 +443,12 @@ async fn cli_roundtrip_bounds_identity_and_restart() -> Result<()> {
         serde_json::from_slice::<Value>(&full.stdout)?["summary"],
         "Check report"
     );
-    let done = f.cli("w1:p2", &["resolve", "--group", "g", &id]).await?;
+    let done = f
+        .cli(
+            "w1:p2",
+            &["mail", "resolve", "--group", "g", &id, "--note", "handled"],
+        )
+        .await?;
     assert!(
         done.status.success(),
         "{}",
@@ -450,20 +458,19 @@ async fn cli_roundtrip_bounds_identity_and_restart() -> Result<()> {
         .cli(
             "w1:p1",
             &[
+                "mail",
                 "send",
+                "b",
+                "Check report",
                 "--group",
                 "g",
-                "--to",
-                "b",
                 "--key",
                 "cli",
-                "--summary",
-                "Check report",
             ],
         )
         .await?;
     assert_eq!(sent.stdout, replay.stdout);
-    let empty = f.cli("w1:p2", &["inbox", "--group", "g"]).await?;
+    let empty = f.cli("w1:p2", &["mail", "list", "--group", "g"]).await?;
     assert_eq!(
         serde_json::from_slice::<Value>(&empty.stdout)?["items"],
         json!([])
@@ -474,7 +481,7 @@ async fn cli_roundtrip_bounds_identity_and_restart() -> Result<()> {
         .unwrap()
         .value = "different".into();
     assert!(
-        !f.cli("w1:p2", &["inbox", "--group", "g"])
+        !f.cli("w1:p2", &["mail", "list", "--group", "g"])
             .await?
             .status
             .success()
@@ -545,12 +552,15 @@ async fn work_writer_versions_and_mail_links_survive_restart() -> Result<()> {
     assert_eq!(item.version, 1);
     assert!(
         f.store
-            .work_update(
+            .update_work(
                 &f.b,
                 "lane-api",
-                1,
-                WorkPatch::default(),
-                "not writer",
+                agent_mail::work::WorkUpdate {
+                    version: 1,
+                    patch: WorkPatch::default(),
+                    reason: ("not writer").to_owned(),
+                    resolve_message: None
+                },
                 1001
             )
             .await
@@ -558,23 +568,36 @@ async fn work_writer_versions_and_mail_links_survive_restart() -> Result<()> {
     );
     let update = f
         .store
-        .work_update(
+        .update_work(
             &f.a,
             "lane-api",
-            1,
-            WorkPatch {
-                state: Some("review".into()),
-                next_action: Some("Review commit abc".into()),
-                ..WorkPatch::default()
+            agent_mail::work::WorkUpdate {
+                version: 1,
+                patch: WorkPatch {
+                    state: Some("review".into()),
+                    next_action: Some("Review commit abc".into()),
+                    ..WorkPatch::default()
+                },
+                reason: ("implementation submitted").to_owned(),
+                resolve_message: None,
             },
-            "implementation submitted",
             1002,
         )
         .await?;
     assert_eq!(update.version, 2);
     assert!(
         f.store
-            .work_update(&f.a, "lane-api", 1, WorkPatch::default(), "stale", 1003)
+            .update_work(
+                &f.a,
+                "lane-api",
+                agent_mail::work::WorkUpdate {
+                    version: 1,
+                    patch: WorkPatch::default(),
+                    reason: ("stale").to_owned(),
+                    resolve_message: None
+                },
+                1003
+            )
             .await
             .is_err()
     );

@@ -96,3 +96,6 @@ pub mod doctor;
 pub mod claude;
 
 pub mod native;
+
+/// Native Claude inbox registration and automatic hook receipts.
+pub mod claude_inbox;

@@ -54,8 +54,8 @@ remote host: the same binary, its own mail.db, and optional runtime integration
 One Rust executable supplies the CLI, local worker, and SSH stdio bridge. The
 CLI reads and writes SQLite directly; message operations still work when the
 worker is stopped. The worker is supervised by the host OS (launchd on macOS;
-an equivalent user service or foreground process on Linux). Its only local
-socket dependency is Herdr's existing socket for live state and short prompts.
+an equivalent user service or foreground process on Linux). Runtime adapters use local sockets for Herdr, Codex app-server or Claude's
+native inbox. Mail also exposes a private local event stream.
 The remote bridge uses SSH stdio; it does not open a TCP port.
 
 Herdr bindings use its existing local socket. Standalone local operations need
@@ -341,8 +341,8 @@ No mailbox-name match alone proves the current native session saw an action.
 
 Attention reports facts, never infers workflow progress. The work writer still owns
 acceptance. `doctor` probes setup without launching runtimes or approving hooks.
-ACP and standalone Claude idle delivery are deferred. Claude hook fixtures do not
-establish live recovery compatibility. See the implementation plan for release scope.
+ACP remains deferred. Native Claude delivery and live recovery evidence are
+described in the schema 10 and 11 increments below.
 
 
 ## Native runtime parity (schema 10, v0.4 source)
@@ -364,3 +364,52 @@ Schema 10 renames the endpoint table and labels existing endpoints as Codex,
 retaining their cursor and retry budget. All published migrations remain intact.
 ACP remains deferred. See [live native acceptance](native-acceptance.md) for
 Claude/Claude, mixed-runtime, resume and compaction evidence and client limits.
+
+## Native Claude terminal inbox (schema 11, v0.4 source)
+
+The recommended Claude integration uses the existing terminal session's native
+inbox. `hooks-config --claude-inbox` generates hooks that register its exported
+socket and token automatically at startup and resume. Claude retains its UI,
+permissions and inbound-message policy. Mail does not launch a replacement client.
+The streaming bridge remains available for clients that already own a stream.
+
+Mail pins the socket owner, private permissions and device/inode identity. Runtime
+tokens stay in the private database and are excluded from status. A delivery
+reserves an opaque marker and event cursor before writing native input. The socket
+has no acknowledgment: only a matching authenticated `UserPromptSubmit` hook
+records receipt and injects current bounded context. Receipt means admission to
+the hook pipeline, not model completion or business acceptance. Hooks observe
+activity; they do not provide an independent real-time runtime query.
+
+Idle actionable work uses native queued input. Active cancellation uses native
+priority-now input. Missing or refused input retains pending events, with at most
+three attempts per event frontier, five minutes apart. Same-session resume retains
+that budget; startup and compaction reconstruct current obligations. A missing or
+replaced socket requires a fresh startup hook. SessionEnd authenticates the saved
+endpoint even when Claude has already removed its socket.
+
+See [native inbox acceptance](native-inbox-acceptance.md) for live evidence and
+[usage](usage.md) for setup. ACP remains unnecessary for this path.
+
+
+## CLI workflow and distribution increment (schema 12, v0.4)
+
+The public CLI uses `task` for assignments and groups mail, participants, runtime
+controls and adapter protocols. Group inference validates explicit credentials
+and refuses ambiguity. No old CLI aliases are retained; JSON task associations
+continue to use the stored `work_id`/`work` field names.
+
+Task creation persists its canonical request and original result. Task updates
+use actor + task ID + expected version as the retry identity. Both validate current
+authority and return saved results only for identical retries. Final replies derive
+identity from the original message. New sends retain explicit logical keys.
+
+Runtime detach persists an opt-out for the current binding generation, so startup
+hooks cannot undo it. Enable or explicit attachment restores permission. Optional
+message deadlines are distinct from delivery retry scheduling. Migration copies
+legacy deadlines; the original required `due` column remains for schema continuity,
+while the nullable `deadline` column is authoritative for new readers and writes.
+
+Homebrew, direct installation and the Herdr installer use checksum-verified release
+binaries. The CLI remains a single local executable with SQLite. See the
+[CLI design](CLI_REDESIGN.md) and [user guide](usage.md).

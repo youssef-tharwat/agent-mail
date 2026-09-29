@@ -13,6 +13,8 @@ impl Demo {
         command
             .args(["--state-dir", self.0.path().to_str().unwrap()])
             .args(args)
+            .env_remove("AGENT_MAIL_GROUP")
+            .env_remove("AGENT_MAIL_GROUP")
             .env_remove("AGENT_MAIL_SESSION")
             .env_remove("HERDR_ENV")
             .env_remove("HERDR_PANE_ID")
@@ -33,7 +35,7 @@ impl Demo {
         Ok(serde_json::from_slice(&output.stdout)?)
     }
     fn register(&self, name: &str) -> Result<String> {
-        self.ok(None, &["register", "--name", name])?["session"]
+        self.ok(None, &["participant", "add", name])?["session"]
             .as_str()
             .map(str::to_owned)
             .context("registration did not return a session")
@@ -43,17 +45,15 @@ impl Demo {
 #[test]
 fn standalone_mail_work_and_session_replacement() -> Result<()> {
     let d = Demo::new()?;
-    d.ok(None, &["setup", "--standalone"])?;
+    d.ok(None, &["init", "default"])?;
     let coordinator = d.register("coordinator")?;
     let worker = d.register("worker")?;
     d.ok(
         Some(&coordinator),
         &[
-            "work",
+            "task",
             "create",
-            "--id",
             "api",
-            "--scope",
             "Review API",
             "--owner",
             "worker",
@@ -64,14 +64,13 @@ fn standalone_mail_work_and_session_replacement() -> Result<()> {
     let sent = d.ok(
         Some(&coordinator),
         &[
+            "mail",
             "send",
-            "--to",
             "worker",
+            "Review abc123",
             "--key",
             "request",
-            "--summary",
-            "Review abc123",
-            "--work-id",
+            "--task",
             "api",
         ],
     )?;
@@ -84,7 +83,7 @@ fn standalone_mail_work_and_session_replacement() -> Result<()> {
         !d.call(
             Some(&worker),
             &[
-                "work",
+                "task",
                 "update",
                 "api",
                 "--version",
@@ -99,17 +98,24 @@ fn standalone_mail_work_and_session_replacement() -> Result<()> {
         .success()
     );
     assert!(
-        !d.call(None, &["register", "--name", "worker"])?
+        !d.call(None, &["participant", "add", "worker"])?
             .status
             .success()
     );
-    let replacement = d.ok(None, &["register", "--name", "worker", "--replace"])?;
+    let replacement = d.ok(None, &["participant", "replace", "worker"])?;
     let next = replacement["session"]
         .as_str()
         .context("missing replacement")?;
     assert_ne!(next, worker);
     assert!(!d.call(Some(&worker), &["context"])?.status.success());
-    assert!(!d.call(Some(&worker), &["resolve", &id])?.status.success());
+    assert!(
+        !d.call(
+            Some(&worker),
+            &["mail", "resolve", &id, "--note", "handled"]
+        )?
+        .status
+        .success()
+    );
     let resumed = d.ok(Some(next), &["context"])?;
     assert_eq!(resumed["work"], before["work"]);
     assert_eq!(resumed["mail"], before["mail"]);
@@ -117,14 +123,7 @@ fn standalone_mail_work_and_session_replacement() -> Result<()> {
     std::fs::write(&reply, "Reviewed abc123")?;
     d.ok(
         Some(next),
-        &[
-            "resolve",
-            &id,
-            "--reply-key",
-            "reviewed",
-            "--reply-file",
-            reply.to_str().unwrap(),
-        ],
+        &["mail", "reply", &id, "--body-file", reply.to_str().unwrap()],
     )?;
     assert_eq!(d.ok(Some(next), &["context"])?["mail"], json!([]));
     assert_eq!(
@@ -137,7 +136,7 @@ fn standalone_mail_work_and_session_replacement() -> Result<()> {
     d.ok(
         Some(&coordinator),
         &[
-            "work",
+            "task",
             "update",
             "api",
             "--version",
@@ -155,10 +154,10 @@ fn standalone_mail_work_and_session_replacement() -> Result<()> {
 #[test]
 fn standalone_identity_is_scoped_and_never_infers_liveness() -> Result<()> {
     let d = Demo::new()?;
-    d.ok(None, &["setup"])?;
+    d.ok(None, &["init", "default"])?;
     let a = d.register("a")?;
     let b = d.register("b")?;
-    d.ok(None, &["setup", "--standalone", "--group", "other"])?;
+    d.ok(None, &["init", "other"])?;
     assert!(
         !d.call(Some(&a), &["context", "--group", "other"])?
             .status
@@ -171,15 +170,7 @@ fn standalone_identity_is_scoped_and_never_infers_liveness() -> Result<()> {
     );
     d.ok(
         Some(&a),
-        &[
-            "send",
-            "--to",
-            "b",
-            "--key",
-            "one",
-            "--summary",
-            "Check mail",
-        ],
+        &["mail", "send", "b", "Check mail", "--key", "one"],
     )?;
     let status = d.ok(None, &["service", "run", "--once"])?;
     assert!(
@@ -188,14 +179,130 @@ fn standalone_identity_is_scoped_and_never_infers_liveness() -> Result<()> {
             .unwrap()
             .contains("unknown")
     );
-    let list = d.ok(None, &["participants"])?;
+    let list = d.ok(None, &["participant", "list", "--group", "default"])?;
     assert!(!list.to_string().contains(&a));
     assert!(!list.to_string().contains(&b));
     assert_eq!(list[0]["runtime"], "standalone");
     assert!(
-        !d.call(None, &["prompt-mode", "--enable-unguarded"])?
+        !d.call(None, &["runtime", "herdr-policy", "unguarded"])?
             .status
             .success()
     );
+    Ok(())
+}
+
+#[test]
+fn natural_retries_and_short_replies_preserve_one_logical_change() -> Result<()> {
+    let d = Demo::new()?;
+    d.ok(None, &["init", "project"])?;
+    let writer = d.register("writer")?;
+    let worker = d.register("worker")?;
+    let create = ["task", "create", "api", "Review API", "--owner", "worker"];
+    let first = d.ok(Some(&writer), &create)?;
+    assert_eq!(first["next_action"], "Review API");
+    assert_eq!(first, d.ok(Some(&writer), &create)?);
+    let update = [
+        "task",
+        "update",
+        "api",
+        "--version",
+        "1",
+        "--reason",
+        "Clarify",
+        "--next-action",
+        "Review retries",
+    ];
+    let changed = d.ok(Some(&writer), &update)?;
+    assert_eq!(changed, d.ok(Some(&writer), &update)?);
+    assert_eq!(first, d.ok(Some(&writer), &create)?);
+    assert_eq!(d.ok(Some(&writer), &["task", "show", "api"])?["version"], 2);
+    assert_eq!(
+        d.ok(Some(&writer), &["task", "history", "api"])?
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(
+        !d.call(
+            Some(&writer),
+            &[
+                "task",
+                "update",
+                "api",
+                "--version",
+                "1",
+                "--reason",
+                "Different",
+                "--close"
+            ]
+        )?
+        .status
+        .success()
+    );
+    let sent = d.ok(
+        Some(&writer),
+        &["mail", "send", "worker", "Question", "--key", "question"],
+    )?;
+    let id = sent["id"].to_string();
+    assert!(d.ok(Some(&worker), &["mail", "show", &id])?["due"].is_null());
+    let reply = d.ok(Some(&worker), &["mail", "reply", &id, "Answered"])?;
+    assert_eq!(
+        reply,
+        d.ok(Some(&worker), &["mail", "reply", &id, "Answered"])?
+    );
+    assert!(
+        !d.call(Some(&worker), &["mail", "reply", &id, "Different"])?
+            .status
+            .success()
+    );
+    assert_eq!(
+        d.ok(Some(&writer), &["mail", "list"])?["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn selection_is_unambiguous_and_configuration_never_overwrites() -> Result<()> {
+    let d = Demo::new()?;
+    d.ok(None, &["init", "one"])?;
+    let worker = d.register("worker")?;
+    d.ok(None, &["init", "two"])?;
+    assert!(!d.call(None, &["participant", "list"])?.status.success());
+    d.ok(Some(&worker), &["context"])?;
+    assert!(
+        !d.call(Some(&worker), &["context", "--group", "two"])?
+            .status
+            .success()
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-mail"));
+    command
+        .args(["--state-dir", d.0.path().to_str().unwrap(), "context"])
+        .env("AGENT_MAIL_SESSION", &worker)
+        .env("AGENT_MAIL_GROUP", "one");
+    assert!(command.output()?.status.success());
+    command.env("AGENT_MAIL_GROUP", "two");
+    assert!(!command.output()?.status.success());
+    command.args(["--group", "one"]);
+    assert!(command.output()?.status.success());
+    let path = d.0.path().join("settings/hooks.json");
+    let config = [
+        "runtime",
+        "configure",
+        "claude",
+        "--output",
+        path.to_str().unwrap(),
+    ];
+    d.ok(None, &config)?;
+    d.ok(None, &config)?;
+    let content = std::fs::read_to_string(&path)?;
+    assert!(content.contains("agent-mail adapter claude-hook"));
+    std::fs::write(&path, "do not overwrite")?;
+    assert!(!d.call(None, &config)?.status.success());
+    assert_eq!(std::fs::read_to_string(&path)?, "do not overwrite");
     Ok(())
 }

@@ -91,7 +91,7 @@ pub struct WireMessage {
     /// Creation timestamp in Unix seconds.
     pub created: i64,
     /// Deadline timestamp in Unix seconds.
-    pub due: i64,
+    pub due: Option<i64>,
     /// Optional work identifier associated with this message.
     pub work_id: Option<String>,
     /// Optional identifier of the message being answered.
@@ -190,7 +190,7 @@ pub(crate) async fn enqueue_message(
     created: i64,
 ) -> Result<()> {
     let row = sqlx::query!(
-        "SELECT m.global_id,m.dedup_key,m.summary,m.body,m.created,m.due,m.work_id,m.reply_to,s.name AS sender,s.group_name,r.name AS recipient,r.remote_machine FROM messages m JOIN mailboxes s ON s.id=m.sender JOIN mailboxes r ON r.id=? WHERE m.id=?",
+        "SELECT m.global_id,m.dedup_key,m.summary,m.body,m.created,m.deadline AS due,m.work_id,m.reply_to,s.name AS sender,s.group_name,r.name AS recipient,r.remote_machine FROM messages m JOIN mailboxes s ON s.id=m.sender JOIN mailboxes r ON r.id=? WHERE m.id=?",
         recipient_id,
         message_id
     )
@@ -590,7 +590,7 @@ impl Store {
         time: i64,
     ) -> Result<usize> {
         // The remote command is fixed; SSH aliases are restricted to plain names.
-        let bytes = ssh(target, &["bridge", "export"], None).await?;
+        let bytes = ssh(target, &["adapter", "bridge", "export"], None).await?;
         let remote: Vec<Envelope> = serde_json::from_slice(&bytes)?;
         ensure!(
             remote.len() <= BATCH_LIMIT,
@@ -621,7 +621,13 @@ impl Store {
         );
         let response = ssh(
             target,
-            &["bridge", "exchange", "--source", &local.to_string()],
+            &[
+                "adapter",
+                "bridge",
+                "exchange",
+                "--source",
+                &local.to_string(),
+            ],
             Some(&bytes),
         )
         .await?;
@@ -735,7 +741,10 @@ async fn apply_event(
             bounded(&m.key, 128, "send key")?;
             bounded(&m.summary, SUMMARY_LIMIT, "summary")?;
             bounded(&m.body, BODY_LIMIT, "body")?;
-            ensure!(m.created > 0 && m.due >= m.created, "invalid message time");
+            ensure!(
+                m.created > 0 && m.due.is_none_or(|due| due >= m.created),
+                "invalid message time"
+            );
             let destination = sqlx::query!(
                 "SELECT id,remote_machine FROM mailboxes WHERE group_name=? AND name=?",
                 m.group,
@@ -791,8 +800,9 @@ async fn apply_event(
                     None
                 };
                 let key = format!("relay:{id}");
-                sqlx::query!("INSERT INTO messages(sender,dedup_key,canonical,summary,body,created,due,reply_to,work_id,global_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    sender_id, key, canonical, m.summary, m.body, m.created, m.due, reply_to, m.work_id, id)
+                let legacy_due = m.due.unwrap_or(m.created);
+                sqlx::query!("INSERT INTO messages(sender,dedup_key,canonical,summary,body,created,due,reply_to,work_id,global_id,deadline) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    sender_id, key, canonical, m.summary, m.body, m.created, legacy_due, reply_to, m.work_id, id, m.due)
                     .execute(&mut **tx).await?.last_insert_rowid()
             };
             sqlx::query!(

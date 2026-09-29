@@ -1,96 +1,113 @@
 # Agent Mail
 
-Durable messages and work records for coding agents. Keep assignments, next
-actions, evidence, and pending requests across context resets and restarts.
+**Durable tasks and messages for coding agents, on your machine.**
 
-One local CLI and SQLite database. No account or hosted service. Herdr is optional.
+Keep assignments, next actions, evidence and unanswered requests across context
+resets and restarts. Agent Mail stores coordination state in local SQLite and
+supplies current context through Claude Code, Codex or Herdr integrations.
 
-![Agent Mail CLI demo](assets/agent-mail-demo.gif)
+One native CLI. No account or hosted service. Herdr and Fleet Campaign are optional.
 
 ## Install
 
-Build the latest source with Rust 1.85+:
-
 ```sh
-cargo install --git https://github.com/youssef-tharwat/agent-mail --locked
+brew install youssef-tharwat/tap/agent-mail
 ```
 
-[Prebuilt binaries](https://github.com/youssef-tharwat/agent-mail/releases/latest)
-are available for macOS and Linux.
-[Binary installation and upgrades](docs/usage.md#install).
+Prebuilt macOS and Linux binaries for ARM64 and x86-64. **No Cargo or Rust compiler
+required.** [Direct downloads and installation details](docs/usage.md#install).
 
 ## Quick start
 
-Create a group and register two agents:
+Create a group and two participants:
 
 ```sh
-agent-mail setup --standalone --group project
-agent-mail register --group project --name coordinator
-agent-mail register --group project --name worker
+agent-mail init project
+agent-mail participant add coordinator
+agent-mail participant add worker
 ```
 
-Each registration returns a `session` credential. Give each agent its own value
-as `AGENT_MAIL_SESSION`.
+Each registration returns a `session` credential. Give each participant its own
+`AGENT_MAIL_SESSION`. Keep credentials out of version control.
 
-In the coordinator's environment, assign work:
+As the coordinator, assign a task:
 
 ```sh
-export AGENT_MAIL_SESSION='<coordinator session>'
-agent-mail work create --group project --id api-review --owner worker \
-  --scope 'Review API changes' --next-action 'Review revision abc123'
+export AGENT_MAIL_SESSION='<coordinator credential>'
+agent-mail task create api-review "Review API changes at abc123" --owner worker
 ```
 
-In the worker's environment, recover the assignment and submit a result:
+As the worker, recover the assignment and send a result:
 
 ```sh
-export AGENT_MAIL_SESSION='<worker session>'
-agent-mail context --group project
-agent-mail send --group project --to coordinator --key api-review-result \
-  --summary 'Reviewed abc123; evidence at reviews/api.md' --work-id api-review
+export AGENT_MAIL_SESSION='<worker credential>'
+agent-mail context
+agent-mail mail send coordinator "Reviewed abc123; evidence: reviews/api.md" \
+  --task api-review --key api-review-result-v1
 ```
 
-Use a stable send key when retrying. Reading mail does not resolve it. The work
-record's writer decides whether to accept the result.
-[Commands and decisions](docs/usage.md#submit-one-work-decision).
+The group is inferred from the credential. Task changes notify the relevant
+participants automatically. The writer decides whether to accept the result;
+receiving a message never marks a task complete.
+[Replies and task decisions](docs/usage.md#atomic-decisions).
 
-## Automatic recovery
+## Connect your agents
 
-Lifecycle hooks supply current work after resets and when state changes. The
-native adapters wake idle sessions with a bounded summary. Agents do not need to
-poll. Idle wake requires a running Mail worker and an attached runtime session.
+For automatic recovery and idle wake, configure a runtime and run the Mail worker:
 
-[Set up hooks and Codex wake](docs/usage.md#automatic-recovery-and-change-notifications-v03).
-[Native Claude setup](docs/usage.md#native-claude-delivery-next-release) is available
-in source for the next release; it does not require ACP.
-Tested with two live Codex agents through submission, correction, and acceptance.
-[Results and limits](docs/local-codex-acceptance.md).
+```sh
+agent-mail service run
+```
 
-Use `agent-mail doctor --group project --name worker` to check setup.
-`agent-mail status` reports unresolved work and delivery issues.
+| Runtime | Setup |
+| --- | --- |
+| Claude Code | [Normal terminal with native inbox hooks](docs/usage.md#claude-code) |
+| Codex | [Lifecycle hooks and app-server attachment](docs/usage.md#codex) |
+| Herdr | [Optional plugin and verified pane binding](docs/usage.md#optional-herdr-integration) |
 
-## Agent skill
+Mail keeps durable tasks, messages and bounded delivery retries. Your runtime owns
+agent execution and permissions; your workflow owns review and acceptance rules.
+Manual CLI use needs no running service or agent runtime.
+
+```sh
+agent-mail status
+agent-mail status --check worker
+```
+
+## Agent skill (optional)
 
 ```sh
 npx skills add youssef-tharwat/agent-mail --skill agent-mail -g
 ```
 
-The [skill](skills/agent-mail/SKILL.md) teaches agents the Mail workflow.
-It is installed separately from the CLI or Herdr plugin.
+The [skill](skills/agent-mail/SKILL.md) teaches agents the handoff workflow. This
+installer requires Node/npm and installs instructions, not the CLI.
 
-## Herdr integration
+## Herdr plugin (optional)
 
 ```sh
 herdr plugin install youssef-tharwat/agent-mail
 ```
 
-Herdr provides live sessions and lifecycle information. Agent Mail stores durable
-mail and work state. [Setup and binding](docs/usage.md#optional-herdr-integration).
+The plugin downloads a verified release binary; it does not require Cargo.
+[Setup and binding](docs/usage.md#optional-herdr-integration).
 
-## Documentation
+## Documentation and help
 
-- [User guide](docs/usage.md)
-- [Architecture and ownership](docs/ARCHITECTURE.md)
-- [Implementation plan](docs/IMPLEMENTATION_PLAN.md)
-- [Improvements from testing](docs/next-steps.md)
+- [User guide](docs/usage.md): commands, runtime setup, delivery controls and upgrades.
+- [Architecture](docs/ARCHITECTURE.md): ownership and delivery guarantees.
+- [CLI design](docs/CLI_REDESIGN.md): defaults and workflow decisions.
+- [Live runtime validation](docs/native-inbox-acceptance.md).
+- [Issues](https://github.com/youssef-tharwat/agent-mail/issues): bugs and feature requests.
 
-MIT licensed.
+v0.4 changes command names and hook entry points. Existing users should follow
+[the upgrade guide](docs/usage.md#upgrading) before updating their store.
+
+## Contributing
+
+See [development setup and checks](docs/usage.md#development). Keep changes focused
+and add regression coverage for behavior changes. Discuss larger changes in an
+issue first. [Implementation plan](docs/IMPLEMENTATION_PLAN.md).
+
+Maintained by [Youssef Tharwat](https://github.com/youssef-tharwat).
+Licensed under [MIT](LICENSE).

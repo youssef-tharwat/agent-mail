@@ -1,23 +1,26 @@
 # User guide
 
-[Back to the README](../README.md)
+[README](../README.md) · Agent Mail v0.4
 
 ## Install
 
-Download a prebuilt binary from [GitHub Releases](https://github.com/youssef-tharwat/agent-mail/releases/latest).
-No Rust toolchain or Herdr installation is required.
-
-| Platform | Archive target |
-| --- | --- |
-| macOS, Apple Silicon | `aarch64-apple-darwin` |
-| macOS, Intel | `x86_64-apple-darwin` |
-| Linux, x86-64 (glibc 2.35+) | `x86_64-unknown-linux-gnu` |
-| Linux, ARM64 (glibc 2.35+) | `aarch64-unknown-linux-gnu` |
-
-For example, on Apple Silicon:
+With Homebrew:
 
 ```sh
-version=0.3.0
+brew install youssef-tharwat/tap/agent-mail
+agent-mail --version
+```
+
+No Cargo or Rust compiler is required. Prebuilt binaries support macOS and Linux
+(glibc 2.35+), on Apple Silicon/ARM64 and Intel/x86-64.
+
+### Direct download
+
+Download the archive and its checksum from [GitHub Releases](https://github.com/youssef-tharwat/agent-mail/releases/latest).
+For Apple Silicon:
+
+```sh
+version=0.4.0
 target=aarch64-apple-darwin
 archive="agent-mail-v${version}-${target}.tar.gz"
 base="https://github.com/youssef-tharwat/agent-mail/releases/download/v${version}"
@@ -29,475 +32,321 @@ mkdir -p "$HOME/.local/bin"
 install -m 755 agent-mail "$HOME/.local/bin/agent-mail"
 ```
 
-Add `~/.local/bin` to your `PATH`. On Linux, `sha256sum -c` also verifies the
-checksum. macOS binaries are not Apple-notarized.
+Add `~/.local/bin` to your PATH. Other targets: `x86_64-apple-darwin`,
+`aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`. Linux can verify with
+`sha256sum -c`. macOS binaries are not Apple-notarized.
 
-Or build from source with Rust 1.85+:
-
-```sh
-cargo install --git https://github.com/youssef-tharwat/agent-mail --tag v0.3.0 --locked
-```
+The checked-out repository also provides `sh scripts/install.sh`, which detects
+your platform, verifies the published checksum and installs into `~/.local/bin`.
+`AGENT_MAIL_INSTALL_DIR` overrides that destination. It installs the version pinned
+by that checkout. npm distribution is not provided.
 
 ## Quick start
 
 ```sh
-agent-mail setup --standalone --group project
-agent-mail register --group project --name coordinator
-agent-mail register --group project --name worker
+agent-mail init project
+agent-mail participant add coordinator
+agent-mail participant add worker
 ```
 
-Each registration returns a generated `session` credential. The operator or
-launcher gives each agent its own credential through `AGENT_MAIL_SESSION`.
-Set this in the worker's environment, using the worker's returned value:
+Each registration returns a credential in `session`. Give each participant its
+own `AGENT_MAIL_SESSION`; keep credentials out of Git. Registration does not start
+an agent or prove it is running. A second `participant add` never replaces an
+existing credential. Use `participant replace NAME` explicitly when needed.
+
+As the coordinator:
 
 ```sh
-export AGENT_MAIL_SESSION='<worker session>'
-agent-mail context --group project
+export AGENT_MAIL_SESSION='<coordinator credential>'
+agent-mail task create api-review "Review API changes at abc123" --owner worker
 ```
 
-In the coordinator's environment, use the coordinator's credential:
+As the worker:
 
 ```sh
-export AGENT_MAIL_SESSION='<coordinator session>'
-agent-mail work create --group project --id api-review --owner worker \
-  --scope 'Review API changes' --next-action 'Review abc123'
-agent-mail send --group project --to worker --key review-1 \
-  --summary 'Review abc123' --work-id api-review
+export AGENT_MAIL_SESSION='<worker credential>'
+agent-mail context
+agent-mail mail send coordinator "Reviewed abc123; evidence: reviews/api.md" \
+  --task api-review --key api-review-result-v1
 ```
 
-Both paths use the same send, inbox, resolve, context, and work commands.
-`--session <credential>` also works; an explicit credential selects standalone
-identity even inside Herdr. Invalid credentials fail without falling back to
-another identity. Leave it unset for the normal Herdr pane binding.
+The task's writer decides whether the result is acceptable. Creating or updating
+a task publishes the relevant notifications atomically; no bookkeeping send is
+needed. Without a runtime adapter these commands work manually, with no worker.
 
-`agent-mail participants --group project` lists addresses and runtime bindings
-without exposing credentials. This is a registration view; it does not infer
-whether a worker is alive. Without an adapter, standalone agents check `context` at checkpoints.
-No background worker is needed for local mail or work operations. When run,
-the worker reports pending/overdue standalone mail and unknown availability;
-it cannot wake a standalone agent or send an operator notification without a
-runtime integration.
+## Group and identity selection
 
-To replace a standalone session explicitly:
+Use `--group GROUP` anywhere in a command, or set `AGENT_MAIL_GROUP` once.
+Otherwise Mail infers the group from a standalone credential or a verified Herdr
+identity. An operator without a credential can use the sole configured group.
+Multiple possible groups require an explicit selection. No last-used-group state
+is stored, so concurrent terminals cannot change each other's selection.
+
+A supplied invalid credential or mismatched group fails; Mail never falls back
+to another identity. `--session` overrides `AGENT_MAIL_SESSION`. Herdr-bound agents
+leave the standalone credential unset. Only operators issue or replace identities.
+
+`--state-dir` overrides `AGENT_MAIL_STATE_DIR`; otherwise the saved/default store
+is used. Use the same store for the CLI, client hooks and background worker.
+`init GROUP` is explicit, local setup; an inherited Herdr socket does not select
+a runtime. Repeating init preserves a previously configured group connection.
+
+## Messages
 
 ```sh
-agent-mail register --group project --name worker --replace
+agent-mail mail list
+agent-mail mail show 12
+agent-mail mail send reviewer "Review def456" --key review-def456 --task api-review
+agent-mail mail reply 12 "Reviewed; see reviews/api.md"
+agent-mail mail resolve 13 --note "Handled by the linked task decision"
+agent-mail mail withdraw 14
 ```
 
-Supply the new credential to the replacement session. The old credential stops
-working; the mailbox ID, pending mail, work ownership, and history survive.
-The same `--replace` rule applies when switching between standalone and Herdr
-bindings. Configure a Herdr socket with `setup --group project --socket PATH`
-before using `bind`. A registered remote route cannot be converted this way.
+- `send` creates a new logical request. Reuse its key for identical retries; use
+  a new key for a changed or genuinely new request. Add recipients with `--to`.
+- `reply` answers and resolves your delivery in one transaction. Its retry identity
+  is derived from the original message; an identical retry creates no second
+  answer. Changed replies conflict. Resolving first and replying later conflicts.
+- `resolve` records an outcome without sending an answer. Reading does not resolve.
+- `withdraw` is for the sender's request, not the recipient's disposition.
 
-`setup` uses a supplied or inherited Herdr socket when present; otherwise it
-creates standalone state. `--standalone` explicitly ignores an inherited socket.
-It never detaches an existing Herdr group silently. Use `--state-dir PATH` or
-`AGENT_MAIL_STATE_DIR` for an isolated store; both runtimes otherwise share the
-normal state location.
+Use `--body-file PATH` or `--body-file -` for bounded input on send/reply; reply
+accepts either inline text or a file, never both. Large evidence belongs in Git,
+CI or artifacts. Message bodies are limited to 8 KiB, summaries to 240 UTF-8 bytes.
+
+Requests have no business deadline unless `--due-in 15m` (or seconds/hours/days)
+is supplied. Delivery still runs with bounded retries. A deadline reports overdue
+work; it does not authorize tools, acceptance or automatic reassignment.
+
+## Tasks
+
+```sh
+agent-mail task list
+agent-mail task show api-review
+agent-mail task history api-review
+agent-mail task update api-review --version 1 \
+  --next-action "Add retry coverage and resubmit" \
+  --reason "Coverage missing" --resolve 12
+```
+
+Creation requires an ID, task description and owner. The description becomes the
+scope and initial next action; override the initial step with `--next-action`.
+State defaults to `open`. Deadlines and evidence are optional. A deadline is a UTC
+RFC3339 timestamp, such as `--deadline 2026-10-01T12:00:00Z`.
+
+Identical creation retries return the original creation result, even after later
+updates. Changed creation content for the same ID conflicts. An old record without
+creation provenance cannot be treated as an identical retry.
+
+Only the designated writer on the group's home machine may update a task.
+Use the version you actually observed. Updates derive retry identity from the
+writer, task ID and expected version. Identical retries return the original result;
+changed retries or stale versions fail. Reread and reconsider on a conflict.
+
+### Atomic decisions
+
+Simple changes use flags; complex changes use a typed JSON document:
+
+```json
+{
+  "version": 2,
+  "reason": "Reviewed corrected evidence",
+  "patch": {
+    "state": "accepted",
+    "open": false,
+    "accepted_revision": "def456",
+    "evidence": ["ci/run/42"]
+  },
+  "resolve_message": 13
+}
+```
+
+```sh
+agent-mail task update api-review --file acceptance.json
+# Or: agent-mail task update api-review --file - < acceptance.json
+```
+
+The file contains `version`, `reason`, `patch` and optional `resolve_message`.
+Patch fields: `owner`, `state`, `open`, `next_action`, `deadline`,
+`accepted_revision`, `evidence`. Omitted fields retain their values; use JSON null
+to clear deadline or accepted revision, and `[]` to clear evidence. JSON deadlines
+are Unix seconds; CLI deadline flags accept UTC timestamps. Unknown fields and
+mixed file/flag updates are rejected.
+
+A linked resolution must refer to a request in the writer's inbox for this task.
+The update, resolution, history and events all commit or all roll back. State names
+are workflow-defined; closing a task does not itself establish acceptance criteria.
+Stored/API records retain the field names `work_id` and `work` for task associations
+and recovery summaries; the public command is `task`.
+
+## Automatic recovery and delivery
+
+Run one worker for the store:
+
+```sh
+agent-mail service run
+```
+
+On macOS, `service install` installs a user launchd job; `service uninstall` removes
+the job while preserving data. On Linux, use foreground run under your supervisor.
+Mail does not launch or supervise the agents themselves.
+
+### Claude Code
+
+```sh
+agent-mail runtime configure claude --output .claude/agent-mail-hooks.json
+claude --settings .claude/agent-mail-hooks.json
+```
+
+Launch each Claude terminal with its assigned Mail credential/environment. The
+normal Claude UI, tools and permissions remain in charge. Startup hooks register
+Claude's native inbox automatically. Resume with the same environment and settings
+file; compaction and lifecycle hooks recover current state.
+
+The generated file contains no credentials. Generation is atomic and refuses to
+overwrite different existing content. Do not also install the generic Mail hooks.
+Client trust and inbound-message policy still apply; configuration is not proof
+that hooks are trusted. Tested with Claude Code 2.1.284.
+
+A socket write is only an attempt. A correlated native `UserPromptSubmit` hook
+confirms admission and supplies fresh bounded context. It does not prove the model
+finished a turn or accepted a result. Missing/refused delivery remains pending.
+[Live acceptance evidence](native-inbox-acceptance.md).
+
+### Codex
+
+```sh
+agent-mail runtime configure codex --output .codex/hooks.json
+```
+
+If that file already contains hooks, generate into a separate file and merge its
+entries into the intended configuration. Review/trust hooks through Codex `/hooks`.
+For idle wake, attach the participant to a persistent thread on an existing local
+Codex app-server:
+
+```sh
+agent-mail runtime attach worker codex \
+  --socket /absolute/path/to/codex.sock --thread THREAD_UUID
+```
+
+Use the actual socket and thread; Mail verifies the endpoint. It does not create
+or resume the Codex session. Hooks supply reset/compaction recovery independently
+of the queue. Tested with Codex 0.157.0's experimental app-server API.
+[Codex acceptance evidence](local-codex-acceptance.md).
+
+### Delivery controls
+
+```sh
+agent-mail runtime pause
+agent-mail runtime resume
+agent-mail runtime detach worker
+agent-mail runtime enable worker
+agent-mail runtime retry worker
+```
+
+Pause/resume affects group delivery, not mail writes. Retry resets only that
+participant's delivery budget; it never resumes a paused group or retries tools.
+Inspect and fix the endpoint before retrying. Attempts are limited to three per
+change batch, five minutes apart, with budgets persisted across worker restarts.
+
+Detach disables native attachment across startup hooks and session restarts.
+Enable permits attachment again; resume Claude to register its inbox. Explicit
+native attachment also enables delivery. Herdr group delivery uses pause/resume.
+
+## Status and troubleshooting
+
+```sh
+agent-mail status
+agent-mail status --check worker
+```
+
+Status reports stored coordination and delivery facts. `--check` probes setup and
+runtime endpoints, exits nonzero on failed checks, and gives corrective actions.
+Neither mode starts agents, repairs state, accepts work or answers permissions.
+Unknown hook trust remains unknown. Delivery receipts and task progress are separate.
+
+## Optional Herdr integration
+
+```sh
+herdr plugin install youssef-tharwat/agent-mail
+```
+
+The plugin downloads the checksum-verified release binary. No Cargo is required.
+It installs into `~/.local/bin` (or `AGENT_MAIL_INSTALL_DIR`); put that directory on
+PATH for hooks. The plugin keeps a local executable for its actions too.
+
+```sh
+agent-mail init project
+agent-mail runtime herdr --socket "$HERDR_SOCKET_PATH"
+agent-mail participant bind coordinator --herdr-pane COORDINATOR_PANE
+agent-mail participant bind worker --herdr-pane WORKER_PANE
+```
+
+Herdr owns live sessions; Mail owns durable coordination. Herdr prompts default
+to notification-only because its API cannot verify an empty draft. Operators may
+explicitly choose `runtime herdr-policy unguarded`; `notify` restores the default.
+Do not mistake registration or an idle pane for confirmed agent progress.
+
+## Advanced integrations
+
+`agent-mail adapter --help` exposes lifecycle hooks, event replay, streaming,
+receipts, SSH transport and the optional client-owned Claude streaming bridge.
+These are programmatic interfaces; agents must not acknowledge events themselves.
+A stream cursor includes binding generation. Reading or acknowledging events never
+resolves business obligations. ACP is not required.
+
+`agent-mail remote --help` exposes machine identity, home assignment, peer routing
+and explicit SSH sync. Automatic sync is opt-in per configured peer. Remote live
+acceptance remains separate from local runtime validation; upgrade both ends to
+v0.4 before exchanging messages without deadlines.
 
 ## Agent skill
-
-The optional [Agent Mail skill](../skills/agent-mail/SKILL.md) teaches agents to
-recover work and handle deliveries without loading whole conversations into
-context. Herdr plugin installation does not install agent skills. Install it
-separately with a skill manager:
 
 ```sh
 npx skills add youssef-tharwat/agent-mail --skill agent-mail -g
 ```
 
-For local development, link the skill from a stable checkout:
-
-```sh
-mkdir -p ~/.codex/skills
-ln -s "$(pwd)/skills/agent-mail" ~/.codex/skills/agent-mail
-```
-
-Then ask a bound or registered agent to use `$agent-mail`, or let Codex select it for an
-Agent Mail task. Other agent tools can read the same `SKILL.md` directly.
-
-## Automatic recovery and change notifications (v0.3)
-
-These commands require v0.3.0 or later.
-Stop existing Mail workers and run `setup` to migrate a backed-up store to schema 9;
-v0.2.0 cannot open the upgraded database.
-
-Mail and work changes automatically publish recipient-scoped events in the same
-SQLite transaction. The owner and designated writer receive work changes;
-reassignment also notifies the previous owner. No separate notification send is
-needed. Work changes participate in the existing bounded Herdr wake policy.
-
-### Enable lifecycle hooks
-
-Launch each client with its assigned `AGENT_MAIL_SESSION` (standalone) or its
-verified Herdr pane binding, plus `AGENT_MAIL_GROUP` and, for a custom store,
-`AGENT_MAIL_STATE_DIR`. The `agent-mail` binary must be on the client's `PATH`.
-
-```sh
-agent-mail hooks-config > /tmp/agent-mail-hooks.json
-```
-
-Merge the generated `hooks` entries into your client's existing configuration:
-
-- **Codex:** `.codex/hooks.json` in the intended project, or `~/.codex/hooks.json`.
-  Review and trust the new entries through `/hooks`; untrusted hooks are skipped.
-- **Claude Code:** the `hooks` object in `.claude/settings.json` in the intended
-  project. Follow the client's hook approval/setup flow.
-
-Do not overwrite unrelated hooks. Configure only sessions assigned a Mail
-identity; a missing/invalid identity fails visibly instead of borrowing another
-participant's mailbox.
-
-The common adapter reads lifecycle JSON on stdin and emits the documented hook
-response. `SessionStart` restores state on startup/resume/compaction;
-`UserPromptSubmit`, `PreToolUse`, and `PostToolUse` surface changes.
-`PostCompact` invalidates cached emission state for clients that do not call
-`SessionStart(compact)`, restoring context at the next supported boundary. `Stop` may request one
-continuation for new obligations per recovery epoch, and never recursively
-continues a stop-hook turn. No model call polls SQLite. Unchanged state emits no
-context except up to two retries, spaced five minutes apart, after an emission
-whose consumption cannot be confirmed. Reset always reconstructs current state.
-Context text is capped at 6,000 UTF-8 bytes and contains summaries plus change IDs.
-
-**Live check:** Codex 0.157 received assigned work through trusted hooks, recovered
-changed work after manual compaction, and recovered changes after session resume,
-without model tool calls. In that version, manual compaction needed the
-`PostCompact` invalidation plus next-prompt fallback; immediate post-compaction
-`SessionStart` injection was not observed. Native Claude live results for the next
-release are recorded in [native acceptance](native-acceptance.md).
-
-**Limits:** each installed client must load and trust its hooks. A successful stdout write does not prove model
-consumption: hook attempts never manufacture delivery receipts. `status` shows
-unacknowledged notifications and emission attempts. Hooks need client lifecycle
-activity; use the Codex queue adapter below for idle sessions. Herdr's optional wake
-path retains its existing safety hold. Neither mode guarantees agent progress.
-
-Hook contracts: [Codex](https://learn.chatgpt.com/docs/hooks),
-[Claude Code](https://code.claude.com/docs/en/hooks).
-
-### Wake an idle Codex session
-
-For an existing persistent thread on a running local Codex app-server:
-
-```sh
-agent-mail attach-codex --group project --name worker \
-  --socket /absolute/path/to/codex.sock --thread THREAD_UUID
-agent-mail service run
-```
-
-Attachment is explicit permission to queue Mail updates to that thread. Use the
-thread's actual UUID and its server's Unix socket; Mail verifies it exists and is
-persistent. Start a dedicated server with `codex app-server --listen
-unix:///absolute/path/to/codex.sock` if your client needs one, then connect your
-client to that server. Mail does not start or resume Codex processes. Give the
-client its participant credential as described above; attachment only configures
-delivery, it does not set the client's environment. One thread can serve one Mail
-participant per store.
-
-The worker wakes an idle thread for current actionable obligations, using a summary capped at 6,000
-UTF-8 bytes. Codex starts the turn; no agent poll or separate `context` call is
-needed. Changes made while busy remain durable. Closed or reassigned work can steer an active
-turn with an expected-turn precondition. Idle closure and passive receipt changes
-remain available for recovery without starting courtesy turns. Install the lifecycle hooks too
-for recovery during compaction and session resume. The queue adapter was tested
-against Codex 0.157.0's experimental app-server API.
-
-`pause --group project` holds delivery; `resume` restores it.
-`detach-codex --group project --name worker` disables the endpoint.
-Replacing a participant invalidates its attachment; attach the replacement
-explicitly. `status` reports delivery cursors, binding validity, attempts and the
-latest worker result. `resume --group project --rearm worker` resets an exhausted
-retry budget.
-
-A confirmed queue receipt advances the notification cursor, never resolves mail
-or accepts work. An uncertain send gets at most three attempts per change batch,
-spaced five minutes apart; a new change gets a fresh budget. Retry state survives
-worker restarts. Codex does **not** deduplicate queue entries by client message ID,
-so a lost response can cause a duplicate wake. Idempotent sends and decisions
-protect business state. Queued input is not proof that the model acted on it.
-Herdr's `prompt-mode --enable-unguarded` is unrelated to Codex attachment.
-
-### Native Claude delivery (next release)
-
-Claude uses its own native streaming CLI; ACP is not required. The operator's
-stdio client launches the bridge instead of launching `claude` directly:
-
-```sh
-agent-mail claude-bridge --socket /absolute/path/to/claude.sock -- [CLAUDE_OPTIONS]
-```
-
-The client writes native JSON input to stdin and reads native JSON output from
-stdout, including permission requests. It must handle approvals and keep reading
-output. This is a client integration command, not an interactive terminal UI.
-The bridge launches only `claude` with native stream formats, forwards permission
-requests unchanged, and never grants approvals or injects Mail credentials.
-Configure the client's own participant environment and trusted hooks as above.
-
-After the client's initial prompt, obtain the session UUID from `system/init`:
-
-```sh
-agent-mail attach-claude --group project --name worker \
-  --socket /absolute/path/to/claude.sock --session-id SESSION_UUID
-agent-mail service run
-```
-
-Requires Claude's `msg_lifecycle_v1` capability (tested with Claude 2.1.284).
-Attachment fails until the session is initialized. Idle work receives the same
-bounded context, durable attempts, receipts, pause/rearm behavior and identity
-checks as Codex. For active cancellation Claude uses native `priority: now`,
-which cancels the current response and starts another; Codex steers its current
-turn. Neither receipt accepts work or resolves a request.
-
-Use `detach-claude --group project --name worker` to stop delivery. To resume,
-launch the bridge with native `--resume SESSION_UUID`, let the client initialize
-it, then reattach. Reattaching the same endpoint preserves its retry budget.
-An arbitrary existing Claude interactive terminal cannot be attached this way.
-`status.native` includes both runtimes; `status.codex` remains a Codex-only
-compatibility view. See [native acceptance evidence](native-acceptance.md).
-
-### Submit one work decision
-
-The designated writer can update work and resolve a linked request atomically:
-
-```json
-{
-  "key": "accept-api-v2",
-  "version": 2,
-  "reason": "Evidence verified",
-  "patch": {
-    "state": "accepted",
-    "open": false,
-    "accepted_revision": "abc123",
-    "evidence": ["ci/run/42"]
-  },
-  "resolve_message": 12
-}
-```
-
-```sh
-agent-mail work decide --group project api-review --file decision.json
-```
-
-Use the current work version and your actual message ID. `resolve_message` is
-optional; when supplied, the request must be in the writer's inbox and linked
-to this work item. A failed step rolls back the decision, resolution, history,
-and events. Retrying the same key and content returns the original result;
-changed content is rejected. Workflow policy still determines acceptance.
-Workers submit evidence using linked mail; they cannot accept their own work
-unless they are its designated writer.
-
-### Programmatic subscribers
-
-`agent-mail events` returns a bounded page with a cursor and binding generation.
-After an adapter confirms delivery of an individual event, it may call
-`agent-mail ack EVENT_ID`. Acknowledgment never resolves mail or closes work.
-Replacement sessions replay events independently of old binding receipts.
-The built-in hooks deliberately track emission attempts separately from these
-confirmed receipts. Detailed events and underlying obligations remain durable.
-
-## Optional Herdr integration
-
-Herdr supplies live agent identity, lifecycle observations, and wake hints.
-Agent Mail keeps the durable participant registry, mail, and work records.
-
-### Install the plugin
-
-The Herdr plugin currently builds from source, requiring Rust 1.85+ and Herdr
-0.9.1+. It installs the CLI into Cargo's bin directory:
-
-```sh
-herdr plugin install youssef-tharwat/agent-mail
-# macOS: set up state and install the background worker
-herdr plugin action invoke setup --plugin youssef-tharwat.agent-mail
-# Linux: set up state; run the worker under your own supervisor
-herdr plugin action invoke setup-linux --plugin youssef-tharwat.agent-mail
-```
-
-Setup does not bind agents. Run `herdr pane list`, then bind the intended native
-sessions:
-
-```sh
-agent-mail bind --name coordinator --target YOUR_COORDINATOR_PANE
-agent-mail bind --name worker --target YOUR_WORKER_PANE
-```
-
-For an existing named group, configure its socket with
-`agent-mail setup --group project --socket "$HERDR_SOCKET_PATH"` and pass
-`--group project` when binding. Leave `AGENT_MAIL_SESSION` unset inside bound
-Herdr panes. The skill is installed separately using the command above.
-
-### Local plugin development
-
-```sh
-cargo install --path . --locked
-herdr plugin link . --enabled
-```
-
-On macOS, `agent-mail service install` installs a user launchd job; on Linux,
-run `agent-mail service run` under your own process supervisor.
-`service uninstall` preserves the database.
-
-### Quiet prompts
-
-Herdr's current socket API does not expose a reliable empty-draft check.
-Automatic agent prompts are therefore **off by default**. Pending mail remains
-in SQLite and `context`/`status`; the worker can raise one operator alert when
-it becomes overdue. An operator who accepts the risk of overwriting an
-unfinished agent draft may explicitly run:
-
-```sh
-agent-mail prompt-mode --group project --enable-unguarded
-```
-
-In that mode the worker sends only a short fixed inbox hint to a verified idle
-agent, with at most one initial prompt and two reminders spaced five minutes
-apart. It never inserts message bodies into prompts. `prompt-mode --disable`
-returns to the safe default. `pause` and `resume` control a group's prompts.
+This installs workflow instructions, not the binary. This installer uses Node/npm;
+the CLI and Homebrew installation do not require Node. The bundled skill targets
+v0.4 and must be upgraded alongside the CLI.
 
 ## Upgrading
 
-For an upgrade, stop the worker and other Mail commands, install the new binary,
-rerun `setup` with the existing group and socket (or `--standalone`) to apply
-migrations, then restart the worker. Schema 8 preserves existing mailbox IDs,
-Herdr bindings, mail, work records, reminder budgets, and remote routes. Older
-binaries cannot open the upgraded store; back it up before upgrading. On
-macOS, use `service uninstall` before setup and `service install` afterward.
+v0.4 intentionally changes the command interface without old aliases. Regenerate
+Mail hooks, update the skill, and update scripts to use `task`, `mail`, `participant`,
+`runtime`, `status --check` and `adapter`. Stored tasks/messages are preserved.
 
-## Mail and work commands
-
-With your assigned session credential (or inside a bound Herdr pane):
+Stop the worker and other Mail commands and back up your state directory. On macOS
+run `service uninstall` before upgrading and `service install` afterward.
 
 ```sh
-agent-mail send --group project --to worker --key review-1 \
-  --summary 'Review revision abc123' --body-file request.txt
-agent-mail context --group project
-agent-mail inbox --group project 1
-agent-mail resolve --group project 1 --note handled
+brew update
+brew upgrade youssef-tharwat/tap/agent-mail
+agent-mail init YOUR_EXISTING_GROUP
 ```
 
-Reuse a send key for a retry with identical content. A successful send means
-the local SQLite transaction committed. Reading does not resolve mail. An
-agent resolves its delivery explicitly and may include `--reply-key` and
-`--reply-file` to publish a reply in the same transaction.
-
-Create a work record from the designated home writer:
-
-```sh
-agent-mail work create --group project --id lane-a --scope 'Implement feature' \
-  --owner worker --state active --next-action 'Inspect contract'
-agent-mail send --group project --to worker --key lane-a-review \
-  --summary 'Review the contract' --work-id lane-a
-agent-mail work show --group project lane-a
-agent-mail work update --group project lane-a --version 1 --reason 'Revision submitted' \
-  --state review --next-action 'Check evidence'
-```
-
-Work updates require the current version and a reason. The home writer decides
-state, ownership, and acceptance. Replies do not change work state.
-
-## Optional remote machines
-
-Each machine installs the binary and owns its own SQLite database. Configure
-SSH aliases so the home can run `ssh ALIAS agent-mail bridge export` without
-interactive input. Use the default state location on remote hosts; the bridge
-reads the locator created by `setup`. There is no listening Mail port.
-
-For a home host A and remote host B, run `setup` and `bind` for the local agents
-on both hosts. Then use their `agent-mail machine-id` values:
-
-```sh
-# On B: point its group at A's authoritative work register.
-agent-mail join --group project --home A_MACHINE_UUID
-agent-mail route --group project --name coordinator --machine A_MACHINE_UUID
-
-# On A: register B's logical inbox and an SSH alias for B.
-agent-mail route --group project --name worker --machine B_MACHINE_UUID
-agent-mail peer --machine B_MACHINE_UUID --ssh-target B_SSH_ALIAS
-agent-mail sync --peer B_MACHINE_UUID
-# Optional: authorize periodic sync by the home worker for this peer.
-agent-mail auto-sync --peer B_MACHINE_UUID --enable
-```
-
-Run `sync` **on the home machine** after remote sends or whenever you want to
-exchange queued events. Once enabled, the home worker also syncs the configured
-peer about every 30 seconds. `auto-sync --peer B_MACHINE_UUID --disable` stops
-future background transfers; an already running exchange may finish. Manual
-`sync` still works. Adding the same SSH target
-preserves the setting, while changing it disables automatic sync until the
-operator opts in again. Automatic sync is off by default and requires a running
-home worker. One installation must be the home for all its enrolled groups to
-initiate sync.
-
-The home forwards messages between remotes. Exchanged
-events are committed before acknowledgment; a lost response causes replay,
-which is deduplicated. While disconnected, local sends queue and local inboxes
-remain readable. `status` shows the outbox count, oldest queued event, peer
-sync time, auto-sync setting, and last error. Remote work snapshots show their
-last transfer time as `synced_at` and remain
-read-only; their version may be stale until another sync.
-
-## Limits
-
-- Named recipient fan-out is capped at 32. Message bodies are capped at 8 KiB;
-  large evidence belongs in Git, CI, or artifacts referenced by path or ID.
-- `context` returns at most five work summaries and five mail summaries per
-  page within a 4 KiB budget. Cursors fetch further pages.
-- Mail records obligations and decisions. It does not run tools, retry agent
-  side effects, or decide whether a revision is correct.
-- Bindings and standalone session credentials are workflow guards for agents
-  sharing an OS account, not a
-  security boundary against malicious same-user code.
+Init applies migrations through schema 12. Older binaries cannot open the upgraded
+store. Restart the worker after migrating. Native Claude tokens stay in the private
+database; status excludes them. Uninstalling a package does not erase Mail state.
 
 ## Development
 
+With Rust 1.85+ and Git:
+
+```sh
+git clone https://github.com/youssef-tharwat/agent-mail.git
+cd agent-mail
+cargo build --locked
+cargo run --locked -- --help
+```
+
+Install the checkout with `cargo install --path . --locked`. Before submitting:
+
 ```sh
 cargo fmt --all --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features
 ```
 
-License: MIT.
-
-## Local event stream (v0.3)
-
-Start the existing worker with `agent-mail service run`. In a participant's
-configured environment:
-
-```sh
-agent-mail watch --group project
-# Reconnect using the last event ID and the binding generation from Ready:
-agent-mail watch --group project --after 42 --generation 1
-```
-
-The private `events.sock` uses versioned newline-delimited JSON. `ready` identifies
-the participant and binding generation; `event` contains an ID, kind, subject,
-and revision. It contains no message body or credential. Save the cursor only
-after your consumer processes the event. A subscription never acknowledges Mail
-or resolves work. Replacing the binding closes the old subscription; recover with
-the new credential and cursor zero.
-
-Database commits precede best-effort socket hints. Missed hints reconcile within
-the worker's five-second interval. Writes succeed while the worker is stopped.
-Replay uses batches of 32; at most 32 connections are admitted. An unread socket
-is disconnected after a two-second blocked write and can resume from its cursor.
-This stream is for programs; agents use runtime delivery and lifecycle recovery.
-
-## Diagnose setup and attention (v0.3)
-
-```sh
-agent-mail doctor --group project --name worker
-agent-mail status
-```
-
-`doctor` checks schema, selected identity, worker, authenticated stream, and the
-configured runtime capability. Omit `--name` to check the caller's credential.
-It emits structured checks (`pass`, `fail`, `warning`, `unknown`); exit 1 means at
-least one failed check, exit 0 means none. Unknown hook trust requires a real
-client check. Diagnostics never launch an agent, grant approval, or rotate identity.
-
-`status.attention` lists open local work, explicit overdue deadlines, missing
-standalone endpoints, unconfirmed attempts, and exhausted delivery budgets.
-Results are bounded and expose `more` when truncated. Delivery is not progress:
-accepted input leaves work open until its designated writer decides. No elapsed
-period or workflow-state label invents a waiting state, deadline, or extra reminder.
+MIT licensed. Report issues with OS, Mail/runtime versions and reproduction steps;
+omit credentials and private message contents.

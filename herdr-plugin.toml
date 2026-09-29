@@ -2,32 +2,45 @@ id = "youssef-tharwat.agent-mail"
 name = "Agent Mail"
 version = "0.4.0"
 min_herdr_version = "0.9.1"
-description = "Local durable mail and a compact work register for coding agents"
+description = "Local durable tasks and messages for coding agents"
 platforms = ["macos", "linux"]
 
 [[build]]
-command = ["cargo", "install", "--path", ".", "--locked"]
+command = ["sh", "scripts/install.sh", "--plugin"]
 
 [[startup]]
 platforms = ["macos"]
-command = ["./target/release/agent-mail", "restore"]
+command = ["./target/release/agent-mail", "adapter", "restore"]
 
 [[actions]]
 id = "setup"
 title = "Set up Mail"
 contexts = ["workspace"]
 platforms = ["macos"]
-command = ["./target/release/agent-mail", "setup", "--install-service"]
+command = ["./target/release/agent-mail", "init", "default"]
 
 [[actions]]
 id = "setup-linux"
 title = "Set up Mail state"
 contexts = ["workspace"]
 platforms = ["linux"]
-command = ["./target/release/agent-mail", "setup"]
+command = ["./target/release/agent-mail", "init", "default"]
 
 [[actions]]
 id = "status"
 title = "Mail status"
 contexts = ["workspace"]
 command = ["./target/release/agent-mail", "status"]
+
+[[actions]]
+id = "connect-herdr"
+title = "Connect this Herdr workspace"
+contexts = ["workspace"]
+command = ["./target/release/agent-mail", "runtime", "herdr"]
+
+[[actions]]
+id = "install-service"
+title = "Install background worker"
+contexts = ["workspace"]
+platforms = ["macos"]
+command = ["./target/release/agent-mail", "service", "install"]
