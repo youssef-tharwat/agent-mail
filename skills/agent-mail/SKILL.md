@@ -1,7 +1,7 @@
 ---
 name: agent-mail
 description: >-
-  Use Agent Mail to coordinate durable tasks and messages: recover assignments after context resets, assign work, report blockers or results, request reviews, and record corrections or acceptance. Apply to Mail-based handoffs in Codex, Claude Code, Herdr or Fleet, including forgotten assignments and stalled requests. Also use when asked to set up or diagnose Agent Mail, or retire and restore its agent registrations. Workflow and runtime integrations are optional; this skill teaches the tool's operating flows.
+  Use Agent Mail to coordinate durable tasks and messages: recover assignments after context resets, assign work, report blockers or results, request reviews, and record corrections or acceptance. Apply to Mail-based handoffs in Codex, Claude Code, Herdr or Fleet, including forgotten assignments and stalled requests. Also use when asked to set up coordination for a new project or fleet, follow changes, wait for replies, diagnose delivery, or retire and restore registrations. Workflow and runtime integrations are optional; this skill teaches the tool's operating flows.
 ---
 
 # Agent Mail

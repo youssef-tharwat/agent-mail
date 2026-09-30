@@ -161,6 +161,7 @@ impl Fixture {
             .env("HERDR_ENV", "1")
             .env("HERDR_PANE_ID", pane)
             .env("HERDR_SOCKET_PATH", &self.socket)
+            .env_remove("CODEX_SESSION_ID")
             .env_remove("HERDR_PLUGIN_ID")
             .env_remove("AGENT_MAIL_GROUP")
             .env_remove("AGENT_MAIL_GROUP")
@@ -315,6 +316,10 @@ async fn bursts_batch_and_retry_budget_survives_restarts() -> Result<()> {
     service::tick(&f.store, 1000).await?;
     assert_eq!(f.host.lock().await.prompts.len(), 1);
     assert!(f.host.lock().await.prompts[0].contains("agent ack"));
+    let prompt = f.host.lock().await.prompts[0].clone();
+    let notice: Value = serde_json::from_str(prompt.split_once('\n').unwrap().0)?;
+    assert!(notice["new_mail"].as_array().unwrap().len() <= 5);
+    assert_eq!(notice["more"], true);
     agent_mail::verification::reconcile(&f.store, 1000).await?;
     // The other registered lane has no pending notification, so it receives its
     // one bounded standalone probe. The busy target is challenged in its wake.
@@ -839,7 +844,8 @@ async fn work_only_changes_wake_without_separate_mail_and_keep_retry_budget() ->
     assert_eq!(initial, 1); // Both subscribe, but only the owner has a new obligation.
     service::tick(&f.store, 1001).await?;
     assert_eq!(f.host.lock().await.prompts.len(), initial);
-    assert!(f.host.lock().await.prompts[0].contains("context"));
+    assert!(f.host.lock().await.prompts[0].contains("tasks"));
+    assert!(!f.host.lock().await.prompts[0].contains("Inspect evidence"));
     Ok(())
 }
 

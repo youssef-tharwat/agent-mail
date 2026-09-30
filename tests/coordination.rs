@@ -235,7 +235,8 @@ fn hooks_restore_after_reset_suppress_repeats_and_bound_stop_continuations() -> 
         false,
     )?;
     let update = d.hook("PostToolUse", false)?;
-    assert!(update.to_string().contains("Check changed contract"));
+    assert!(update.to_string().contains("task"));
+    assert!(!update.to_string().contains("Check changed contract"));
     let routine = update["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap();
@@ -371,24 +372,21 @@ fn assignment_review_correction_and_acceptance_surface_without_manual_context() 
             .contains("Submitted evidence")
     );
     d.decide(json!({"version":1,"reason":"Missing regression case","patch":{"state":"active","next_action":"Add regression case"},"resolve_message":first["id"]}),false)?;
-    assert!(
-        d.hook("PostToolUse", false)?
-            .to_string()
-            .contains("Add regression case")
-    );
+    assert!(d.hook("PostToolUse", false)?.to_string().contains("task"));
     let second = submit("submission2")?;
     assert!(
         writer_hook("PostToolUse")?
             .to_string()
-            .contains("Submitted evidence")
+            .contains(&second["id"].to_string())
     );
     d.decide(json!({"version":2,"reason":"Evidence passed","patch":{"state":"accepted","accepted_revision":"abc123"},"resolve_message":second["id"]}),false)?;
     let final_hook = d.hook("PostToolUse", false)?;
-    assert!(final_hook.to_string().contains("work_changed"));
+    assert!(final_hook.to_string().contains("task"));
     let text = final_hook["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap();
     let state: Value = serde_json::from_str(text.split_once('\n').unwrap().1)?;
-    assert_eq!(state["context"]["work"], json!([]));
+    assert!(state["context"].is_null());
+    assert!(!state["changes"]["tasks"].as_array().unwrap().is_empty());
     Ok(())
 }

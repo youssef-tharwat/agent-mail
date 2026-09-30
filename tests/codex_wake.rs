@@ -75,7 +75,11 @@ fn server(listener: UnixListener, thread: Uuid) -> Server {
                             );
                             assert_eq!(r["params"]["threadId"], thread.to_string());
                             let text = r["params"]["input"][0]["text"].as_str().unwrap();
-                            assert!(text.len() <= 6000 && text.contains("Inspect evidence"));
+                            assert!(
+                                text.len() <= 6000
+                                    && text.contains("tasks")
+                                    && !text.contains("Inspect evidence")
+                            );
                             let prior = count.fetch_add(1, Ordering::SeqCst);
                             if prior == 0 {
                                 assert!(text.contains("agent ack"));

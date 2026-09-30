@@ -23,6 +23,15 @@ struct RunArgs {
 }
 
 enum Command {
+    WatchChanges {
+        group: String,
+        after: Option<String>,
+    },
+    WaitMail {
+        group: String,
+        id: i64,
+        timeout: Option<i64>,
+    },
     AckDelivery {
         group: String,
         nonce: uuid::Uuid,
@@ -794,6 +803,33 @@ async fn run(cli: RunArgs) -> Result<()> {
                 serde_json::to_value(store.work_history(&actor, &id).await?)?
             }
         },
+        Command::WatchChanges { group, after } => {
+            use std::io::Write;
+            let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+            let mut watch = store.watch(&actor, after.as_deref()).await?;
+            println!(
+                "{}",
+                json!({"type":"ready","group":group,"agent":actor.name,"cursor":watch.cursor()})
+            );
+            std::io::stdout().flush()?;
+            loop {
+                let batch = watch.next().await?;
+                println!("{}", serde_json::to_string(&batch)?);
+                std::io::stdout().flush()?;
+            }
+        }
+        Command::WaitMail { group, id, timeout } => {
+            let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+            serde_json::to_value(
+                store
+                    .wait_mail(
+                        &actor,
+                        id,
+                        timeout.map(|seconds| std::time::Duration::from_secs(seconds as u64)),
+                    )
+                    .await?,
+            )?
+        }
         Command::Watch {
             group,
             after,

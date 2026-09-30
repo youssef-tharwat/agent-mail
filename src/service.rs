@@ -226,16 +226,9 @@ async fn wake(
             None
         }
     };
-    // Group names are validated ASCII identifiers; no message content enters the prompt.
-    let mut text = format!(
-        "Agent Mail: work or mail changed. Run agent-mail context --group {}. Handle relevant obligations.",
-        binding.group_name
-    );
-    if let Some(nonce) = challenge.as_deref() {
-        text.push('\n');
-        text.push_str(&crate::verification::challenge(binding, nonce));
-    }
-    anyhow::ensure!(text.len() <= 480, "wake-up exceeds size limit");
+    let text = store
+        .herdr_notification_text(binding, challenge.as_deref())
+        .await?;
     herdr::call(
         socket,
         "agent.prompt",

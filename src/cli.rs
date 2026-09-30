@@ -56,6 +56,12 @@ enum Action {
         #[arg(long, default_value_t = 0)]
         mail_after: i64,
     },
+    /// Stream small change batches; resume with a cursor from an earlier batch.
+    Watch {
+        /// Exclusive resume cursor from watch output. Omit to start now.
+        #[arg(long)]
+        after: Option<String>,
+    },
     /// Send, read and resolve durable requests.
     #[command(subcommand)]
     Mail(Mail),
@@ -123,6 +129,13 @@ enum Mail {
     List {
         #[arg(long, default_value_t = 0)]
         after: i64,
+    },
+    /// Wait for all recipients to settle a sent request, or its deadline.
+    Wait {
+        id: i64,
+        /// Stop earlier than the request deadline, e.g. 30s or 5m.
+        #[arg(long,value_parser=parse_duration)]
+        timeout: Option<i64>,
     },
     /// Read one message addressed to this agent.
     Show { id: i64 },
@@ -453,7 +466,7 @@ impl Cli {
             command,
             &[
                 ("Start", &["init", "run"]),
-                ("Coordinate", &["context", "task", "mail"]),
+                ("Coordinate", &["context", "task", "mail", "watch"]),
                 ("Manage", &["status", "agent"]),
                 ("Integrations", &["runtime", "service"]),
             ],
@@ -512,6 +525,7 @@ impl Cli {
             let agent = matches!(
                 &command,
                 Action::Context { .. }
+                    | Action::Watch { .. }
                     | Action::Agent(Agent::Ack { .. })
                     | Action::Mail(_)
                     | Action::Task(_)
@@ -608,7 +622,9 @@ impl Cli {
                     replace,
                 },
             },
+            Action::Watch { after } => Command::WatchChanges { group, after },
             Action::Mail(mail) => match mail {
+                Mail::Wait { id, timeout } => Command::WaitMail { group, id, timeout },
                 Mail::Send {
                     recipient,
                     summary,

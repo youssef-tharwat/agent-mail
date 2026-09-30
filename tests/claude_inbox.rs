@@ -141,7 +141,8 @@ async fn socket_write_is_unconfirmed_until_matching_hook_and_cancellation_uses_p
         )
         .await?
         .unwrap();
-    assert!(context.to_string().contains("Inspect evidence"));
+    assert!(!context.to_string().contains("Inspect evidence"));
+    assert!(context.to_string().contains("changes"));
     let context_text = context["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .context("Claude notification did not return its delivery context")?;

@@ -417,7 +417,9 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
             None
         }
     };
-    let text = store.delivery_text(actor, challenge.as_deref()).await?;
+    let text = store
+        .delivery_text(actor, challenge.as_deref(), endpoint.scanned)
+        .await?;
     // Hold the binding lock during the bounded send: replacement/detachment cannot race it.
     let mut tx = store.pool().begin().await?;
     Store::lock_actor(&mut tx, actor).await?;

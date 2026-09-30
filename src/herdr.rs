@@ -94,7 +94,7 @@ impl Agent {
     /// Session details are absent, inconsistent, or use an unsupported identity kind.
     pub fn identity(&self) -> Result<&Session> {
         let session = self.agent_session.as_ref().context(
-            "native agent identity is unavailable; enable the agent's Herdr integration",
+            "Herdr has not reported a native session identity for this pane; `agent bind` requires one. Herdr is optional: launch a standalone managed session with `agent-mail run NAME -- codex` or `agent-mail run NAME -- claude`, or enable the client's Herdr integration and retry the pane bind",
         )?;
         ensure!(
             !session.value.is_empty() && !self.terminal_id.is_empty(),
@@ -104,6 +104,42 @@ impl Agent {
             self.agent.as_deref() == Some(session.agent.as_str()),
             "agent and native session identity disagree"
         );
+        Ok(session)
+    }
+
+    /// Validate a binding identity and diagnose a caller pane mismatch without trusting it.
+    ///
+    /// The caller pane is used only to explain missing Herdr identity. It is never used
+    /// as the identity being bound.
+    ///
+    /// # Errors
+    /// The selected pane has no native identity, or its session details are inconsistent.
+    pub fn identity_for_bind(
+        &self,
+        target: &str,
+        caller_pane: Option<&str>,
+        caller_session: Option<&str>,
+    ) -> Result<&Session> {
+        if self.agent_session.is_none()
+            && let Some(caller_pane) = caller_pane
+            && caller_pane != target
+        {
+            bail!(
+                "the selected Herdr pane {target:?} has no native session identity, while this process inherits HERDR_PANE_ID={caller_pane:?}. These identify different panes, so Agent Mail will not bind using the inherited identity. Verify the selected pane's Herdr session/integration, then retry when Herdr reports its native session identity"
+            );
+        }
+        let session = self.identity()?;
+        if caller_pane == Some(target)
+            && session.agent == "codex"
+            && session.kind == SessionKind::Id
+            && let Some(caller_session) = caller_session
+        {
+            ensure!(
+                session.value == caller_session,
+                "Herdr reports pane {target:?} as Codex session {:?}, but this Codex process reports session {caller_session:?}; no binding was changed. Resolve the pane/session mismatch before retrying",
+                session.value
+            );
+        }
         Ok(session)
     }
 
@@ -171,7 +207,14 @@ pub async fn call(socket: &Path, method: &str, params: Value) -> Result<Value> {
 /// The RPC fails or the response does not describe an agent.
 pub async fn agent(socket: &Path, target: &str) -> Result<Agent> {
     let result = call(socket, "agent.get", json!({"target": target})).await?;
-    serde_json::from_value(result["agent"].clone()).context("decode Herdr agent")
+    let agent: Agent =
+        serde_json::from_value(result["agent"].clone()).context("decode Herdr agent")?;
+    ensure!(
+        agent.pane_id == target,
+        "Herdr returned pane {:?} for explicitly selected pane {target:?}; no binding was changed",
+        agent.pane_id
+    );
+    Ok(agent)
 }
 
 /// List agents from an explicitly selected Herdr session.
@@ -230,7 +273,13 @@ impl Store {
             self.group(group).await?.socket.is_some(),
             "configure a Herdr socket before binding"
         );
-        let session = agent.identity()?;
+        let inherited_pane = std::env::var("HERDR_PANE_ID").ok();
+        let caller_session = std::env::var("CODEX_SESSION_ID").ok();
+        let session = agent.identity_for_bind(
+            &agent.pane_id,
+            inherited_pane.as_deref(),
+            caller_session.as_deref(),
+        )?;
         let binding = Binding::Herdr(HerdrBinding {
             pane: agent.pane_id.clone(),
             terminal: agent.terminal_id.clone(),
@@ -262,10 +311,94 @@ impl Store {
         );
         let binding = self.caller(&group.name, &pane).await?;
         let live = agent(Path::new(configured_socket), &pane).await?;
+        let caller_session = std::env::var("CODEX_SESSION_ID").ok();
+        live.identity_for_bind(&pane, Some(&pane), caller_session.as_deref())?;
         ensure!(
             live.matches(&binding),
             "participant binding no longer matches this agent; operator rebinding is required"
         );
         Ok(binding)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn missing_session_agent() -> Agent {
+        Agent {
+            pane_id: "w6:p5E".into(),
+            terminal_id: "terminal-1".into(),
+            agent: Some("codex".into()),
+            agent_session: None,
+            agent_status: AgentStatus::Idle,
+            interactive_ready: true,
+            launch_pending: false,
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn missing_identity_reports_mismatched_inherited_pane_without_using_it() {
+        let error = missing_session_agent()
+            .identity_for_bind("w6:p5E", Some("wS:p2"), Some("codex-session"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("HERDR_PANE_ID=\"wS:p2\""));
+        assert!(error.contains("will not bind"));
+        assert!(error.contains("different panes"));
+    }
+
+    #[test]
+    fn matching_or_absent_caller_context_keeps_the_direct_identity_diagnostic() {
+        let agent = missing_session_agent();
+        assert!(
+            agent
+                .identity_for_bind("w6:p5E", Some("w6:p5E"), None)
+                .unwrap_err()
+                .to_string()
+                .contains("Herdr has not reported a native session identity")
+        );
+        assert!(
+            agent
+                .identity_for_bind("w6:p5E", None, None)
+                .unwrap_err()
+                .to_string()
+                .contains("Herdr has not reported a native session identity")
+        );
+    }
+
+    #[test]
+    fn same_pane_codex_session_mismatch_is_rejected_before_binding() {
+        let agent = Agent {
+            pane_id: "wS:p2".into(),
+            terminal_id: "terminal-2".into(),
+            agent: Some("codex".into()),
+            agent_session: Some(Session {
+                agent: "codex".into(),
+                kind: SessionKind::Id,
+                value: "herdr-session".into(),
+            }),
+            agent_status: AgentStatus::Idle,
+            interactive_ready: true,
+            launch_pending: false,
+            cwd: None,
+        };
+        let error = agent
+            .identity_for_bind("wS:p2", Some("wS:p2"), Some("codex-session"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("pane/session mismatch"));
+        assert!(
+            agent
+                .identity_for_bind("wS:p2", Some("wS:p2"), Some("herdr-session"))
+                .is_ok()
+        );
+        // An operator may explicitly bind a different pane based on its Herdr snapshot.
+        assert!(
+            agent
+                .identity_for_bind("wS:p2", Some("wS:p1"), Some("codex-session"))
+                .is_ok()
+        );
     }
 }

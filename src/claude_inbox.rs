@@ -174,7 +174,7 @@ impl Store {
             None
         };
         let context = if receipt {
-            Some(self.delivery_text(actor, challenge.as_deref()).await?)
+            Some(self.delivery_text(actor, challenge.as_deref(), 0).await?)
         } else {
             None
         };

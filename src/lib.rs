@@ -97,6 +97,9 @@ pub mod attention;
 
 pub mod stream;
 
+/// Resumable grouped watches and event-driven request waits.
+pub mod watch;
+
 pub mod doctor;
 
 pub mod claude;

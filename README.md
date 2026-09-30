@@ -19,17 +19,19 @@ Prebuilt binaries for macOS and Linux, ARM64 and x86-64. No Rust compiler needed
 
 ## Start
 
-Create a group:
+Create one isolated group for this project or fleet. This adds a group to the
+existing local store; it does not join or change another group's agents, tasks or
+inbox. Use the same group name for its agents:
 
 ```sh
-agent-mail init project
+agent-mail init my-project
 ```
 
 Launch each agent in its own terminal:
 
 ```sh
-agent-mail run coordinator -- codex
-agent-mail run worker -- claude
+agent-mail --group my-project run coordinator -- codex
+agent-mail --group my-project run worker -- claude
 ```
 
 `run` creates a missing identity, starts the shared delivery worker when needed,
@@ -52,8 +54,22 @@ agent-mail mail send coordinator "Review complete; evidence: reviews/api.md" \
 ```
 
 The task's creator is its **writer** and records decisions. Its **owner** does the
-work and reports results. Task changes publish notifications automatically.
-Reading or delivering a message never accepts a task.
+work and reports results. Task changes publish notifications automatically. Reading or delivering a
+message never accepts a task.
+
+Follow changes without polling, then fetch only the changed records:
+
+```sh
+agent-mail watch
+agent-mail mail show 42
+agent-mail task show api-review
+```
+
+`watch` starts from the current position and prints a resumable cursor with each
+small grouped batch. Save the latest cursor after handling its batch and resume
+with `agent-mail watch --after CURSOR`. `mail wait ID` returns on the first reply, when all recipients resolve without
+a reply, or at the request deadline. `--timeout 5m` sets an earlier limit. Waiting
+never resolves the request or changes its task.
 [Assignment, review and acceptance](docs/agent-guide.md#assignment--result--decision).
 
 ## Check delivery
@@ -90,7 +106,7 @@ Use `status --json` for full structured evidence. [Delivery details](docs/usage.
 | Category | Commands | Purpose |
 |---|---|---|
 | Start | `init`, `run` | Create a group and launch agents. |
-| Coordinate | `context`, `task`, `mail` | Recover assignments, manage tasks and exchange requests. |
+| Coordinate | `context`, `task`, `mail`, `watch` | Recover assignments, manage tasks, exchange requests and follow changes. |
 | Manage | `status`, `agent` | Check delivery, retry, or manage registrations. |
 | Integrations | `runtime`, `service` | Configure manual integrations and worker supervision. |
 
@@ -119,8 +135,9 @@ updates. [Installation and update details](docs/usage.md#agent-skill).
 herdr plugin install youssef-tharwat/agent-mail
 ```
 
-Herdr owns sessions and panes; Mail owns coordination. Native managed launches work
-without Herdr. [Herdr setup and prompt policy](docs/usage.md#optional-herdr-integration).
+Herdr is optional: Mail works with standalone managed launches. Binding an existing
+Herdr pane requires Herdr's agent integration to report its native session identity;
+the Agent Mail Herdr plugin only handles delivery. [Herdr setup and prompt policy](docs/usage.md#optional-herdr-integration).
 Fleet Campaign is also optional; your workflow defines review and acceptance rules.
 
 ## More
