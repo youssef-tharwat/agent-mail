@@ -409,7 +409,7 @@ clears prior launch evidence; an old session cannot establish new readiness.
 ## Existing installations
 
 Upgrade the binary, then use Agent Mail normally. Commands, hooks, managed launches
-and worker startup automatically upgrade an existing store to schema 17. Missing
+and worker startup automatically upgrade an existing store to schema 18. Missing
 stores still require `agent-mail init GROUP`. Help, the skill guide and read-only
 `status --check NAME` diagnostics do not migrate state.
 
@@ -641,7 +641,10 @@ agent-mail attention history --mail 42
 
 `attention show` fetches an occurrence addressed to your identity. Its `current`
 field identifies superseded work, and its `followup` gives the current source and
-metadata version. Fetch that task/mail before acting. `attention checkpoint` also
+metadata version. Mail occurrences include the original message and the addressed
+delivery's current disposition in `mail`; task occurrences require `task show`
+before acting. A sender reading escalated mail does not mark it retrieved for the
+recipient or gain authority to resolve that delivery. `attention checkpoint` also
 lets the request sender handle an escalation without borrowing the recipient's
 identity. Only the task writer or request sender may set `extend_until`, together
 with a nonempty `reason`, to authorize a later escalation boundary. Repeated reads,

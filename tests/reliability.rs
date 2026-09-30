@@ -532,7 +532,7 @@ async fn cli_worker_crash_keeps_messages_and_reservations() -> Result<()> {
             .await
             .prompts
             .iter()
-            .any(|p| !p.starts_with("Agent Mail delivery check."))
+            .any(|p| p.starts_with("Agent Mail changes:"))
         {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -554,7 +554,7 @@ async fn cli_worker_crash_keeps_messages_and_reservations() -> Result<()> {
             .await
             .prompts
             .iter()
-            .filter(|p| !p.starts_with("Agent Mail delivery check."))
+            .filter(|p| p.starts_with("Agent Mail changes:"))
             .count(),
         1
     );

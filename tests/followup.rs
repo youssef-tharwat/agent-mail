@@ -140,6 +140,82 @@ async fn retrieved_work_is_reminded_then_escalated_without_business_mutation() -
     Ok(())
 }
 #[tokio::test]
+async fn escalated_mail_is_visible_to_sender_without_receipting_or_resolving_for_owner()
+-> Result<()> {
+    let f = Fixture::new().await?;
+    let message = f.mail("unread-result").await?;
+    followup::reconcile(&f.store, f.time + 241).await?;
+    let id = f.store.attention_list(&f.writer, 0).await?["items"][0]["id"]
+        .as_i64()
+        .unwrap();
+    assert!(f.store.message(&f.writer, message).await.is_err());
+    let detail = f.store.attention_show(&f.writer, id).await?;
+    assert_eq!(detail["current"], true);
+    assert_eq!(detail["mail"]["id"], message);
+    assert_eq!(detail["mail"]["sender"], "writer");
+    assert_eq!(detail["mail"]["summary"], "Decision needed");
+    assert_eq!(detail["mail"]["body"], "Evidence");
+    assert_eq!(detail["mail"]["state"], "pending");
+    assert!(
+        f.store.followup_status(Some("g"), f.time + 242).await?["items"][0]["retrieved_at"]
+            .is_null()
+    );
+    assert!(
+        f.store
+            .resolve(
+                &f.writer,
+                message,
+                "cannot act as owner",
+                None,
+                f.time + 242
+            )
+            .await
+            .is_err()
+    );
+    assert!(f.store.attention_show(&f.owner, id).await.is_err());
+    f.store.register("g", "outsider", false).await?;
+    let outsider = f.store.mailbox("g", "outsider").await?;
+    assert!(f.store.attention_show(&outsider, id).await.is_err());
+    assert_eq!(f.store.inbox(&f.owner, 0).await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn self_escalation_receipts_only_the_mail_actually_returned() -> Result<()> {
+    let f = Fixture::new().await?;
+    let message = f
+        .store
+        .publish(
+            &f.owner,
+            Publish {
+                recipients: vec!["owner".into()],
+                key: "self".into(),
+                summary: "Own decision".into(),
+                body: "Read this source".into(),
+                due_after: None,
+                reply_to: None,
+                work_id: None,
+            },
+            f.time,
+        )
+        .await?;
+    f.mail("still-unread").await?;
+    followup::reconcile(&f.store, f.time + 241).await?;
+    let id = f.store.attention_list(&f.owner, 0).await?["items"][0]["id"]
+        .as_i64()
+        .unwrap();
+    let detail = f.store.attention_show(&f.owner, id).await?;
+    assert_eq!(detail["mail"]["id"], message);
+    assert_eq!(detail["mail"]["body"], "Read this source");
+    let status = f.store.followup_status(Some("g"), f.time + 242).await?;
+    for plan in status["items"].as_array().unwrap() {
+        assert_eq!(plan["retrieved_at"].is_null(), plan["message"] != message);
+    }
+    assert_eq!(f.store.inbox(&f.owner, 0).await?.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
 async fn checkpoint_is_versioned_retry_safe_and_never_grants_writer_authority() -> Result<()> {
     let f = Fixture::new().await?;
     f.task("review").await?;
@@ -546,7 +622,7 @@ async fn operator_retry_budget_survives_restart_and_route_repair() -> Result<()>
         .configure_followups(
             "g",
             &Policy {
-                notifier: Some(vec!["/usr/bin/true".into()]),
+                notifier: Some(vec!["/usr/bin/tee".into()]),
                 ..policy
             },
             f.time + 2001,

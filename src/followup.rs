@@ -2,8 +2,8 @@
 //! Checkpoints report intent. Only ordinary task/mail operations settle work.
 use crate::{
     bounded,
-    states::{EventKind, TaskState},
-    store::{Mailbox, Store},
+    states::{EventKind, MessageState, TaskState},
+    store::{Mailbox, Message, Store},
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -399,6 +399,32 @@ impl Store {
             .bind(row.get::<i64, _>("followup"))
             .fetch_one(&mut *tx)
             .await?;
+        // Escalations go to the original sender, whose inbox cannot read the
+        // recipient's delivery. Expose this one authorized source, preserving
+        // its recipient's disposition and retrieval identity.
+        let mail = if let Some(message) = plan.message {
+            ensure!(
+                plan.group_name == actor.group_name
+                    && (actor.id == plan.recipient || actor.id == plan.authority),
+                "source is not addressed to this agent"
+            );
+            let item = sqlx::query_as!(Message,
+                "SELECT m.id,b.name AS sender,m.summary,m.body,m.created,m.deadline AS due,d.state AS 'state: MessageState',d.reply_id,m.work_id FROM messages m JOIN deliveries d ON d.message=m.id JOIN mailboxes b ON b.id=m.sender WHERE m.id=? AND d.recipient=?",
+                message, plan.recipient).fetch_one(&mut *tx).await?;
+            if actor.id == plan.recipient {
+                Self::retrieve_tx(
+                    &mut tx,
+                    actor,
+                    EventKind::MailPending,
+                    &message.to_string(),
+                    0,
+                )
+                .await?;
+            }
+            Some(item)
+        } else {
+            None
+        };
         let active: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM active_attention WHERE id=?)")
                 .bind(id)
@@ -414,7 +440,7 @@ impl Store {
         .await?;
         tx.commit().await?;
         Ok(
-            json!({"id":id,"current":active,"stage":row.get::<i64,_>("stage"),"reason":row.get::<String,_>("reason"),"followup":plan.value()?,"instruction":"Fetch the current task/mail. Act within its authority or record a checkpoint/blocker. Retrieval does not settle work."}),
+            json!({"id":id,"current":active,"stage":row.get::<i64,_>("stage"),"reason":row.get::<String,_>("reason"),"followup":plan.value()?,"mail":mail,"instruction":"Read the included mail or fetch the current task. Act within its authority or record a checkpoint/blocker. Retrieval does not settle work."}),
         )
     }
     /// Record source retrieval for all runtimes, separately from transport receipts.

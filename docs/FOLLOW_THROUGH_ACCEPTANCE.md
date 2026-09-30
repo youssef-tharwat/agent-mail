@@ -33,6 +33,7 @@ correctly act on every prompt.
 | Coverage | Evidence |
 |---|---|
 | Retrieve, ignore, remind twice, escalate, settle | `tests/followup.rs` |
+| Sender source access, no false recipient receipt, exact self-retrieval | `tests/followup.rs` |
 | Exhausted unread delivery never gains a new owner budget | `tests/followup.rs` |
 | Checkpoint authority, versions, exact retries, unchanged reports | `tests/followup.rs` |
 | Explicit hold, dependency cycles, reply-before-wait, late dependency | `tests/followup.rs` |
@@ -52,8 +53,12 @@ RUSTC_WRAPPER= cargo clippy --locked --all-targets --all-features -- -D warnings
 RUSTC_WRAPPER= cargo test --locked --all-features
 ```
 
-Result: formatting and strict Clippy passed; **137 tests passed**, including
-19 follow-through tests and one documentation test. `git diff --check` passed.
+Result for v0.10.1: formatting and strict Clippy passed; **139 tests passed**,
+including 21 follow-through tests and one documentation test. `git diff --check`
+passed. The unpublished v0.10.0 candidate exposed two Linux fixture races: the
+worker-crash test matched an outdated probe prefix, and the success notifier
+exited without consuming its payload. The corrected fixtures preserve their
+original reservation and delivery assertions.
 
 `RUSTC_WRAPPER` is cleared because the local sccache wrapper could not operate in
 the sandbox. Socket fixtures ran with sandbox escalation. Release CI repeats checks
@@ -61,7 +66,8 @@ on macOS and Linux; local validation alone is not evidence for those runners.
 
 ## Live acceptance
 
-Two actual Codex clients were launched through `agent-mail run` in a disposable
+Two actual Codex clients were launched through `agent-mail run` using the v0.10.0
+candidate in a disposable
 directory and group, using workspace sandboxing and normal on-request approvals.
 New hook trust was declined; each client loaded the candidate binary's guide during
 bootstrap, and the managed launcher established its native endpoint independently.

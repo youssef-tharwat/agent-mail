@@ -391,8 +391,10 @@ not permission to resume an action. Owners report blockers; writers still make t
 decisions. On version conflict, fetch current records and reconsider.
 
 `attention list` is paginated. `attention show ID` states whether the occurrence
-is still current; fetching it only stops its delivery retry. Handle the source or
-record a checkpoint. A writer/sender receiving an escalation may use
+is still current and includes the source message for mail occurrences. Read that
+message, or fetch the source task, then act or record a checkpoint. Reading it does
+not settle the source; a sender's read does not receipt the recipient's delivery.
+A writer/sender receiving an escalation may use
 `attention checkpoint ID --key KEY --file PATH`; an explicit later `extend_until`
 requires that authority and an audited `reason`. Existing reports and all deadlines
 remain visible through task/mail details and `attention history --task ID` or

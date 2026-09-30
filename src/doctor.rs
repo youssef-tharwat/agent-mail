@@ -210,7 +210,7 @@ pub async fn inspect(
         report.add(
             "stream",
             Level::Pass,
-            "Authenticated version 1 subscription accepted",
+            "Authenticated event subscription accepted",
             None,
         );
     } else {
