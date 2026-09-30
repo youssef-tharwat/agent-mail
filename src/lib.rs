@@ -117,3 +117,9 @@ pub mod readiness;
 
 /// Closed coordination state vocabularies.
 pub mod states;
+
+/// Automatic store migration and coordinated local worker replacement.
+pub mod upgrade;
+
+/// Durable checkpoints and bounded follow-through reconciliation.
+pub mod followup;

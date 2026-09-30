@@ -23,6 +23,29 @@ struct RunArgs {
 }
 
 enum Command {
+    Checkpoint {
+        group: String,
+        source: agent_mail::followup::Source,
+        key: String,
+        report: agent_mail::followup::Checkpoint,
+    },
+    AttentionList {
+        group: String,
+        after: i64,
+    },
+    AttentionShow {
+        group: String,
+        id: i64,
+    },
+    AttentionHistory {
+        group: String,
+        task: Option<String>,
+        mail: Option<i64>,
+    },
+    AttentionConfigure {
+        group: String,
+        policy: agent_mail::followup::Policy,
+    },
     WatchChanges {
         group: String,
         after: Option<String>,
@@ -251,6 +274,13 @@ enum Bridge {
 }
 
 enum WorkCommand {
+    Checkpoint {
+        group: String,
+        id: String,
+        version: i64,
+        key: String,
+        report: agent_mail::followup::Checkpoint,
+    },
     /// Apply a JSON decision and optionally resolve a linked request atomically.
     Decide {
         group: String,
@@ -343,6 +373,10 @@ async fn run(cli: RunArgs) -> Result<()> {
                 root.join("mail.db").is_file(),
                 "run agent-mail init GROUP first"
             );
+            agent_mail::upgrade::open(&root, agent_mail::upgrade::OpenMode::Existing)
+                .await?
+                .close()
+                .await;
             supervision::install(&root)?;
             println!("{}", json!({"installed":true}));
             return Ok(());
@@ -353,27 +387,22 @@ async fn run(cli: RunArgs) -> Result<()> {
             return Ok(());
         }
         Command::Restore => {
+            agent_mail::upgrade::open(&root, agent_mail::upgrade::OpenMode::Existing)
+                .await?
+                .close()
+                .await;
             let restored = supervision::restore(&root)?;
             println!("{}", json!({"restored":restored}));
             return Ok(());
         }
         _ => {}
     }
-    let setup = matches!(cli.command, Command::Setup { .. });
-    // Enrolling another group only writes rows. Reserve the exclusive schema
-    // lock for first initialization or an actual schema upgrade.
-    let store = if setup {
-        match Store::open(&root, false).await {
-            Ok(store) => store,
-            Err(_) => Store::open(&root, true)
-                .await
-                .with_context(|| format!("open Agent Mail store {}", root.display()))?,
-        }
-    } else {
-        Store::open(&root, false)
-            .await
-            .with_context(|| format!("open Agent Mail store {}", root.display()))?
+    let mode = match &cli.command {
+        Command::Setup { .. } => agent_mail::upgrade::OpenMode::Initialize,
+        Command::Service(Service::Run { .. }) => agent_mail::upgrade::OpenMode::Worker,
+        _ => agent_mail::upgrade::OpenMode::Existing,
     };
+    let store = agent_mail::upgrade::open(&root, mode).await?;
     let output: Value = match cli.command {
         Command::Setup {
             group,
@@ -604,6 +633,37 @@ async fn run(cli: RunArgs) -> Result<()> {
                 .await?;
             json!({"id":id,"persisted":true,"delivery":store.message_delivery_outcome(&group,id).await})
         }
+        Command::Checkpoint {
+            group,
+            source,
+            key,
+            report,
+        } => {
+            let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+            store
+                .checkpoint(&actor, source, &key, report, now()?)
+                .await?
+        }
+        Command::AttentionConfigure { group, policy } => {
+            store.configure_followups(&group, &policy, now()?).await?;
+            json!({"group":group,"policy":policy})
+        }
+        Command::AttentionList { group, after } => {
+            let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+            store.attention_list(&actor, after).await?
+        }
+        Command::AttentionShow { group, id } => {
+            let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+            store.attention_show(&actor, id).await?
+        }
+        Command::AttentionHistory { group, task, mail } => {
+            let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+            json!(
+                store
+                    .checkpoint_history(&actor, task.as_deref(), mail)
+                    .await?
+            )
+        }
         Command::Inbox {
             group,
             message,
@@ -611,7 +671,9 @@ async fn run(cli: RunArgs) -> Result<()> {
         } => {
             let actor = store.authenticate(&group, cli.session.as_ref()).await?;
             if let Some(id) = message {
-                serde_json::to_value(store.message(&actor, id).await?)?
+                let mut value = serde_json::to_value(store.message(&actor, id).await?)?;
+                value["followup"] = store.source_followup(&actor, None, Some(id)).await?;
+                value
             } else {
                 let records = store.inbox(&actor, after).await?;
                 let mut items = Vec::new();
@@ -746,6 +808,24 @@ async fn run(cli: RunArgs) -> Result<()> {
             json!({"event":event,"acknowledged":true,"resolved":false})
         }
         Command::Work(command) => match command {
+            WorkCommand::Checkpoint {
+                group,
+                id,
+                version,
+                key,
+                report,
+            } => {
+                let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+                store
+                    .checkpoint(
+                        &actor,
+                        agent_mail::followup::Source::Task { id, version },
+                        &key,
+                        report,
+                        now()?,
+                    )
+                    .await?
+            }
             WorkCommand::Decide { group, id, update } => {
                 let actor = store.authenticate(&group, cli.session.as_ref()).await?;
                 let mut value =
@@ -791,7 +871,9 @@ async fn run(cli: RunArgs) -> Result<()> {
             }
             WorkCommand::Show { group, id } => {
                 let actor = store.authenticate(&group, cli.session.as_ref()).await?;
-                serde_json::to_value(store.work_show(&actor, &id).await?)?
+                let mut value = serde_json::to_value(store.work_show(&actor, &id).await?)?;
+                value["followup"] = store.source_followup(&actor, Some(&id), None).await?;
+                value
             }
             WorkCommand::List { group, after } => {
                 let actor = store.authenticate(&group, cli.session.as_ref()).await?;

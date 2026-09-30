@@ -161,7 +161,8 @@ async fn session_tick_inner(
                     DeliveryState::Settled
                 } else if !agent.matches(&binding) {
                     DeliveryState::BindingMismatch
-                } else if !agent.ready() {
+                } else if let Some(reason) = agent.readiness_reason() {
+                    detail = Some(reason.into());
                     DeliveryState::Busy
                 } else if item.attempts >= 3 && !fresh {
                     DeliveryState::Exhausted
@@ -254,6 +255,8 @@ async fn wake(
 /// # Errors
 /// Database access or a spawned session task fails.
 pub async fn tick(store: &Store, time: i64) -> Result<Vec<Observation>> {
+    crate::followup::reconcile(store, time).await?;
+    crate::followup::notify_operators(store, time).await?;
     let mut pending = Vec::new();
     let mut observations = crate::native::tick(store, time).await?;
     for item in store.pending().await? {
@@ -363,6 +366,7 @@ pub async fn run(store: &Store, once: bool) -> Result<()> {
     } else {
         Some(crate::stream::Server::start(store.clone())?)
     };
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut last_relay = None::<tokio::time::Instant>;
     let mut relay_jobs = JoinSet::<Result<Vec<Value>>>::new();
     let mut relay_report = Vec::new();
@@ -375,7 +379,12 @@ pub async fn run(store: &Store, once: bool) -> Result<()> {
             verification_jobs
                 .spawn(async move { crate::verification::reconcile(&state, time).await });
         }
-        let result = tick(store, time).await;
+        let result = tokio::select! {
+            result=tick(store,time)=>result,
+            ()=async {if let Some(server)=&stream {server.upgrade_requested().await} else {std::future::pending::<()>().await}}=>{break;},
+            result=tokio::signal::ctrl_c()=>{result?;break;},
+            _=terminate.recv()=>{break;},
+        };
         if relay_jobs.is_empty()
             && last_relay.is_none_or(|last| last.elapsed() >= Duration::from_secs(30))
         {
@@ -427,6 +436,8 @@ pub async fn run(store: &Store, once: bool) -> Result<()> {
             () = tokio::time::sleep(Duration::from_secs(5)) => {},
             () = async { if let Some(server)=&stream { server.changed().await } else { std::future::pending::<()>().await } } => {},
             result = tokio::signal::ctrl_c() => { result?; break; }
+            _ = terminate.recv() => { break; }
+            () = async { if let Some(server)=&stream { server.upgrade_requested().await } else { std::future::pending::<()>().await } } => { break; }
         }
     }
     verification_jobs.abort_all();

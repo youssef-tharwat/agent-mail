@@ -65,7 +65,7 @@ fn agent(pane: &str) -> Agent {
             value: format!("session-{pane}"),
         }),
         agent_status: agent_mail::herdr::AgentStatus::Idle,
-        interactive_ready: true,
+        interactive_ready: Some(true),
         launch_pending: false,
         cwd: None,
     }

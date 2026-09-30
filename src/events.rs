@@ -35,7 +35,8 @@ impl Store {
         subject: &str,
         version: i64,
     ) -> Result<()> {
-        if actor.binding.herdr().is_some() {
+        Self::retrieve_followup_tx(tx, actor, kind, subject, version, crate::now()?).await?;
+        if actor.binding.herdr().is_some() || kind == EventKind::AttentionDue {
             let kind = kind.as_str();
             sqlx::query!("INSERT OR IGNORE INTO event_receipts(recipient,binding_version,event) SELECT recipient,?,id FROM coordination_events WHERE recipient=? AND kind=? AND subject=? AND version<=?",actor.binding_version,actor.id,kind,subject,version).execute(&mut **tx).await?;
         }
@@ -314,14 +315,15 @@ impl Store {
                     .iter()
                     .map(|event| (event.kind, event.subject.clone(), event.version)),
             );
-            let payload = serde_json::json!({"new_mail":changes.new_mail,"mail_updates":changes.mail_updates,"tasks":changes.tasks,"more":more});
-            let mut text = if limit <= 480 {
-                payload.to_string()
-            } else {
+            let payload = serde_json::json!({"new_mail":changes.new_mail,"mail_updates":changes.mail_updates,"tasks":changes.tasks,"followups":changes.followups,"more":more});
+            let instruction = "Agent Mail changes: fetch task/mail/attention IDs with show; act or checkpoint. More: context.\n";
+            let mut text = if limit > 480 {
                 format!(
-                    "Agent Mail changes (IDs only). Fetch with task show or mail show; Stop only assignments that are closed or reassigned. Group: {}.\n{}",
-                    actor.group_name, payload
+                    "{instruction}Stop only assignments that are closed or reassigned. Group: {}.\n{payload}",
+                    actor.group_name
                 )
+            } else {
+                format!("{instruction}{payload}")
             };
             if let Some(nonce) = challenge {
                 text.push('\n');
@@ -330,10 +332,19 @@ impl Store {
             if text.len() <= limit {
                 return Ok(text);
             }
-            ensure!(
-                !visible.is_empty(),
-                "compact notification exceeds {limit} bytes"
-            );
+            if visible.is_empty() {
+                let mut recovery = String::from(
+                    "Agent Mail changes: run agent-mail context and attention list; fetch records, act or checkpoint.\n",
+                );
+                if let Some(nonce) = challenge {
+                    recovery.push_str(&crate::verification::challenge(actor, nonce));
+                }
+                ensure!(
+                    recovery.len() <= limit,
+                    "notification recovery instruction exceeds transport limit"
+                );
+                return Ok(recovery);
+            }
             visible.remove(0);
             more = true;
         }

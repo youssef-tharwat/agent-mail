@@ -1,6 +1,9 @@
 //! Regression coverage for migration behavior.
 mod support;
-use agent_mail::store::Store;
+use agent_mail::{
+    store::Store,
+    upgrade::{self, OpenMode},
+};
 use anyhow::Result;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::fs;
@@ -38,11 +41,11 @@ async fn existing_version_four_state_upgrades_to_opt_in_sync() -> Result<()> {
         .await?;
     pool.close().await;
 
-    let store = Store::open(&root, true).await?;
+    let store = upgrade::open(&root, OpenMode::Existing).await?;
     let version = sqlx::query!("PRAGMA user_version")
         .fetch_one(&support::pool(&store).await?)
         .await?;
-    assert_eq!(version.user_version, Some(17));
+    assert_eq!(version.user_version, Some(18));
     let peer = uuid::Uuid::new_v4();
     store.add_peer(peer, "test-host").await?;
     assert!(!store.peers_status().await?[0].auto_sync);
@@ -72,7 +75,7 @@ async fn populated_version_five_keeps_mail_work_bindings_and_foreign_keys() -> R
     "#).execute(&pool).await?;
     pool.close().await;
     assert!(Store::open(&root, false).await.is_err());
-    let store = Store::open(&root, true).await?;
+    let store = upgrade::open(&root, OpenMode::Existing).await?;
     let worker = store.mailbox("g", "b").await?;
     assert_eq!(worker.id, 42);
     assert_eq!(
@@ -152,7 +155,7 @@ async fn invalid_legacy_references_abort_the_migration_atomically() -> Result<()
         .execute(&mut *connection).await?;
     drop(connection);
     pool.close().await;
-    assert!(Store::open(&root, true).await.is_err());
+    assert!(upgrade::open(&root, OpenMode::Existing).await.is_err());
     let options = SqliteConnectOptions::new().filename(root.join("mail.db"));
     let pool = SqlitePoolOptions::new().connect_with(options).await?;
     assert_eq!(
@@ -221,7 +224,7 @@ async fn published_six_eight_nine_and_ten_upgrade_with_binding_and_receipts_inta
             sqlx::raw_sql("INSERT INTO codex_wakes(recipient,binding_version,socket,thread,delivered,attempts,next_attempt) VALUES(1,1,'/tmp/test.sock','00000000-0000-4000-8000-000000000003',1,2,400);").execute(&pool).await?;
         }
         pool.close().await;
-        let store = Store::open(&root, true).await?;
+        let store = upgrade::open(&root, OpenMode::Existing).await?;
         let actor = store.mailbox("g", "owner").await?;
         assert_eq!(store.work_show(&actor, "task").await?.version, 1);
         if version >= 8 {
@@ -282,7 +285,7 @@ async fn typed_lifecycle_migration_validates_history_and_rolls_back_ambiguity() 
         let snapshot = serde_json::json!({"group_name":"g","id":"task","scope":"Review","owner":"owner","writer":"owner","state":history,"open":true,"next_action":"Review","deadline":null,"accepted_revision":null,"evidence":[],"version":1,"updated":100}).to_string();
         sqlx::query!("INSERT INTO work_changes(group_name,work_id,version,actor,reason,snapshot,changed) VALUES('g','task',1,'owner','Created',?,100)",snapshot).execute(&pool).await?;
         pool.close().await;
-        let migrated = Store::open(&root, true).await;
+        let migrated = upgrade::open(&root, OpenMode::Existing).await;
         if succeeds {
             let store = migrated?;
             let actor = store.mailbox("g", "owner").await?;
@@ -341,7 +344,7 @@ async fn version_sixteen_upgrades_without_changing_business_or_legacy_budgets() 
     fs::create_dir_all(&migrations)?;
     for entry in fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))? {
         let entry = entry?;
-        if entry.file_name().to_string_lossy().starts_with("0017_") {
+        if entry.file_name().to_string_lossy()[..4].parse::<u32>()? > 16 {
             continue;
         }
         fs::copy(entry.path(), migrations.join(entry.file_name()))?;
@@ -364,7 +367,7 @@ async fn version_sixteen_upgrades_without_changing_business_or_legacy_budgets() 
       INSERT INTO work_items(group_name,id,scope,owner,writer,state,next_action,updated) VALUES ('g','task','Review','owner','owner','review','Review report',100);
     "#).execute(&pool).await?;
     pool.close().await;
-    let store = Store::open(&root, true).await?;
+    let store = upgrade::open(&root, OpenMode::Existing).await?;
     let actor = store.mailbox("g", "owner").await?;
     assert_eq!(
         (actor.attempts, actor.next_wake, actor.alerted),
@@ -381,7 +384,160 @@ async fn version_sixteen_upgrades_without_changing_business_or_legacy_budgets() 
             .fetch_one(&pool)
             .await?
             .user_version,
-        Some(17)
+        Some(18)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_first_use_migrates_once_and_keeps_a_verified_backup() -> Result<()> {
+    let temp = tempfile::Builder::new()
+        .prefix("am-upgrade-")
+        .tempdir_in("/tmp")?;
+    let (root, pool) = version_five(&temp).await?;
+    pool.close().await;
+    let (first, second) = tokio::join!(
+        upgrade::open(&root, OpenMode::Existing),
+        upgrade::open(&root, OpenMode::Existing)
+    );
+    first?.close().await;
+    second?.close().await;
+    let backups = fs::read_dir(root.join("backups"))?.collect::<std::io::Result<Vec<_>>>()?;
+    assert_eq!(backups.len(), 1);
+    let pool = SqlitePoolOptions::new()
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(backups[0].path())
+                .read_only(true),
+        )
+        .await?;
+    assert_eq!(
+        sqlx::query!("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await?
+            .user_version,
+        Some(5)
+    );
+    assert_eq!(
+        sqlx::query!("PRAGMA quick_check")
+            .fetch_one(&pool)
+            .await?
+            .quick_check
+            .as_deref(),
+        Some("ok")
+    );
+    pool.close().await;
+    assert!(!root.join("upgrade.json").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn automatic_open_never_initializes_missing_state_or_downgrades() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("missing");
+    assert!(upgrade::open(&root, OpenMode::Existing).await.is_err());
+    assert!(!root.exists());
+    let store = upgrade::open(&root, OpenMode::Initialize).await?;
+    store.enroll("g", None).await?;
+    store.close().await;
+    let pool = SqlitePoolOptions::new()
+        .connect_with(SqliteConnectOptions::new().filename(root.join("mail.db")))
+        .await?;
+    sqlx::query!("PRAGMA user_version=19")
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+    let error = upgrade::open(&root, OpenMode::Existing).await.unwrap_err();
+    assert!(error.to_string().contains("downgrade"));
+    assert!(!root.join("backups").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn backup_failure_leaves_the_original_store_untouched() -> Result<()> {
+    let temp = tempfile::Builder::new()
+        .prefix("am-backup-")
+        .tempdir_in("/tmp")?;
+    let (root, pool) = version_five(&temp).await?;
+    pool.close().await;
+    fs::write(root.join("backups"), "blocks backup directory creation")?;
+    assert!(upgrade::open(&root, OpenMode::Existing).await.is_err());
+    let pool = SqlitePoolOptions::new()
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(root.join("mail.db"))
+                .read_only(true),
+        )
+        .await?;
+    assert_eq!(
+        sqlx::query!("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await?
+            .user_version,
+        Some(5)
+    );
+    assert_eq!(
+        sqlx::query!("SELECT COUNT(*) AS 'count!:i64' FROM pragma_table_info('mailboxes') WHERE name='terminal'")
+            .fetch_one(&pool)
+            .await?
+            .count,
+        1
+    );
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_cli_commands_upgrade_but_diagnostics_remain_read_only() -> Result<()> {
+    let temp = tempfile::Builder::new()
+        .prefix("am-cli-upgrade-")
+        .tempdir_in("/tmp")?;
+    let (root, pool) = version_five(&temp).await?;
+    pool.close().await;
+    let binary = env!("CARGO_BIN_EXE_agent-mail");
+    let diagnostic = tokio::process::Command::new(binary)
+        .arg("--state-dir")
+        .arg(&root)
+        .args(["--group", "g", "status", "--check"])
+        .output()
+        .await?;
+    assert!(!diagnostic.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&diagnostic.stdout)?;
+    assert_eq!(report["checks"][0]["check"], "database");
+    assert!(!root.join("backups").exists());
+    // Selection of a sole group happens before normal command dispatch. This
+    // path must migrate rather than reject the historical schema at selection.
+    let output = tokio::process::Command::new(binary)
+        .arg("--state-dir")
+        .arg(&root)
+        .args(["remote", "id"])
+        .output()
+        .await?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Remote id has no group selection, so exercise that path separately on a
+    // fresh old store with an ordinary group-scoped status.
+    let temp = tempfile::Builder::new()
+        .prefix("am-scoped-upgrade-")
+        .tempdir_in("/tmp")?;
+    let (root, pool) = version_five(&temp).await?;
+    // Seed a historical group so selection can succeed after migration.
+    sqlx::raw_sql("INSERT INTO node VALUES ('00000000-0000-4000-8000-000000000001'); INSERT INTO groups(name,socket,home_machine) VALUES ('g','','00000000-0000-4000-8000-000000000001');").execute(&pool).await?;
+    pool.close().await;
+    let output = tokio::process::Command::new(binary)
+        .arg("--state-dir")
+        .arg(&root)
+        .args(["--group", "g", "status", "--json"])
+        .output()
+        .await?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(root.join("backups").is_dir());
     Ok(())
 }

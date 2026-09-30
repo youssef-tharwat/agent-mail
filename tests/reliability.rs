@@ -54,7 +54,7 @@ fn agent(pane: &str) -> Agent {
             value: format!("session-{pane}"),
         }),
         agent_status: agent_mail::herdr::AgentStatus::Idle,
-        interactive_ready: true,
+        interactive_ready: Some(true),
         launch_pending: false,
         cwd: None,
     }
@@ -318,9 +318,14 @@ async fn bursts_batch_and_retry_budget_survives_restarts() -> Result<()> {
     assert_eq!(f.host.lock().await.prompts.len(), 1);
     assert!(f.host.lock().await.prompts[0].contains("agent ack"));
     let prompt = f.host.lock().await.prompts[0].clone();
-    let notice: Value = serde_json::from_str(prompt.split_once('\n').unwrap().0)?;
-    assert!(notice["new_mail"].as_array().unwrap().len() <= 5);
-    assert_eq!(notice["more"], true);
+    assert!(prompt.contains("act or checkpoint"));
+    if let Some(line) = prompt.lines().find(|line| line.starts_with('{')) {
+        let notice: Value = serde_json::from_str(line)?;
+        assert!(notice["new_mail"].as_array().unwrap().len() <= 5);
+        assert_eq!(notice["more"], true);
+    } else {
+        assert!(prompt.contains("agent-mail context"));
+    }
     agent_mail::verification::reconcile(&f.store, 1000).await?;
     // The other registered lane has no pending notification, so it receives its
     // one bounded standalone probe. The busy target is challenged in its wake.
@@ -1139,5 +1144,38 @@ async fn alerted_legacy_inbox_still_wakes_a_done_agent() -> Result<()> {
     service::tick(&f.store, 1000).await?;
     assert_eq!(f.host.lock().await.prompts.len(), 1);
     assert_eq!(f.store.mailbox("g", "b").await?.attempts, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn manually_started_done_client_wakes_without_launch_metadata() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.send("manual-session").await?;
+    {
+        let mut host = f.host.lock().await;
+        host.agents[1].interactive_ready = None;
+        host.agents[1].agent_status = agent_mail::herdr::AgentStatus::Done;
+    }
+    service::tick(&f.store, 1000).await?;
+    assert_eq!(f.host.lock().await.prompts.len(), 1);
+    assert!(f.host.lock().await.prompts[0].contains("act or checkpoint"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_unready_and_blocked_clients_keep_precise_reasons() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.send("not-ready").await?;
+    f.host.lock().await.agents[1].interactive_ready = Some(false);
+    let report = service::tick(&f.store, 1000).await?;
+    assert_eq!(report[0].detail.as_deref(), Some("not_interactive"));
+    {
+        let mut host = f.host.lock().await;
+        host.agents[1].interactive_ready = None;
+        host.agents[1].agent_status = agent_mail::herdr::AgentStatus::Blocked;
+    }
+    let report = service::tick(&f.store, 1001).await?;
+    assert_eq!(report[0].detail.as_deref(), Some("approval_or_question"));
+    assert!(f.host.lock().await.prompts.is_empty());
     Ok(())
 }

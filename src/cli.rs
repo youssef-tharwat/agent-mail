@@ -2,7 +2,6 @@
 use super::{Bridge, Command, RunArgs, Service, WorkCommand, read_body};
 use agent_mail::states::{NativeRuntime, TaskState};
 use agent_mail::{
-    store::Store,
     supervision,
     work::{WorkPatch, WorkUpdate},
 };
@@ -68,6 +67,9 @@ enum Action {
     /// Create, inspect and update versioned assignments.
     #[command(subcommand)]
     Task(Task),
+    /// Inspect scheduled attention and configure follow-through.
+    #[command(subcommand)]
+    Attention(Attention),
     /// Register, inspect and retry agents.
     #[command(subcommand)]
     Agent(Agent),
@@ -103,6 +105,15 @@ enum Action {
 }
 #[derive(Subcommand)]
 enum Mail {
+    /// Record a next step or waiting condition without resolving work.
+    Checkpoint {
+        id: i64,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
+
     /// Send a new request. Reuse the key only for an identical retry.
     Send {
         /// Primary recipient in this group.
@@ -160,6 +171,16 @@ enum Mail {
 }
 #[derive(Subcommand)]
 enum Task {
+    /// Report progress for the observed task revision without changing task state.
+    Checkpoint {
+        id: String,
+        #[arg(long)]
+        version: i64,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
     /// Assign a task. Identical creation retries return the original result.
     Create {
         id: String,
@@ -199,6 +220,36 @@ enum Task {
     },
     /// Inspect recent versions and the reasons for each change.
     History { id: String },
+}
+#[derive(Subcommand)]
+enum Attention {
+    /// Record a next step for an addressed occurrence; authority may extend its review time.
+    Checkpoint {
+        id: i64,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Read my current attention occurrences; fetching details records retrieval.
+    List {
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+    },
+    /// Fetch an addressed occurrence and current source references.
+    Show { id: i64 },
+    /// Inspect checkpoint history for a task or inbox delivery.
+    History {
+        #[arg(long, conflicts_with = "mail", required_unless_present = "mail")]
+        task: Option<String>,
+        #[arg(long)]
+        mail: Option<i64>,
+    },
+    /// Operator: configure observation/dispatch, intervals and optional notifier.
+    Configure {
+        #[arg(long)]
+        file: PathBuf,
+    },
 }
 #[derive(Args, Default)]
 #[group(id = "changes", multiple = true)]
@@ -504,6 +555,7 @@ impl Cli {
             &command,
             Action::Init { .. }
                 | Action::Service(_)
+                | Action::Status { check: Some(_), .. }
                 | Action::Status {
                     all_groups: true,
                     ..
@@ -519,7 +571,7 @@ impl Cli {
                 )
         );
         let group = if scoped {
-            let store = Store::open(&root, false)
+            let store = agent_mail::upgrade::open(&root, agent_mail::upgrade::OpenMode::Existing)
                 .await
                 .with_context(|| format!("open Agent Mail store {}", root.display()))?;
             let agent = matches!(
@@ -529,6 +581,12 @@ impl Cli {
                     | Action::Agent(Agent::Ack { .. })
                     | Action::Mail(_)
                     | Action::Task(_)
+                    | Action::Attention(
+                        Attention::List { .. }
+                            | Attention::Show { .. }
+                            | Attention::History { .. }
+                            | Attention::Checkpoint { .. }
+                    )
                     | Action::Adapter(_)
                     | Action::Status { .. }
             );
@@ -581,6 +639,23 @@ impl Cli {
                 json,
             },
             Action::Service(s) => Command::Service(s),
+            Action::Attention(attention) => match attention {
+                Attention::Checkpoint { id, key, file } => Command::Checkpoint {
+                    group,
+                    source: agent_mail::followup::Source::Attention { id },
+                    key,
+                    report: serde_json::from_str(&read_body(&file)?)?,
+                },
+                Attention::List { after } => Command::AttentionList { group, after },
+                Attention::Show { id } => Command::AttentionShow { group, id },
+                Attention::History { task, mail } => {
+                    Command::AttentionHistory { group, task, mail }
+                }
+                Attention::Configure { file } => Command::AttentionConfigure {
+                    group,
+                    policy: serde_json::from_str(&read_body(&file)?)?,
+                },
+            },
             Action::Agent(p) => match p {
                 Agent::Retry { name } => Command::Retry { group, name },
                 Agent::Ack { nonce } => Command::AckDelivery { group, nonce },
@@ -624,6 +699,12 @@ impl Cli {
             },
             Action::Watch { after } => Command::WatchChanges { group, after },
             Action::Mail(mail) => match mail {
+                Mail::Checkpoint { id, key, file } => Command::Checkpoint {
+                    group,
+                    source: agent_mail::followup::Source::Mail { id },
+                    key,
+                    report: serde_json::from_str(&read_body(&file)?)?,
+                },
                 Mail::Wait { id, timeout } => Command::WaitMail { group, id, timeout },
                 Mail::Send {
                     recipient,
@@ -696,6 +777,18 @@ impl Cli {
             },
             Action::Task(task) => {
                 Command::Work(match task {
+                    Task::Checkpoint {
+                        id,
+                        version,
+                        key,
+                        file,
+                    } => WorkCommand::Checkpoint {
+                        group,
+                        id,
+                        version,
+                        key,
+                        report: serde_json::from_str(&read_body(&file)?)?,
+                    },
                     Task::Create {
                         id,
                         task,

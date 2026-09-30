@@ -17,7 +17,7 @@ use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sqlx::{
-    Sqlite, SqlitePool, Transaction,
+    Connection, Sqlite, SqlitePool, Transaction,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
 use std::{
@@ -139,10 +139,10 @@ struct StoreInner {
 
 /// Excludes migration for the lifetime of all store handles.
 #[derive(Debug)]
-struct DatabaseGuard(std::fs::File);
+pub(crate) struct DatabaseGuard(std::fs::File);
 
 impl DatabaseGuard {
-    fn acquire(root: &Path, exclusive: bool) -> Result<Self> {
+    pub(crate) fn acquire(root: &Path, exclusive: bool) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -280,6 +280,9 @@ pub struct Pending {
     pub alerted: i64,
 }
 
+/// Schema understood by this binary.
+pub(crate) const SCHEMA_VERSION: i64 = 18;
+
 impl Store {
     /// Open a database, optionally creating and migrating its schema.
     ///
@@ -300,6 +303,14 @@ impl Store {
             "state directory missing; run agent-mail init GROUP first"
         );
         let guard = DatabaseGuard::acquire(root, setup)?;
+        Self::open_guarded(root, setup, guard).await
+    }
+
+    pub(crate) async fn open_guarded(
+        root: &Path,
+        setup: bool,
+        guard: DatabaseGuard,
+    ) -> Result<Self> {
         let path = root.join("mail.db");
         if setup && !path.exists() {
             OpenOptions::new()
@@ -328,20 +339,42 @@ impl Store {
             .await?
             .user_version
             .context("SQLite did not report its schema version")?;
-        ensure!(version <= 17, "database schema is newer than this binary");
+        ensure!(
+            version <= SCHEMA_VERSION,
+            "database schema is newer than this binary"
+        );
         if setup {
             // Rebuilding a referenced table requires FK enforcement off outside
             // the migration transaction. The migration checks every FK before commit.
             // The schema guard excludes every other Mail process during setup.
             let mut connection = pool.acquire().await?;
+            if version > 0 && version < SCHEMA_VERSION {
+                let backup = crate::upgrade::backup(&mut connection, root, version).await?;
+                eprintln!(
+                    "agent-mail: migrating schema {version} to {SCHEMA_VERSION}; backup {}",
+                    backup.display()
+                );
+            }
             sqlx::query!("PRAGMA foreign_keys = OFF")
                 .execute(&mut *connection)
                 .await?;
-            let migrated = sqlx::migrate!("./migrations").run(&mut *connection).await;
+            let mut transaction = connection.begin().await?;
+            let migrated = sqlx::migrate!("./migrations").run(&mut *transaction).await;
+            match migrated {
+                Ok(()) => transaction.commit().await?,
+                Err(error) => {
+                    transaction
+                        .rollback()
+                        .await
+                        .context("schema rollback failed")?;
+                    drop(connection);
+                    pool.close().await;
+                    return Err(error).context("schema migration failed; original schema and records preserved; see docs/usage.md for unsupported legacy states");
+                }
+            }
             sqlx::query!("PRAGMA foreign_keys = ON")
                 .execute(&mut *connection)
                 .await?;
-            migrated.context("schema migration failed; legacy task states must use the supported lifecycle with a matching open flag (see docs/usage.md)")?;
             drop(connection);
             if sqlx::query!("SELECT id FROM node LIMIT 1")
                 .fetch_optional(&pool)
@@ -365,7 +398,7 @@ impl Store {
             .await?;
         } else {
             ensure!(
-                version == 17,
+                version == SCHEMA_VERSION,
                 "database schema needs initialization or migration; run agent-mail init GROUP"
             );
         }

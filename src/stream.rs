@@ -17,13 +17,20 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
-    sync::{Notify, Semaphore, broadcast, oneshot},
+    sync::{Notify, Semaphore, broadcast, oneshot, watch},
     task::{JoinHandle, JoinSet},
 };
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
+    WorkerStatus {
+        version: u32,
+    },
+    PrepareUpgrade {
+        version: u32,
+        target_version: String,
+    },
     Changed {
         version: u32,
     },
@@ -36,6 +43,65 @@ enum Request {
         after: i64,
     },
 }
+/// Identity of the running local worker, returned over its private socket.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct WorkerInfo {
+    pub version: String,
+    pub schema: i64,
+    pub executable: PathBuf,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ControlReply {
+    Worker { info: WorkerInfo },
+    UpgradeAccepted,
+    Error { message: String },
+}
+
+async fn control(root: &Path, request: Request) -> Result<ControlReply> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut socket = UnixStream::connect(socket(root)).await?;
+        let mut bytes = serde_json::to_vec(&request)?;
+        bytes.push(b'\n');
+        socket.write_all(&bytes).await?;
+        let mut reader = BufReader::new(socket);
+        let response = line(&mut reader, 4096).await?;
+        let reply: ControlReply = serde_json::from_slice(&response)?;
+        match reply {
+            ControlReply::Error { message } => anyhow::bail!("{message}"),
+            other => Ok(other),
+        }
+    })
+    .await
+    .context("worker control timed out")?
+}
+
+pub(crate) async fn worker_info(root: &Path) -> Result<WorkerInfo> {
+    match control(root, Request::WorkerStatus { version: 1 }).await? {
+        ControlReply::Worker { info } => Ok(info),
+        _ => anyhow::bail!("unexpected worker control response"),
+    }
+}
+
+pub(crate) async fn prepare_upgrade(root: &Path) -> Result<()> {
+    ensure!(
+        matches!(
+            control(
+                root,
+                Request::PrepareUpgrade {
+                    version: 1,
+                    target_version: env!("CARGO_PKG_VERSION").into()
+                }
+            )
+            .await?,
+            ControlReply::UpgradeAccepted
+        ),
+        "worker did not accept upgrade handoff"
+    );
+    Ok(())
+}
+
 /// A versioned subscription response, committed event, or protocol error.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -93,6 +159,7 @@ pub async fn hint(root: &Path) {
 #[derive(Debug)]
 pub struct Server {
     changed: Arc<Notify>,
+    upgrade: Arc<Notify>,
     task: JoinHandle<()>,
     stop: Option<oneshot::Sender<()>>,
 }
@@ -138,6 +205,9 @@ impl Server {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         let changed = Arc::new(Notify::new());
         let notify = changed.clone();
+        let upgrade = Arc::new(Notify::new());
+        let upgrading = upgrade.clone();
+        let (upgrade_signal, _) = watch::channel(false);
         let (stop, mut stopped) = oneshot::channel();
         let task = tokio::spawn(async move {
             let (signals, _) = broadcast::channel::<()>(1);
@@ -149,8 +219,8 @@ impl Server {
                     accepted=listener.accept()=>{
                         let Ok((stream,_))=accepted else {break;};
                         let Ok(permit)=slots.clone().try_acquire_owned() else {continue;};
-                        let store=store.clone();let signals=signals.clone();let notify=notify.clone();let endpoint=Arc::clone(&endpoint);
-                        clients.spawn(async move {let _endpoint=endpoint;let _permit=permit;let _=serve(stream,&store,&signals,&notify).await;});
+                        let store=store.clone();let signals=signals.clone();let notify=notify.clone();let endpoint=Arc::clone(&endpoint);let upgrading=upgrading.clone();let upgrade_signal=upgrade_signal.clone();
+                        clients.spawn(async move {let _endpoint=endpoint;let _permit=permit;let _=serve(stream,&store,&signals,&notify,&upgrading,&upgrade_signal).await;});
                     }
                     _=clients.join_next(),if !clients.is_empty()=>{}
                 }
@@ -162,6 +232,7 @@ impl Server {
         });
         Ok(Self {
             changed,
+            upgrade,
             task,
             stop: Some(stop),
         })
@@ -170,6 +241,10 @@ impl Server {
     /// Wait for a committed-change hint; durable replay remains authoritative.
     pub async fn changed(&self) {
         self.changed.notified().await;
+    }
+
+    pub(crate) async fn upgrade_requested(&self) {
+        self.upgrade.notified().await;
     }
 
     /// Stop the listener and all client tasks before releasing the worker lock.
@@ -211,17 +286,34 @@ async fn serve(
     store: &Store,
     signals: &broadcast::Sender<()>,
     notify: &Notify,
+    upgrading: &Notify,
+    upgrade_signal: &watch::Sender<bool>,
 ) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
     let result:Result<()>=async {
         let bytes=tokio::time::timeout(Duration::from_secs(3),line(&mut read,4096)).await??;
         let request:Request=serde_json::from_slice(&bytes).context("invalid stream request")?;
+        match &request {
+            Request::WorkerStatus {version:1} => {
+                let response=ControlReply::Worker {info:WorkerInfo {version:env!("CARGO_PKG_VERSION").into(),schema:crate::store::SCHEMA_VERSION,executable:std::env::current_exe()?}};
+                let mut bytes=serde_json::to_vec(&response)?; bytes.push(b'\n'); write.write_all(&bytes).await?; return Ok(());
+            }
+            Request::PrepareUpgrade {version:1,target_version} => {
+                ensure!(semver::Version::parse(target_version)? >= semver::Version::parse(env!("CARGO_PKG_VERSION"))?,"worker is newer than the requested executable; automatic downgrade is refused");
+                write.write_all(b"{\"type\":\"upgrade_accepted\"}\n").await?;
+                upgrade_signal.send_replace(true);
+                // Allow subscribers to receive their terminal upgrade frame before the worker drains.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                upgrading.notify_one();return Ok(());
+            }
+            _=>{}
+        }
         let Request::Subscribe{version,group,participant,binding,binding_version,mut after}=request else {
             ensure!(matches!(request,Request::Changed{version:1}),"unsupported stream version");
             let _=signals.send(());notify.notify_one();return Ok(());
         };
-        ensure!(version==1 && after>=0,"unsupported version or cursor");
+        ensure!(version==2 && after>=0,"unsupported stream version; upgrade client for attention events");
         let actor=store.mailbox(&group,&participant).await?;
         ensure!(actor.binding==*binding && actor.binding_version==binding_version,"binding changed or credential invalid; reconnect with current identity");
         if let Binding::Herdr(bound)=&*binding {
@@ -232,20 +324,23 @@ async fn serve(
         ensure!(!matches!(*binding,Binding::Remote{..}),"remote routes cannot subscribe locally");
         // Subscribe before replay. A racing commit is either in replay or its pending signal.
         let mut receiver=signals.subscribe();
-        send(&mut write,&Frame::Ready{version:1,participant:participant.clone(),binding_version}).await?;
+        let mut upgrade=upgrade_signal.subscribe();
+        send(&mut write,&Frame::Ready{version:2,participant:participant.clone(),binding_version}).await?;
         loop {
+            ensure!(!*upgrade.borrow(),"store upgrade in progress; resume with the new binary and saved cursor");
             let mut tx=store.pool().begin().await?;
             Store::check_actor(&mut tx,&actor).await?;
             let rows=sqlx::query!("SELECT id,kind,subject,version FROM coordination_events WHERE recipient=? AND id>? ORDER BY id LIMIT 32",actor.id,after).fetch_all(&mut *tx).await?;
             tx.commit().await?;
             let full=rows.len()==32;
             for row in rows {
-                send(&mut write,&Frame::Event{version:1,participant:participant.clone(),binding_version,id:row.id,kind:row.kind,subject:row.subject,revision:row.version}).await?;
+                send(&mut write,&Frame::Event{version:2,participant:participant.clone(),binding_version,id:row.id,kind:row.kind,subject:row.subject,revision:row.version}).await?;
                 after=row.id;
             }
             if full {continue;}
             tokio::select! {
                 _=receiver.recv()=>{},
+                _=upgrade.changed()=>{},
                 _=tokio::time::sleep(Duration::from_secs(5))=>{},
                 ended=read.fill_buf()=>{ensure!(!ended?.is_empty(),"subscriber disconnected");anyhow::bail!("unexpected subscriber input");}
             }
@@ -277,7 +372,7 @@ pub async fn connect(
         .await
         .context("Mail worker unavailable; start agent-mail service run")?;
     let request = Request::Subscribe {
-        version: 1,
+        version: 2,
         group: actor.group_name.clone(),
         participant: actor.name.clone(),
         binding: Box::new(actor.binding.clone()),

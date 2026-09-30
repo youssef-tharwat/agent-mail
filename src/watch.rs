@@ -24,6 +24,8 @@ pub struct Changes {
     pub new_mail: Vec<Change>,
     /// Replies, resolutions or withdrawals on existing requests.
     pub mail_updates: Vec<Change>,
+    /// Scheduled follow-through occurrences; fetch with attention show.
+    pub followups: Vec<Change>,
     /// Changed assignments.
     pub tasks: Vec<Change>,
 }
@@ -32,8 +34,12 @@ impl Changes {
         let mut new_mail = BTreeMap::new();
         let mut mail_updates = BTreeMap::new();
         let mut tasks = BTreeMap::new();
+        let mut followups = BTreeMap::new();
         for (kind, id, revision) in events {
             match kind {
+                EventKind::AttentionDue => {
+                    followups.insert(id, revision);
+                }
                 EventKind::WorkChanged => {
                     tasks.insert(id, revision);
                 }
@@ -46,6 +52,13 @@ impl Changes {
             }
         }
         Self {
+            followups: followups
+                .into_iter()
+                .map(|(id, revision)| Change {
+                    id,
+                    revision: Some(revision),
+                })
+                .collect(),
             new_mail: new_mail
                 .into_iter()
                 .map(|(id, ())| Change { id, revision: None })
@@ -128,7 +141,7 @@ impl Watch {
         let mut reader = stream::connect(&store, &actor, after).await?;
         match stream::next(&mut reader).await? {
             Frame::Ready {
-                version: 1,
+                version: 2,
                 participant,
                 binding_version,
             } if participant == actor.name && binding_version == actor.binding_version => {}
@@ -170,7 +183,7 @@ impl Watch {
                         }
                     }
                     Ok(Frame::Ready {
-                        version: 1,
+                        version: 2,
                         participant,
                         binding_version,
                     }) if participant == actor.name && binding_version == actor.binding_version => {

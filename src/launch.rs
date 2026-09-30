@@ -1,5 +1,5 @@
 //! Operator-owned launch context. No global current-agent state or credential files.
-use agent_mail::{identity::Binding, store::Store};
+use agent_mail::identity::Binding;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::{
@@ -37,7 +37,7 @@ pub(super) fn hook_settings(claude: bool, executable: &str) -> Value {
 
 pub(super) async fn launch(root: &Path, group: &str, name: &str, args: &[OsString]) -> Result<()> {
     let (program, forwarded) = args.split_first().context("provide a command after --")?;
-    let store = Store::open(root, false).await?;
+    let store = agent_mail::upgrade::open(root, agent_mail::upgrade::OpenMode::Existing).await?;
     let actor = store.launch_identity(group, name).await?;
     let Binding::Standalone { session } = &actor.binding else {
         bail!("run requires a standalone agent; Herdr owns launches for pane-bound agents")
@@ -271,7 +271,7 @@ async fn interactive(
         eprintln!("agent-mail: idle delivery needs `agent-mail service run` in another terminal");
     }
     let mut client = AsyncCommand::from(ui).kill_on_drop(true).spawn()?;
-    let store = Store::open(root, false).await?;
+    let store = agent_mail::upgrade::open(root, agent_mail::upgrade::OpenMode::Existing).await?;
     let mut discovery = Box::pin(async {
         loop {
             if store.runtime_enabled(actor).await? {

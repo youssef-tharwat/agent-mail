@@ -47,7 +47,7 @@ async fn replay_live_restart_and_binding_rotation() -> Result<()> {
     let mut client = stream::connect(&store, &owner, 0).await?;
     assert!(matches!(
         next(&mut client).await?,
-        Frame::Ready { version: 1, .. }
+        Frame::Ready { version: 2, .. }
     ));
     let cursor = match next(&mut client).await? {
         Frame::Event { id, subject, .. } => {

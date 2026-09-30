@@ -85,7 +85,7 @@ pub async fn inspect(
                 "database",
                 Level::Fail,
                 "Database cannot be opened with the current schema",
-                Some("Stop the worker, back up state, and run agent-mail init GROUP to migrate"),
+                Some("Use the upgraded binary and run agent-mail init GROUP; migration and worker handoff are automatic"),
             );
             return report;
         }
@@ -96,6 +96,23 @@ pub async fn inspect(
         "Current schema opens successfully",
         None,
     );
+    let selected = if group.is_empty() {
+        match store.select_group(None, session, false).await {
+            Ok(group) => group,
+            Err(error) => {
+                report.add(
+                    "group",
+                    Level::Fail,
+                    error.to_string(),
+                    Some("Select the intended group with --group GROUP"),
+                );
+                return report;
+            }
+        }
+    } else {
+        group.to_owned()
+    };
+    let group = selected.as_str();
     let config = match store.group(group).await {
         Ok(c) => c,
         Err(_) => {
@@ -260,7 +277,7 @@ pub async fn inspect(
                 Some(socket) => crate::herdr::agent(Path::new(&socket), &binding.pane).await,
                 None => Err(anyhow::anyhow!("missing socket")),
             };
-            match live {Ok(live) if live.matches(&actor)=>report.add("endpoint",Level::Pass,json!({"runtime":"herdr","state":live.agent_status,"auto_prompt":config.auto_prompt}),None),_=>report.add("endpoint",Level::Fail,"Herdr identity is unavailable or changed",Some("Verify the pane and explicitly rebind its current session"))}
+            match live {Ok(live) if live.matches(&actor)=>report.add("endpoint",if live.ready(){Level::Pass}else{Level::Warning},json!({"runtime":"herdr","state":live.agent_status,"ready":live.ready(),"ineligible_reason":live.readiness_reason(),"interactive_ready":live.interactive_ready,"auto_prompt":config.auto_prompt}),None),_=>report.add("endpoint",Level::Fail,"Herdr identity is unavailable or changed",Some("Verify the pane and explicitly rebind its current session"))}
         }
         Ok(None) => report.add(
             "endpoint",
@@ -306,6 +323,26 @@ pub async fn inspect(
             "recovery",
             Level::Fail,
             "Cannot read hook evidence",
+            Some("Inspect database health"),
+        ),
+    }
+    match store
+        .followup_status_for(
+            Some(group),
+            crate::now().unwrap_or_default(),
+            Some(actor.id),
+        )
+        .await
+    {
+        Ok(value) => {
+            let needs_attention = value["totals"]["due"].as_i64().unwrap_or(0) > 0
+                || value["totals"]["escalated"].as_i64().unwrap_or(0) > 0;
+            report.add("followthrough",if needs_attention{Level::Warning}else{Level::Pass},json!({"items":value["items"],"totals":value["totals"],"operator_notifications":value["operator_notifications"],"more":value["more"],"remote_followup":"unsupported","reported_progress_is_verified":false}),if needs_attention{Some("Inspect the current source under the responsible identity; record an outcome or checkpoint. Status inspection does not handle it.")}else{None});
+        }
+        Err(_) => report.add(
+            "followthrough",
+            Level::Unknown,
+            "Cannot inspect follow-through",
             Some("Inspect database health"),
         ),
     }

@@ -8,7 +8,7 @@ description: >-
 
 Use the skill bundled with the running binary: `agent-mail --skill`. Startup and
 recovery hooks supply it automatically; do not reload instructions already in
-context. This guide matches 0.9; use the installed binary's guide for older versions.
+context. This guide matches 0.10; use the installed binary's guide for older versions.
 Use `agent-mail COMMAND --help` for syntax. Task/mail/agent operations return JSON;
 `status` is a readable summary, `status --json` returns structured data, and
 `status --check NAME` returns detailed diagnostics. `run` preserves the child interface.
@@ -255,7 +255,11 @@ neither determines which group a new project should use. Cross-group messaging i
 not supported. Never join another campaign or delete its store to bypass a setup
 problem.
 On the current schema, `init GROUP` can add a group while delivery is running;
-an actual schema migration still requires exclusive access.
+schema upgrades automatically coordinate exclusive access, back up the store and
+restart its worker with the current binary. Read-only diagnostics do not migrate.
+If an upgrade interrupts a watch, resume with the upgraded binary and the last
+handled cursor using `watch --after CURSOR`. If migration reports an old command
+holding the store, close that command and retry; never delete the database.
 
 For a new project or fleet, choose a distinct group name and set it up before
 registering or launching agents. `init GROUP` adds the group to the existing store;
@@ -362,3 +366,41 @@ workers waiting for that decision should not poll or invent authorization.
 is invalidated by registration, launch or endpoint changes; a prior successful check
 is not proof of future delivery. Retry schedules are system-owned; agents do not
 maintain timers, acknowledge adapter events, or mark work complete on wake-up.
+
+## Follow through when yielding unfinished work
+
+A notification is a request to fetch current records. Fetch the listed task/mail
+IDs with `task show` or `mail show`, and scheduled `followups` IDs with
+`attention show`. If a compact notification instead supplies recovery commands,
+run them and follow the returned page cursors as needed. A delivery-check
+acknowledgment does not substitute for these reads or the authorized next action.
+
+Finish with an ordinary reply/resolve/task decision when appropriate. If work is
+unfinished when yielding, record its next step and review time using
+`task checkpoint ID --version TASK_VERSION --key KEY --file PATH` or
+`mail checkpoint ID --key KEY --file PATH`. The JSON contains the observed
+`followup.version`, `next_step`, a future UTC Unix `next_check_at`, and optionally
+`waiting` and `evidence`. See `docs/usage.md` or command help for the format.
+This records intent without changing task authority or resolving mail. Do not
+create a checkpoint after every tool call or repeat unchanged reports each turn.
+
+Waiting may name a local same-group task and qualifying states, an outgoing mail
+request, or a person/role responsible for an external condition. Preserve explicit
+approval holds. A condition or timer waking you means reassess the current source,
+not permission to resume an action. Owners report blockers; writers still make task
+decisions. On version conflict, fetch current records and reconsider.
+
+`attention list` is paginated. `attention show ID` states whether the occurrence
+is still current; fetching it only stops its delivery retry. Handle the source or
+record a checkpoint. A writer/sender receiving an escalation may use
+`attention checkpoint ID --key KEY --file PATH`; an explicit later `extend_until`
+requires that authority and an audited `reason`. Existing reports and all deadlines
+remain visible through task/mail details and `attention history --task ID` or
+`--mail ID`.
+
+The service owns follow-up schedules and escalation. Coordinators may end a turn
+while waiting after recording a valid next step. A background `watch` process alone
+does not process events or wake the model. Do not keep a polling loop or reset
+transport budgets to simulate progress. Groups begin in observation mode; operators
+enable dispatch with `attention configure`. Status identifies that mode and whether
+an independent operator notification route exists.

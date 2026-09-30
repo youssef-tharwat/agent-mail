@@ -408,14 +408,30 @@ clears prior launch evidence; an old session cannot establish new readiness.
 
 ## Existing installations
 
-Before migration, stop the delivery worker and client processes and back up the
-state directory. Upgrade the binary, then run `agent-mail init GROUP`; it migrates
-the store through schema 16. Older binaries cannot open the migrated store. Upgrade
-both relay peers before syncing.
+Upgrade the binary, then use Agent Mail normally. Commands, hooks, managed launches
+and worker startup automatically upgrade an existing store to schema 17. Missing
+stores still require `agent-mail init GROUP`. Help, the skill guide and read-only
+`status --check NAME` diagnostics do not migrate state.
 
-On macOS, `agent-mail service uninstall` stops the launchd worker and preserves its
-database. Run `agent-mail service install` after migration. Managed launches load
-the guide bundled with the current binary; skills.sh manages the discoverable loader.
+Upgrades serialize across the shared store, preserve a verified SQLite snapshot in
+`STATE_DIR/backups`, and apply migrations in one transaction. The system stops the
+store's delivery worker and restarts it using the upgraded executable, including
+updating the executable copied by the macOS launchd installation. It preserves
+registrations, pending mail, task history and explicit pause settings. A failed
+migration leaves the original schema and records intact and restores the original
+worker. Interrupted handoffs retain restart intent for the next invocation.
+
+A watch interrupted for migration exits with an upgrade message. Resume it with
+the new binary and the last handled cursor: `agent-mail watch --after CURSOR`.
+Ordinary worker restarts still reconnect automatically. If an old command retains
+a database handle, migration waits briefly and fails without changing the schema;
+close that command and retry. A legacy worker that cannot be uniquely identified
+requires stopping its supervisor once before retrying. External supervisors remain
+operator-owned; automatic managed service replacement supports macOS launchd.
+
+Older binaries cannot open a migrated store. Upgrade both relay peers before
+syncing. Managed launches load the current binary's guide; skills.sh manages the
+discoverable loader.
 
 ## Development
 
@@ -478,7 +494,7 @@ runtime attachments become invalid, and explicit delivery pause remains in effec
 History and coordination records are preserved. Manage remote registrations at home.
 
 Schema 15 imports existing agents as registered/version 1 with an import history entry.
-Run `init GROUP` for migration with the service stopped. Once the schema is current,
+Existing stores migrate automatically on use. Once the schema is current,
 adding other groups does not require stopping delivery. Select campaigns explicitly
 with `--group GROUP`; sharing a store does not mean sharing a group's inboxes.
 Available starting with v0.7.0.
@@ -532,3 +548,137 @@ Herdr remains optional. Its notify-only policy cannot wake idle panes; use nativ
 managed launches or explicitly opt into unguarded Herdr prompts. Verification
 honors pause and policy settings. Custom commands and remote recipients do not
 acquire a native wake route merely by registering.
+
+## Follow-through after delivery
+
+Mail requests stay pending until reply/resolve/withdraw; task decisions still belong
+to their writer. Delivery acknowledgment and record retrieval are separate from a
+recorded outcome. Agent Mail now keeps an attention plan beside each local pending
+request and task. Runtime readiness, retrieval, the next check, and escalations are
+reported separately by `status --json` and `status --check NAME`.
+
+Existing groups start in **observation mode**. To enable follow-up dispatch, an
+operator supplies a complete group policy:
+
+```json
+{"mode":"enabled","interval_seconds":900,"max_seconds":3600,"notifier":null}
+```
+
+```sh
+agent-mail --group project attention configure --file policy.json
+```
+
+The interval controls two follow-up opportunities for retrieved but unhandled work;
+the third check escalates to the task writer or mail sender. Work with no usable
+runtime escalates by `max_seconds`. Exhausted delivery of an unread source escalates
+without resetting the original delivery budget. Existing pause and Herdr prompt
+policies still apply. Switch `mode` to `observe` to stop follow-up dispatch and retain
+its history. These scheduling times are independent of business deadlines.
+
+### Record a next step when yielding
+
+Fetch `task show ID` or `mail show ID` first. The response's `followup.version` is
+the attention metadata version; a task also has its own top-level `version`.
+For unfinished work, use a checkpoint file with UTC Unix seconds:
+
+```json
+{
+  "version": 0,
+  "next_step": "Review the remaining API evidence",
+  "next_check_at": 1790800000,
+  "waiting": null,
+  "evidence": ["repo/path/report.md"]
+}
+```
+
+```sh
+agent-mail task checkpoint api --version 3 --key api-evidence-1 --file checkpoint.json
+agent-mail mail checkpoint 42 --key request-42-review --file checkpoint.json
+```
+
+Replace the example time, IDs and both versions with current values. Times must be
+in the future and within the returned escalation boundary. Identical key/input
+retries are safe; changed retries and stale versions conflict. A task owner may
+report intent, but only the writer changes task state, ownership, acceptance and
+business deadlines. A checkpoint does not accept a task or resolve a request.
+Ordinary final replies and task decisions need no extra checkpoint.
+
+Optional `waiting` values:
+
+```json
+{"kind":"task","id":"dependency","states":["accepted"]}
+```
+
+```json
+{"kind":"mail","id":57}
+```
+
+```json
+{"kind":"external","responsible":"release owner","reason":"Awaiting rollout approval"}
+```
+
+A task dependency must be local and in the same group; cycles are rejected. A mail
+wait names a request **you sent**. An external wait always needs a responsible
+person or role and a next review time. When a condition changes, the agent fetches
+current records and reassesses authority. Expiry of an approval hold does not
+approve the action. An unchanged hold escalates for review instead of telling its
+worker to resume implementation.
+
+If a dependency becomes ready after the wait has escalated, the owner receives one
+reassessment notification. The writer's unresolved escalation remains visible and
+the original escalation boundary is preserved.
+
+### Handle scheduled attention
+
+```sh
+agent-mail attention list
+agent-mail attention list --after 123
+agent-mail attention show 124
+agent-mail attention checkpoint 124 --key review-extension-1 --file checkpoint.json
+agent-mail attention history --task api
+agent-mail attention history --mail 42
+```
+
+`attention show` fetches an occurrence addressed to your identity. Its `current`
+field identifies superseded work, and its `followup` gives the current source and
+metadata version. Fetch that task/mail before acting. `attention checkpoint` also
+lets the request sender handle an escalation without borrowing the recipient's
+identity. Only the task writer or request sender may set `extend_until`, together
+with a nonempty `reason`, to authorize a later escalation boundary. Repeated reads,
+acknowledgments, runtime activity, and identical reports do not extend the boundary.
+
+A checkpoint or ordinary source outcome supersedes its scheduled occurrences.
+Earlier reminders are also superseded when a later reminder/escalation is created.
+An unchanged checkpoint does not supersede an occurrence or grant another interval.
+Neither reading status nor inspecting history records retrieval for another agent.
+
+### Operator alerts and compatibility
+
+Escalation first targets the writer/sender. A self-escalation goes directly to the
+operator; an unhandled escalation reaches that route after five minutes. Herdr
+uses its operator notification surface. Standalone groups can configure `notifier`
+as an array containing an **absolute executable** and arguments. It is launched
+without a shell, receives bounded group/attention JSON on stdin, has a five-second
+timeout, and gets at most three attempts with five-minute cooldowns. An explicitly
+configured notifier takes precedence over Herdr. Configure only a program you
+intend Agent Mail to execute.
+
+Without an operator route, status reports `unconfigured`; it does not claim a human
+was notified. Alert acceptance is also separate from handling the underlying work.
+Changing the configured notifier retries failed, unconfigured, or uncertain alerts
+with a new bounded operator budget. It does not reset business delivery attempts.
+`last_scan_age_seconds` exposes stale worker observations; a stopped worker relies
+on process supervision to restart before it can send anything.
+
+Status totals cover all active sources, even when its detail list is truncated.
+Agent checks filter before pagination. Recovery responses stay within 4 KiB and
+mark only returned records retrieved; `checkpoints_more` directs agents to fetch
+full metadata through `task show` or `mail show`.
+
+Schema 18 adds attention metadata and preserves existing business records and
+receipts. Event subscriptions use protocol 2; an old subscriber gets an explicit
+upgrade error. The existing automatic upgrade path drains the old worker and
+backs up the database. Follow-up dispatch covers local tasks and local deliveries
+on Herdr, managed Codex and managed Claude. Remote task snapshots and cross-machine
+waits remain explicitly unsupported for follow-through; existing relay payloads
+retain their original contract.

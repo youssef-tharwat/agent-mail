@@ -125,7 +125,14 @@ review and acceptance rules; Fleet Campaign is optional too.
 [Architecture](docs/ARCHITECTURE.md) · [Development](docs/usage.md#development) ·
 [Issues](https://github.com/youssef-tharwat/agent-mail/issues)
 
-Update with `brew upgrade youssef-tharwat/tap/agent-mail`. The skill loads the
+Update with `brew upgrade youssef-tharwat/tap/agent-mail`. Existing stores migrate
+automatically on the next use, with a verified backup and worker handoff. The skill loads the
 installed binary's instructions on its next invocation. [Skill updates](docs/usage.md#agent-skill).
+
+### Durable follow-through
+
+Agent Mail can schedule bounded follow-ups for retrieved work that has no outcome,
+track explicit waits, and escalate stalled decisions independently of the coordinator.
+Groups begin in observation mode. See [follow-through configuration and checkpoints](docs/usage.md#follow-through-after-delivery).
 
 Maintained by [Youssef Tharwat](https://github.com/youssef-tharwat). [MIT](LICENSE).

@@ -1,6 +1,6 @@
 [package]
 name = "agent-mail"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Durable tasks and messages for coding agents"
@@ -17,6 +17,7 @@ mimalloc = "0.1"
 futures-util = { version = "0.3", features = ["sink"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = "1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "signal", "process", "sync"] }
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }

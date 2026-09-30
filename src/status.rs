@@ -53,11 +53,11 @@ pub async fn report(store: &Store, group: Option<&str>) -> Result<Value> {
         .collect::<Vec<_>>();
     let mut result = json!({
         "state_dir":root.canonicalize()?,"group":group,"all_groups":group.is_none(),
-        "service_running":service::running(root),"now":now()?,"groups":groups,"inboxes":pending,
+        "service_running":service::running(root),"now":now()?,"last_scan_age_seconds":scan["checked_at"].as_i64().map(|t|now().unwrap_or(t).saturating_sub(t).max(0)),"groups":groups,"inboxes":pending,
         "delivery":store.delivery_statuses(group,now()?).await?,
         "notifications":store.notification_status_for(group).await?,
         "runtime_policy":scoped_rows(store.runtime_policy_status().await?,group),
-        "native":native,"codex":codex,"attention":store.attention_for(group,now()?).await?,"last_scan":scan
+        "followup":store.followup_status(group,now()?).await?,"native":native,"codex":codex,"attention":store.attention_for(group,now()?).await?,"last_scan":scan
     });
     if group.is_none() {
         let (pending, oldest) = store.outbox_status().await?;
@@ -127,6 +127,19 @@ pub async fn summary(store: &Store, group: Option<&str>) -> Result<String> {
         };
         writeln!(output, "{label:<width$}  {detail}")?;
     }
+    let followup = store.followup_status(group, time).await?;
+    writeln!(
+        output,
+        "\nFollow-through: {} pending, {} due, {} escalated{}",
+        followup["totals"]["pending"],
+        followup["totals"]["due"],
+        followup["totals"]["escalated"],
+        if followup["more"] == true {
+            " (detail list truncated; responsible agents can page attention list)"
+        } else {
+            ""
+        }
+    )?;
     output.push_str("\nDetails: agent-mail status --check NAME · JSON: agent-mail status --json");
     if group.is_none() {
         output

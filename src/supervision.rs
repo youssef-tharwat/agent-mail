@@ -92,6 +92,10 @@ pub fn install(root: &Path) -> Result<()> {
             "existing service uses another state directory; uninstall it explicitly first"
         );
     }
+    if path.exists() && crate::service::running(&root) {
+        restore(&root)?;
+        return Ok(());
+    }
     ensure!(
         !crate::service::running(&root),
         "stop the service before installing/updating its executable"
@@ -239,6 +243,90 @@ pub fn save_locator(root: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn owned_running(root: &Path) -> Result<bool> {
+    if !cfg!(target_os = "macos") {
+        return Ok(false);
+    }
+    let (domain, path) = target()?;
+    if !path.exists()
+        || std::fs::read_to_string(&path)? != plist(&root.join("bin/agent-mail"), root)?
+    {
+        return Ok(false);
+    }
+    Ok(Command::new("launchctl")
+        .args(["print", &format!("{domain}/{LABEL}")])
+        .output()?
+        .status
+        .success())
+}
+
+/// Stop an installed launchd job only when it owns this exact store.
+pub(crate) fn suspend_owned(root: &Path) -> Result<bool> {
+    if !cfg!(target_os = "macos") {
+        return Ok(false);
+    }
+    let (domain, path) = target()?;
+    if !path.exists()
+        || std::fs::read_to_string(&path)? != plist(&root.join("bin/agent-mail"), root)?
+    {
+        return Ok(false);
+    }
+    let service_target = format!("{domain}/{LABEL}");
+    if Command::new("launchctl")
+        .args(["print", &service_target])
+        .output()?
+        .status
+        .success()
+    {
+        launch(&["bootout", &service_target])?;
+    }
+    Ok(true)
+}
+
+pub(crate) fn resume_owned(root: &Path, executable: &Path) -> Result<()> {
+    let destination = root.join("bin/agent-mail");
+    let temporary = destination.with_extension("new");
+    std::fs::copy(executable, &temporary)?;
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::File::open(&temporary)?.sync_all()?;
+    std::fs::rename(temporary, destination)?;
+    ensure!(
+        restore(root)?,
+        "owned launchd configuration disappeared during upgrade"
+    );
+    Ok(())
+}
+
+pub(crate) fn spawn_worker(root: &Path, executable: &Path) -> Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(root.join("service.log"))?;
+    let mut command = Command::new(executable);
+    command
+        .args(["--state-dir"])
+        .arg(root)
+        .args(["service", "run"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(log)
+        .process_group(0);
+    for key in [
+        "AGENT_MAIL_SESSION",
+        "AGENT_MAIL_GROUP",
+        "AGENT_MAIL_LAUNCH",
+        "HERDR_ENV",
+        "HERDR_PLUGIN_ID",
+        "HERDR_SOCKET_PATH",
+    ] {
+        command.env_remove(key);
+    }
+    command.spawn().context("start local delivery worker")
+}
+
 /// Establish one local worker and verify its authenticated event stream.
 /// Managed launches fail before starting the client when this cannot be established.
 /// # Errors
@@ -248,37 +336,11 @@ pub async fn ensure_running(
     actor: &crate::store::Mailbox,
     executable: &Path,
 ) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-    use std::process::Stdio;
-    let mut child = None;
-    if !crate::service::running(store.root()) {
-        use std::os::unix::fs::OpenOptionsExt;
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(store.root().join("service.log"))?;
-        let mut command = Command::new(executable);
-        command
-            .args(["--state-dir"])
-            .arg(store.root())
-            .args(["service", "run"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(log)
-            .process_group(0);
-        for key in [
-            "AGENT_MAIL_SESSION",
-            "AGENT_MAIL_GROUP",
-            "AGENT_MAIL_LAUNCH",
-            "HERDR_ENV",
-            "HERDR_PLUGIN_ID",
-            "HERDR_SOCKET_PATH",
-        ] {
-            command.env_remove(key);
-        }
-        child = Some(command.spawn().context("start local delivery worker")?);
-    }
+    let mut child = if !crate::service::running(store.root()) {
+        Some(spawn_worker(store.root(), executable)?)
+    } else {
+        None
+    };
     for _ in 0..80 {
         if crate::service::running(store.root()) {
             let ready = tokio::time::timeout(std::time::Duration::from_millis(100), async {

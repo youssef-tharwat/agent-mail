@@ -102,6 +102,8 @@ string_enum! {
         MailChanged => "mail_changed",
         /// Task changed.
         WorkChanged => "work_changed",
+        /// A scheduled attention occurrence, not a business state change.
+        AttentionDue => "attention_due",
     }
 }
 string_enum! {

@@ -59,6 +59,10 @@ pub enum AgentStatus {
     Idle,
     /// Agent finished its turn.
     Done,
+    /// A turn is active.
+    Working,
+    /// The client is waiting for approval or input.
+    Blocked,
     /// Any other upstream status does not prove readiness.
     #[serde(other)]
     Unknown,
@@ -79,7 +83,7 @@ pub struct Agent {
     pub agent_status: AgentStatus,
     /// Whether the live agent is ready for interactive input.
     #[serde(default)]
-    pub interactive_ready: bool,
+    pub interactive_ready: Option<bool>,
     /// Whether agent launch has not yet completed.
     #[serde(default)]
     pub launch_pending: bool,
@@ -157,11 +161,27 @@ impl Agent {
         })
     }
 
+    /// Explain why a live client cannot accept a prompt.
+    /// Herdr omits launch-readiness metadata for manually started clients. Its
+    /// idle/done states still identify the interactive prompt; explicit false wins.
+    pub fn readiness_reason(&self) -> Option<&'static str> {
+        if self.launch_pending {
+            return Some("launch_pending");
+        }
+        match self.agent_status {
+            AgentStatus::Working => Some("active_turn"),
+            AgentStatus::Blocked => Some("approval_or_question"),
+            AgentStatus::Unknown => Some("unknown_runtime_state"),
+            AgentStatus::Idle | AgentStatus::Done if self.interactive_ready == Some(false) => {
+                Some("not_interactive")
+            }
+            AgentStatus::Idle | AgentStatus::Done => None,
+        }
+    }
+
     /// Check whether Herdr reports an idle, interactive, fully launched agent.
     pub fn ready(&self) -> bool {
-        self.interactive_ready
-            && !self.launch_pending
-            && matches!(self.agent_status, AgentStatus::Idle | AgentStatus::Done)
+        self.readiness_reason().is_none()
     }
 }
 
@@ -332,7 +352,7 @@ mod tests {
             agent: Some("codex".into()),
             agent_session: None,
             agent_status: AgentStatus::Idle,
-            interactive_ready: true,
+            interactive_ready: Some(true),
             launch_pending: false,
             cwd: None,
         }
@@ -380,7 +400,7 @@ mod tests {
                 value: "herdr-session".into(),
             }),
             agent_status: AgentStatus::Idle,
-            interactive_ready: true,
+            interactive_ready: Some(true),
             launch_pending: false,
             cwd: None,
         };

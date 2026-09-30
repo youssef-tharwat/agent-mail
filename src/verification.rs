@@ -165,7 +165,7 @@ pub(crate) fn challenge(actor: &Mailbox, nonce: &str) -> String {
         .map(|path| format!("'{}'", path.replace('\'', "'\\''")))
         .unwrap_or_else(|| "agent-mail".into());
     format!(
-        "Agent Mail delivery check. Run `{binary} --group {} agent ack {nonce}` once as this agent, then continue its assigned work. This only acknowledges delivery. Do not poll or repeat the check.",
+        "Agent Mail delivery check: run `{binary} --group {} agent ack {nonce}` once as this agent. Ack is delivery only; fetch records and act.",
         actor.group_name,
     )
 }
