@@ -627,6 +627,9 @@ async fn run(cli: RunArgs) -> Result<()> {
                     }
                     cursor = id;
                 }
+                store
+                    .retrieved(&actor, &items.iter().map(|m| m.id).collect::<Vec<_>>(), &[])
+                    .await?;
                 let more = available > items.len();
                 json!({"items":items,"more":more,"next_after":cursor})
             }
@@ -795,6 +798,16 @@ async fn run(cli: RunArgs) -> Result<()> {
                 let items = store.work_list(&actor, &after).await?;
                 let more = items.len() > 5;
                 let items: Vec<_> = items.into_iter().take(5).collect();
+                store
+                    .retrieved(
+                        &actor,
+                        &[],
+                        &items
+                            .iter()
+                            .map(|w| (w.id.clone(), w.version))
+                            .collect::<Vec<_>>(),
+                    )
+                    .await?;
                 let next_after = items.last().map(|item| item.id.clone()).unwrap_or(after);
                 json!({"items":items,"more":more,"next_after":next_after})
             }

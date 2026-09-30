@@ -164,6 +164,19 @@ pub async fn inspect(
             json!({"paused":config.paused != 0,"auto_prompt":config.auto_prompt != 0}),
             if config.paused == 0 && config.auto_prompt != 0 { None } else { Some("Resume this group and configure its Herdr prompt policy before relying on automatic delivery") });
     }
+    if actor.binding.herdr().is_some() {
+        match sqlx::query!("SELECT b.attempts AS 'attempts!: i64',b.next_wake AS 'next_wake!: i64',b.wake_attempted AS 'wake_attempted!: i64',MAX(e.id) AS latest FROM mailboxes b LEFT JOIN herdr_wake_events e ON e.recipient=b.id WHERE b.id=? AND b.binding_version=? GROUP BY b.id",actor.id,actor.binding_version).fetch_one(store.pool()).await {
+            Ok(row) => {
+                let fresh=row.latest.is_some_and(|id| id>row.wake_attempted);
+                let attempts=if fresh {0} else {row.attempts};
+                let exhausted=row.latest.is_some() && attempts>=3;
+                report.add("herdr_wake",if exhausted {Level::Fail} else {Level::Pass},
+                    json!({"pending_event":row.latest,"attempted_event":row.wake_attempted,"attempts":attempts,"next_wake":row.next_wake,"new_generation":fresh}),
+                    if exhausted {Some("Inspect and repair the endpoint, then run agent-mail agent retry NAME")} else {None});
+            }
+            Err(_) => report.add("herdr_wake",Level::Fail,"Cannot inspect delivery retry state",Some("Inspect database health and the current binding")),
+        }
+    }
     let stream = tokio::time::timeout(Duration::from_secs(3), async {
         let mut reader = crate::stream::connect(&store, &actor, 0).await?;
         anyhow::ensure!(

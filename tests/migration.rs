@@ -42,7 +42,7 @@ async fn existing_version_four_state_upgrades_to_opt_in_sync() -> Result<()> {
     let version = sqlx::query!("PRAGMA user_version")
         .fetch_one(&support::pool(&store).await?)
         .await?;
-    assert_eq!(version.user_version, Some(16));
+    assert_eq!(version.user_version, Some(17));
     let peer = uuid::Uuid::new_v4();
     store.add_peer(peer, "test-host").await?;
     assert!(!store.peers_status().await?[0].auto_sync);
@@ -329,5 +329,59 @@ async fn typed_lifecycle_migration_validates_history_and_rolls_back_ambiguity() 
             assert_eq!((row.state.as_str(), row.open), (state, open));
         }
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn version_sixteen_upgrades_without_changing_business_or_legacy_budgets() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("state");
+    let migrations = temp.path().join("migrations");
+    fs::create_dir_all(&root)?;
+    fs::create_dir_all(&migrations)?;
+    for entry in fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with("0017_") {
+            continue;
+        }
+        fs::copy(entry.path(), migrations.join(entry.file_name()))?;
+    }
+    let pool = SqlitePoolOptions::new()
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(root.join("mail.db"))
+                .create_if_missing(true),
+        )
+        .await?;
+    sqlx::migrate::Migrator::new(migrations.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+    sqlx::raw_sql(r#"
+      INSERT INTO node VALUES ('00000000-0000-4000-8000-000000000001');
+      INSERT INTO groups(name,socket,home_machine) VALUES ('g','','00000000-0000-4000-8000-000000000001');
+      INSERT INTO mailboxes(id,group_name,name,binding,attempts,next_wake,alerted) VALUES (1,'g','owner','{"runtime":"standalone","session":"00000000-0000-4000-8000-000000000002"}',3,400,1);
+      INSERT INTO work_items(group_name,id,scope,owner,writer,state,next_action,updated) VALUES ('g','task','Review','owner','owner','review','Review report',100);
+    "#).execute(&pool).await?;
+    pool.close().await;
+    let store = Store::open(&root, true).await?;
+    let actor = store.mailbox("g", "owner").await?;
+    assert_eq!(
+        (actor.attempts, actor.next_wake, actor.alerted),
+        (3, 400, 1)
+    );
+    assert_eq!(store.work_show(&actor, "task").await?.version, 1);
+    let pool = support::pool(&store).await?;
+    let row = sqlx::query!("SELECT wake_attempted FROM mailboxes WHERE id=1")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(row.wake_attempted, 0);
+    assert_eq!(
+        sqlx::query!("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await?
+            .user_version,
+        Some(17)
+    );
     Ok(())
 }

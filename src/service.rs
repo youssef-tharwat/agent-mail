@@ -149,6 +149,7 @@ async fn session_tick_inner(
                 continue;
             }
             let binding = store.mailbox(&group.name, &item.name).await?;
+            let (attention, fresh) = store.herdr_attention(&binding).await?;
             let mut detail = None;
             let state = if let Some(agent) = agents.iter().find(|a| {
                 binding
@@ -156,11 +157,13 @@ async fn session_tick_inner(
                     .herdr()
                     .is_some_and(|bound| a.pane_id == bound.pane)
             }) {
-                if !agent.matches(&binding) {
+                if !attention {
+                    DeliveryState::Settled
+                } else if !agent.matches(&binding) {
                     DeliveryState::BindingMismatch
                 } else if !agent.ready() {
                     DeliveryState::Busy
-                } else if item.attempts >= 3 {
+                } else if item.attempts >= 3 && !fresh {
                     DeliveryState::Exhausted
                 } else if item.next_wake > time {
                     DeliveryState::Waiting

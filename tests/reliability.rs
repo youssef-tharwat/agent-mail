@@ -1,4 +1,5 @@
 //! Protocol and process-boundary tests using disposable databases and a fake Herdr socket.
+mod support;
 use agent_mail::work::{WorkDraft, WorkPatch};
 use agent_mail::{
     PLUGIN_ID,
@@ -332,13 +333,13 @@ async fn bursts_batch_and_retry_budget_survives_restarts() -> Result<()> {
     let reopened = Store::open(f.store.root(), false).await?;
     service::tick(&reopened, 5000).await?;
     let host = f.host.lock().await;
-    assert_eq!(host.prompts.len(), 4);
+    assert_eq!(host.prompts.len(), 5);
     assert!(
         host.prompts
             .iter()
             .all(|p| p.len() <= 480 && !p.contains("Durable body"))
     );
-    assert_eq!(host.notifications, 1);
+    assert_eq!(host.notifications, 2);
     drop(host);
     reopened.close().await;
     Ok(())
@@ -909,5 +910,234 @@ async fn herdr_verification_obeys_policy_and_requires_exact_agent_response() -> 
     f.host.lock().await.enabled = false;
     verification::reconcile(&f.store, 1004).await?;
     assert!(!f.store.delivery_status(&f.b, 1004).await?.ready);
+    Ok(())
+}
+
+#[tokio::test]
+async fn retrieved_mail_stays_pending_without_repeated_wakes() -> Result<()> {
+    let f = Fixture::new().await?;
+    let id = f.send("read-but-undecided").await?;
+    service::tick(&f.store, 1000).await?;
+    f.store.message(&f.b, id).await?;
+    service::tick(&f.store, 1300).await?;
+    assert_eq!(f.host.lock().await.prompts.len(), 1);
+    assert_eq!(
+        f.store.inbox(&f.b, 0).await?.len(),
+        1,
+        "retrieval never resolves a request"
+    );
+    f.send("fresh-decision").await?;
+    service::tick(&f.store, 1301).await?;
+    assert_eq!(f.host.lock().await.prompts.len(), 2);
+    assert_eq!(f.store.mailbox("g", "b").await?.attempts, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn new_events_keep_cooldown_and_context_receipts_cover_only_visible_records() -> Result<()> {
+    let f = Fixture::new().await?;
+    for i in 0..8 {
+        f.send(&format!("page-{i}")).await?;
+    }
+    service::tick(&f.store, 1000).await?;
+    let context = f.store.context_value(&f.b, String::new(), 0).await?;
+    let visible = context["mail"].as_array().unwrap();
+    assert_eq!(visible.len(), 5);
+    let notices = f.store.notifications(&f.b, 0).await?;
+    assert_eq!(notices.len(), 3, "hidden page records remain unreceived");
+    f.send("arrived-during-cooldown").await?;
+    service::tick(&f.store, 1001).await?;
+    assert_eq!(f.host.lock().await.prompts.len(), 1);
+    service::tick(&f.store, 1300).await?;
+    assert_eq!(f.host.lock().await.prompts.len(), 2);
+    assert_eq!(f.store.mailbox("g", "b").await?.attempts, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn task_retrieval_never_receipts_a_later_revision() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.store
+        .work_create(
+            &f.a,
+            WorkDraft {
+                id: "revision".into(),
+                scope: "Versioned assignment".into(),
+                owner: "b".into(),
+                state: agent_mail::states::TaskState::Active,
+                next_action: "First action".into(),
+                deadline: None,
+                evidence: vec![],
+            },
+            1000,
+        )
+        .await?;
+    service::tick(&f.store, 1000).await?;
+    f.store.work_show(&f.b, "revision").await?;
+    service::tick(&f.store, 1300).await?;
+    assert_eq!(f.host.lock().await.prompts.len(), 1);
+    f.store
+        .update_work(
+            &f.a,
+            "revision",
+            agent_mail::work::WorkUpdate {
+                version: 1,
+                patch: WorkPatch {
+                    next_action: Some("Second action".into()),
+                    ..WorkPatch::default()
+                },
+                reason: "Next authorized step".into(),
+                resolve_message: None,
+            },
+            1301,
+        )
+        .await?;
+    // A delayed receipt for the old view must leave the new revision actionable.
+    f.store
+        .retrieved(&f.b, &[], &[("revision".into(), 1)])
+        .await?;
+    service::tick(&f.store, 1301).await?;
+    assert_eq!(f.host.lock().await.prompts.len(), 2);
+    assert_eq!(f.store.work_show(&f.b, "revision").await?.version, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn partial_retrieval_does_not_reset_the_same_generation_budget() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.send("older-unread").await?;
+    let latest = f.send("newer-read").await?;
+    service::tick(&f.store, 1000).await?;
+    f.store.message(&f.b, latest).await?;
+    service::tick(&f.store, 1300).await?;
+    assert_eq!(f.store.mailbox("g", "b").await?.attempts, 2);
+    service::tick(&f.store, 1600).await?;
+    service::tick(&f.store, 1900).await?;
+    assert_eq!(f.host.lock().await.prompts.len(), 3);
+    assert_eq!(f.store.inbox(&f.b, 0).await?.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn herdr_exhaustion_diagnostics_are_event_and_group_scoped() -> Result<()> {
+    use agent_mail::attention::AttentionKind;
+    let f = Fixture::new().await?;
+    let id = f.send("unreceived").await?;
+    for now in [1000, 1300, 1600] {
+        service::tick(&f.store, now).await?;
+    }
+    let is_exhausted = |items: &[agent_mail::attention::AttentionItem]| {
+        items
+            .iter()
+            .any(|i| i.participant == "b" && matches!(i.kind, AttentionKind::DeliveryExhausted))
+    };
+    assert!(is_exhausted(
+        &f.store.attention_for(Some("g"), 1600).await?.items
+    ));
+    assert!(!is_exhausted(
+        &f.store.attention_for(Some("other"), 1600).await?.items
+    ));
+    let server = agent_mail::stream::Server::start(f.store.clone())?;
+    let report = agent_mail::doctor::inspect(f.store.root(), "g", Some("b"), None).await;
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|c| c.check == "herdr_wake" && c.status == agent_mail::doctor::Level::Fail)
+    );
+    f.send("fresh-generation").await?;
+    let report = agent_mail::doctor::inspect(f.store.root(), "g", Some("b"), None).await;
+    assert!(report.checks.iter().any(|c| c.check == "herdr_wake"
+        && c.status == agent_mail::doctor::Level::Pass
+        && c.detail["attempts"] == 0));
+    server.shutdown().await?;
+    assert!(
+        !is_exhausted(&f.store.attention_for(Some("g"), 1601).await?.items),
+        "old exhaustion does not describe new work"
+    );
+    service::tick(&f.store, 1900).await?;
+    let pending = f.store.inbox(&f.b, 0).await?;
+    for message in pending {
+        f.store.message(&f.b, message.id).await?;
+    }
+    assert!(!is_exhausted(
+        &f.store.attention_for(Some("g"), 1901).await?.items
+    ));
+    assert_eq!(
+        f.store.message(&f.b, id).await?.state,
+        agent_mail::states::MessageState::Pending
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_recovery_retrieves_visible_mail_without_resolution_or_polling() -> Result<()> {
+    let f = Fixture::new().await?;
+    for i in 0..8 {
+        f.send(&format!("cli-recovery-{i}")).await?;
+    }
+    service::tick(&f.store, 1000).await?;
+    let page = f.cli("w1:p2", &["mail", "list", "--group", "g"]).await?;
+    assert!(
+        page.status.success(),
+        "{}",
+        String::from_utf8_lossy(&page.stderr)
+    );
+    let data: Value = serde_json::from_slice(&page.stdout)?;
+    assert_eq!(data["items"].as_array().unwrap().len(), 5);
+    assert_eq!(data["more"], true);
+    assert_eq!(f.store.notifications(&f.b, 0).await?.len(), 3);
+    let after = data["next_after"].to_string();
+    let next = f
+        .cli(
+            "w1:p2",
+            &["mail", "list", "--group", "g", "--after", &after],
+        )
+        .await?;
+    assert!(
+        next.status.success(),
+        "{}",
+        String::from_utf8_lossy(&next.stderr)
+    );
+    let reopened = Store::open(f.store.root(), false).await?;
+    service::tick(&reopened, 1300).await?;
+    assert_eq!(
+        f.host.lock().await.prompts.len(),
+        1,
+        "retrieved reports don't repeatedly wake the agent"
+    );
+    assert_eq!(
+        reopened.inbox(&f.b, 0).await?.len(),
+        6,
+        "all eight unresolved requests remain, across bounded pages"
+    );
+    assert!(reopened.notifications(&f.b, 0).await?.is_empty());
+    f.send("cli-new-work").await?;
+    service::tick(&reopened, 1301).await?;
+    assert_eq!(
+        f.host.lock().await.prompts.len(),
+        2,
+        "new work wakes automatically after restart"
+    );
+    reopened.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn alerted_legacy_inbox_still_wakes_a_done_agent() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.send("legacy-unattempted").await?;
+    let pool = support::pool(&f.store).await?;
+    sqlx::query!(
+        "UPDATE mailboxes SET alerted=1,attempts=0,next_wake=0 WHERE id=?",
+        f.b.id
+    )
+    .execute(&pool)
+    .await?;
+    pool.close().await;
+    f.host.lock().await.agents[1].agent_status = agent_mail::herdr::AgentStatus::Done;
+    service::tick(&f.store, 1000).await?;
+    assert_eq!(f.host.lock().await.prompts.len(), 1);
+    assert_eq!(f.store.mailbox("g", "b").await?.attempts, 1);
     Ok(())
 }

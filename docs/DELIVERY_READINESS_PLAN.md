@@ -124,10 +124,12 @@ task open and could not change it as a non-writer. Claude live acceptance was no
 run because the installed CLI was unauthenticated; automated bridge and inbox tests
 passed. Existing live stores and installed v0.7.0 were not migrated or replaced.
 
-The separately reviewed Herdr reminder issue remains open: unresolved old obligations
-can exhaust its per-agent wake budget, and status --check does not currently expose
-that legacy counter. agent retry NAME provides an explicit re-arm after diagnosis;
-v0.8 does not reset that budget automatically on new mail.
+Historical v0.8 limitation: unresolved old obligations could exhaust the per-agent
+wake budget, and status --check did not expose the legacy counter. The event-scoped
+Herdr wake follow-up automatically rearms new actionable generations, records
+visible retrieval independently from resolution, and exposes current generation
+exhaustion through attention and the `herdr_wake` diagnostic. `alerted=1` does not
+block delivery attempts, including for an interactive `done` Herdr agent.
 
 
 ## 0.8 CLI and skill alignment

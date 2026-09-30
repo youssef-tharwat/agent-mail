@@ -335,6 +335,29 @@ for that agent. It preserves identity, pause/prompt policy, task state and mail
 obligations. It is distinct from retrying an uncertain business write with identical
 input. Do not repeatedly reset budgets or change permissions to make a check pass.
 
+Notification delivery is system-owned: do not run inbox/status polling loops or
+manually prompt another lane after every send. On a notification, retrieve the
+listed records and perform the authorized next action. Herdr retrieval of `inbox`,
+`task show`, `task list` or `context` automatically records only the visible mail
+and task revisions as retrieved. Hidden pages and later revisions remain eligible
+for notification. Retrieval stops transport retries; it neither resolves requests
+nor proves model consumption. The delivery check still requires its explicit acknowledgment.
+
+Herdr wakes have three attempts per actionable event generation, separated by
+five minutes. New actionable mail or task revisions automatically start a new
+budget while preserving that cooldown. Old retrieved but unresolved requests do
+not consume the new budget. Passive events do not restart it. Agent Mail persists
+subscriptions, receipts and attempts across worker restarts; agents do not manage
+those timers. `status --check NAME` includes a `herdr_wake` check with the
+pending/attempted event, effective attempt count and next wake time. A new event
+never inherits the previous generation's exhaustion diagnostic.
+If all attempts for the same event fail, diagnose the unavailable
+route and use `agent retry NAME` once after repair.
+
+A transport cannot decide a pending review for you. A coordinator receiving a
+report must record its authorized decision/next action or its explicit blocker;
+workers waiting for that decision should not poll or invent authorization.
+
 `Ready` requires this exact acknowledgment and recent connection health. Evidence
 is invalidated by registration, launch or endpoint changes; a prior successful check
 is not proof of future delivery. Retry schedules are system-owned; agents do not

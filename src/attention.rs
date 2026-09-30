@@ -20,7 +20,7 @@ pub enum AttentionKind {
     MissingEndpoint,
     /// The persisted delivery retry budget has been consumed.
     DeliveryExhausted,
-    /// A persisted attempt lacks a confirmed runtime receipt.
+    /// A persisted attempt lacks a runtime or retrieval receipt.
     DeliveryUnconfirmed,
 }
 /// An actionable diagnostic for a group participant.
@@ -125,7 +125,7 @@ impl Store {
         for row in missing.into_iter().take(100) {
             items.push(AttentionItem{group:row.group_name,participant:row.name,kind:AttentionKind::MissingEndpoint,subject:None,detail:"No current idle-wake endpoint; hooks alone cannot wake an idle client. Run status --check for setup guidance".into()});
         }
-        let exhausted=sqlx::query!("SELECT b.group_name,b.name,c.attempts FROM runtime_wakes c JOIN mailboxes b ON b.id=c.recipient AND b.binding_version=c.binding_version WHERE (? IS NULL OR b.group_name=?) AND c.attempts>0 AND EXISTS(SELECT 1 FROM wake_events e WHERE e.recipient=b.id AND e.id>c.scanned) LIMIT 101",group,group).fetch_all(self.pool()).await?;
+        let exhausted=sqlx::query!("SELECT b.group_name,b.name,c.attempts FROM runtime_wakes c JOIN mailboxes b ON b.id=c.recipient AND b.binding_version=c.binding_version WHERE (? IS NULL OR b.group_name=?) AND c.attempts>0 AND EXISTS(SELECT 1 FROM wake_events e WHERE e.recipient=b.id AND e.id>c.scanned) AND NOT EXISTS(SELECT 1 FROM wake_events e WHERE e.recipient=b.id AND e.id>c.attempted) UNION ALL SELECT b.group_name,b.name,b.attempts FROM mailboxes b WHERE (? IS NULL OR b.group_name=?) AND b.agent_state='registered' AND b.pane IS NOT NULL AND b.attempts>0 AND b.wake_attempted>=(SELECT MAX(id) FROM herdr_wake_events WHERE recipient=b.id) ORDER BY group_name,name LIMIT 101",group,group,group,group).fetch_all(self.pool()).await?;
         more |= exhausted.len() > 100;
         for row in exhausted.into_iter().take(100) {
             items.push(AttentionItem {
@@ -133,7 +133,7 @@ impl Store {
                 participant: row.name,
                 kind: if row.attempts >= 3 { AttentionKind::DeliveryExhausted } else { AttentionKind::DeliveryUnconfirmed },
                 subject: None,
-                detail: if row.attempts >= 3 { "Delivery attempts exhausted; inspect endpoint before explicitly rearming" } else { "Delivery attempt persisted without a confirmed receipt; delivery may be in progress or uncertain" }.into(),
+                detail: if row.attempts >= 3 { "Delivery attempts exhausted; inspect endpoint before explicitly rearming" } else { "Delivery attempt persisted without a runtime or retrieval receipt; delivery may be in progress or uncertain" }.into(),
             });
         }
         Ok(AttentionReport {

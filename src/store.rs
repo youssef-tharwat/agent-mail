@@ -328,7 +328,7 @@ impl Store {
             .await?
             .user_version
             .context("SQLite did not report its schema version")?;
-        ensure!(version <= 16, "database schema is newer than this binary");
+        ensure!(version <= 17, "database schema is newer than this binary");
         if setup {
             // Rebuilding a referenced table requires FK enforcement off outside
             // the migration transaction. The migration checks every FK before commit.
@@ -365,7 +365,7 @@ impl Store {
             .await?;
         } else {
             ensure!(
-                version == 16,
+                version == 17,
                 "database schema needs initialization or migration; run agent-mail init GROUP"
             );
         }
@@ -768,10 +768,18 @@ impl Store {
     /// The actor is stale, the message is outside its inbox, or the query fails.
     pub async fn message(&self, actor: &Mailbox, id: i64) -> Result<Message> {
         let mut tx = self.pool().begin().await?;
-        Self::check_actor(&mut tx, actor).await?;
+        Self::lock_actor(&mut tx, actor).await?;
         let item = sqlx::query_as!(Message,
             "SELECT m.id,b.name AS sender,m.summary,m.body,m.created,m.deadline AS due,d.state AS 'state: MessageState',d.reply_id,m.work_id FROM messages m JOIN deliveries d ON d.message=m.id JOIN mailboxes b ON b.id=m.sender WHERE m.id=? AND d.recipient=?",
             id, actor.id).fetch_optional(&mut *tx).await?.context("message is not in this inbox")?;
+        Self::retrieve_tx(
+            &mut tx,
+            actor,
+            crate::states::EventKind::MailPending,
+            &id.to_string(),
+            0,
+        )
+        .await?;
         tx.commit().await?;
         Ok(item)
     }
@@ -946,7 +954,7 @@ impl Store {
     /// The database update fails; an ineligible reservation returns false.
     pub async fn reserve(&self, actor: &Mailbox, now: i64) -> Result<bool> {
         let next = now.checked_add(300).context("clock overflow")?;
-        let result = sqlx::query!("UPDATE mailboxes SET attempts=attempts+1,next_wake=? WHERE id=? AND binding_version=? AND agent_state='registered' AND pane IS NOT NULL AND attempts<3 AND next_wake<=? AND EXISTS(SELECT 1 FROM groups WHERE name=mailboxes.group_name AND paused=0 AND auto_prompt=1) AND (EXISTS(SELECT 1 FROM deliveries WHERE recipient=mailboxes.id AND state='pending') OR EXISTS(SELECT 1 FROM pending_work_events WHERE recipient=mailboxes.id))",
+        let result = sqlx::query!("UPDATE mailboxes SET attempts=CASE WHEN wake_attempted<(SELECT MAX(id) FROM herdr_wake_events WHERE recipient=mailboxes.id) THEN 1 ELSE attempts+1 END,wake_attempted=MAX(wake_attempted,(SELECT MAX(id) FROM herdr_wake_events WHERE recipient=mailboxes.id)),next_wake=?,alerted=CASE WHEN wake_attempted=(SELECT MAX(id) FROM herdr_wake_events WHERE recipient=mailboxes.id) THEN alerted ELSE 0 END WHERE id=? AND binding_version=? AND agent_state='registered' AND pane IS NOT NULL AND (attempts<3 OR wake_attempted<(SELECT MAX(id) FROM herdr_wake_events WHERE recipient=mailboxes.id)) AND next_wake<=? AND EXISTS(SELECT 1 FROM groups WHERE name=mailboxes.group_name AND paused=0 AND auto_prompt=1) AND EXISTS(SELECT 1 FROM herdr_wake_events WHERE recipient=mailboxes.id)",
             next, actor.id, actor.binding_version, now).execute(self.pool()).await?;
         Ok(result.rows_affected() == 1)
     }
@@ -956,7 +964,7 @@ impl Store {
     /// # Errors
     /// The database update fails; an already reserved or ineligible alert returns false.
     pub async fn reserve_alert(&self, id: i64, now: i64) -> Result<bool> {
-        let result = sqlx::query!("UPDATE mailboxes SET alerted=1 WHERE id=? AND alerted=0 AND (EXISTS(SELECT 1 FROM deliveries d JOIN messages m ON m.id=d.message WHERE d.recipient=mailboxes.id AND d.state='pending' AND (m.deadline<=? OR mailboxes.attempts>=3)) OR EXISTS(SELECT 1 FROM pending_work_events WHERE recipient=mailboxes.id AND (created+900<=? OR mailboxes.attempts>=3)))", id, now, now).execute(self.pool()).await?;
+        let result = sqlx::query!("UPDATE mailboxes SET alerted=1 WHERE id=? AND alerted=0 AND (EXISTS(SELECT 1 FROM deliveries d JOIN messages m ON m.id=d.message WHERE d.recipient=mailboxes.id AND d.state='pending' AND (m.deadline<=? OR (mailboxes.attempts>=3 AND mailboxes.wake_attempted>=(SELECT MAX(id) FROM herdr_wake_events WHERE recipient=mailboxes.id)))) OR EXISTS(SELECT 1 FROM pending_work_events WHERE recipient=mailboxes.id AND (created+900<=? OR (mailboxes.attempts>=3 AND mailboxes.wake_attempted>=(SELECT MAX(id) FROM herdr_wake_events WHERE recipient=mailboxes.id)))))", id, now, now).execute(self.pool()).await?;
         Ok(result.rows_affected() == 1)
     }
 

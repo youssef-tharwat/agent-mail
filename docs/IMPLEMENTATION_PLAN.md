@@ -227,3 +227,39 @@ Implemented and validated automatic local worker startup, bounded end-to-end
 delivery checks, persistence-safe outcomes and recovery guidance. See
 [Delivery readiness implementation](DELIVERY_READINESS_PLAN.md) for the product
 contract, test evidence and known Herdr reminder limitation.
+
+
+## System-owned event-scoped Herdr delivery
+
+- [x] Persist the last attempted actionable event generation (schema 17).
+- [x] New actionable events rearm bounded wakes automatically, retaining cooldown.
+- [x] Record retrieval separately from business resolution, scoped to binding and
+  visible record/version; hidden pages and newer task revisions remain eligible.
+- [x] Persist reservations before prompts; ambiguous sends consume attempts.
+- [x] Preserve pause, prompt policy, identity checks and explicit business decisions.
+- [x] Reset transport generations on rebinding, without resolving business work.
+- [x] Document notification-driven usage in README and the binary's operating skill.
+
+This does not automatically accept reviews, schedule unauthorized work or guarantee
+progress from an agent that received a report but has not made its decision. Delivery
+checks still require explicit model acknowledgment; retrieval is a separate fact.
+
+Validation: the full all-features suite passed; final migration, Herdr reliability
+and skill distribution regressions passed after the last changes, along with
+strict all-targets/all-features Clippy, formatting and diff checks. Coverage includes
+restart after exhaustion, cooldown under new arrivals, partial retrieval without
+budget resets, unresolved retrieved mail, bounded pages, later task revisions and
+schema 16 migration. These are disposable-store/fake-runtime tests, not a new live
+fleet acceptance run. No installed binary or live store was modified.
+
+Follow-up completion: attention and `status --check NAME` now expose current Herdr
+wake exhaustion with a repair action, without assigning old exhaustion to a newer
+generation. Regression tests include alerted legacy inboxes with zero attempts and
+an interactive done agent. An isolated CLI pagination/restart flow verifies automatic
+retrieval receipts, pending business mail and automatic wake for subsequent work.
+Schema 17 is required for this change; older published binaries cannot read the
+migrated store. Release and installation remain separate from local validation.
+
+Final validation: 110 tests passed with `cargo test --locked --all-features`;
+`cargo clippy --locked --all-targets --all-features -- -D warnings`, formatting
+and diff checks passed. The change is included in the v0.9.1 release.

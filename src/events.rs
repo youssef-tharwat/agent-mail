@@ -27,6 +27,51 @@ pub struct Notification {
 }
 
 impl Store {
+    // Retrieval receipts stop transport retries, never resolve business requests.
+    pub(crate) async fn retrieve_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        actor: &Mailbox,
+        kind: EventKind,
+        subject: &str,
+        version: i64,
+    ) -> Result<()> {
+        if actor.binding.herdr().is_some() {
+            let kind = kind.as_str();
+            sqlx::query!("INSERT OR IGNORE INTO event_receipts(recipient,binding_version,event) SELECT recipient,?,id FROM coordination_events WHERE recipient=? AND kind=? AND subject=? AND version<=?",actor.binding_version,actor.id,kind,subject,version).execute(&mut **tx).await?;
+        }
+        Ok(())
+    }
+
+    /// Record retrieval of exactly the records included in a bounded response.
+    ///
+    /// # Errors
+    /// The binding is stale or persistence fails.
+    pub async fn retrieved(
+        &self,
+        actor: &Mailbox,
+        mail: &[i64],
+        work: &[(String, i64)],
+    ) -> Result<()> {
+        let mut tx = self.pool().begin().await?;
+        Self::lock_actor(&mut tx, actor).await?;
+        for id in mail {
+            Self::retrieve_tx(&mut tx, actor, EventKind::MailPending, &id.to_string(), 0).await?;
+        }
+        for (id, version) in work {
+            Self::retrieve_tx(&mut tx, actor, EventKind::WorkChanged, id, *version).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn herdr_attention(&self, actor: &Mailbox) -> Result<(bool, bool)> {
+        let row = sqlx::query!("SELECT MAX(e.id) AS latest,b.wake_attempted AS 'wake_attempted!: i64' FROM mailboxes b LEFT JOIN herdr_wake_events e ON e.recipient=b.id WHERE b.id=? AND b.binding_version=? GROUP BY b.id",actor.id,actor.binding_version).fetch_one(self.pool()).await?;
+        Ok((
+            row.latest.is_some(),
+            row.latest.is_some_and(|id| id > row.wake_attempted),
+        ))
+    }
+
     /// Replay a bounded page of unacknowledged events for this binding.
     ///
     /// # Errors
@@ -229,7 +274,12 @@ impl Store {
         challenge: Option<&str>,
         after: i64,
     ) -> Result<String> {
-        self.notification_text(actor, challenge, after, 6000).await
+        Self::notification_text(
+            actor,
+            challenge,
+            self.latest_changes_since(actor, after).await?,
+            6000,
+        )
     }
 
     pub(crate) async fn herdr_notification_text(
@@ -237,17 +287,19 @@ impl Store {
         actor: &Mailbox,
         challenge: Option<&str>,
     ) -> Result<String> {
-        self.notification_text(actor, challenge, 0, 480).await
+        let mut tx = self.pool().begin().await?;
+        Self::check_actor(&mut tx, actor).await?;
+        let events = sqlx::query_as!(Notification,"SELECT id,kind AS 'kind: EventKind',subject,version FROM herdr_wake_events WHERE recipient=? ORDER BY id DESC LIMIT 6",actor.id).fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+        Self::notification_text(actor, challenge, events, 480)
     }
 
-    async fn notification_text(
-        &self,
+    fn notification_text(
         actor: &Mailbox,
         challenge: Option<&str>,
-        after: i64,
+        events: Vec<Notification>,
         limit: usize,
     ) -> Result<String> {
-        let events = self.latest_changes_since(actor, after).await?;
         let mut visible = events
             .iter()
             .rev()

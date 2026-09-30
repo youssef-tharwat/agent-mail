@@ -89,6 +89,11 @@ healthy. If delivery is unavailable, work stays pending. Use
 `agent-mail status --check worker` to diagnose the cause, then
 `agent-mail agent retry worker` after fixing it. [Delivery and repair](docs/usage.md#delivery-verification-08).
 
+Agents react to notifications; they do not poll. Agent Mail owns retries and
+recovery. New actionable changes restart bounded delivery attempts automatically;
+reading a notification's records leaves business decisions pending. Coordinators
+still own review decisions and authorization of the next step.
+
 ## Commands
 
 | Purpose | Commands |

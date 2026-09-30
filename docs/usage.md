@@ -316,6 +316,18 @@ Unknown hook trust remains unknown. Delivery receipts and task progress are sepa
 
 ## Optional Herdr integration
 
+Agents use notifications rather than inbox/status polling loops. The worker owns
+subscriptions and bounded retries. New actionable mail or task revisions start a
+fresh Herdr wake budget automatically, with the existing five-minute cooldown.
+Fetching visible records records retrieval for this binding and exact task versions;
+it stops notification retries without resolving requests. Omitted page records and
+later revisions remain eligible. Retrieval does not replace the explicit delivery
+check acknowledgment. Diagnose and repair an exhausted route before `agent retry`;
+normal new work requires no manual rearming. `status --check NAME` includes
+`herdr_wake`: pending/attempted event IDs, effective attempts and next wake time.
+An exhausted current generation fails this check with a repair action; fresh events
+are not reported as exhausted because of an older generation's counters.
+
 ```sh
 herdr plugin install youssef-tharwat/agent-mail
 herdr plugin enable youssef-tharwat.agent-mail

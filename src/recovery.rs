@@ -2,7 +2,7 @@
 //!
 //! The view combines current work, unresolved mail, relay health, and continuation
 //! cursors. Payload budgets may truncate either collection; callers use the returned
-//! cursors to fetch more. Reading a recovery view does not acknowledge events.
+//! cursors to fetch more. Visible records receive transport retrieval receipts; business state is unchanged.
 
 use crate::store::{Mailbox, Store};
 use anyhow::Result;
@@ -43,6 +43,15 @@ impl Store {
             }
             next_mail = item.id;
         }
+        self.retrieved(
+            actor,
+            &mails.iter().map(|m| m.id).collect::<Vec<_>>(),
+            &works
+                .iter()
+                .map(|w| (w.id.clone(), w.version))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
         let peers = self.peers_status().await?;
         let stale_peers: Vec<_> = peers
             .iter()

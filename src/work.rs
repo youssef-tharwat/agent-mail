@@ -355,7 +355,7 @@ impl Store {
     pub async fn work_show(&self, actor: &Mailbox, id: &str) -> Result<WorkItem> {
         name(id)?;
         let mut tx = self.pool().begin().await?;
-        Self::check_actor(&mut tx, actor).await?;
+        Self::lock_actor(&mut tx, actor).await?;
         let row = sqlx::query_as!(WorkRow,
             "SELECT group_name,id,scope,owner,writer,state AS 'state: TaskState',next_action,deadline,accepted_revision,evidence,version,updated FROM work_items WHERE group_name=? AND id=?",
             actor.group_name, id)
@@ -378,6 +378,14 @@ impl Store {
         let links = sqlx::query!("SELECT m.id FROM messages m JOIN mailboxes b ON b.id=m.sender WHERE b.group_name=? AND m.work_id=? ORDER BY m.id DESC LIMIT 20",
             actor.group_name, id).fetch_all(&mut *tx).await?;
         item.linked_messages = links.into_iter().map(|row| row.id).collect();
+        Self::retrieve_tx(
+            &mut tx,
+            actor,
+            crate::states::EventKind::WorkChanged,
+            id,
+            item.version,
+        )
+        .await?;
         tx.commit().await?;
         Ok(item)
     }
