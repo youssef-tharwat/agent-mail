@@ -37,6 +37,8 @@ pub mod service;
 pub mod status;
 pub mod store;
 pub mod supervision;
+/// End-to-end delivery verification, separate from business decisions.
+pub mod verification;
 pub mod work;
 
 /// Stable Herdr plugin identifier used for session-scoped enablement checks.
@@ -105,7 +107,7 @@ pub mod native;
 pub mod claude_inbox;
 
 /// Version-matched operating instructions bundled with the binary.
-pub const SKILL: &str = include_str!("../skills/agent-mail/SKILL.md");
+pub const SKILL: &str = include_str!("../docs/agent-guide.md");
 
 /// Observed launcher and lifecycle-hook readiness.
 pub mod readiness;

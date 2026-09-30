@@ -314,19 +314,24 @@ async fn bursts_batch_and_retry_budget_survives_restarts() -> Result<()> {
     }
     service::tick(&f.store, 1000).await?;
     assert_eq!(f.host.lock().await.prompts.len(), 1);
+    assert!(f.host.lock().await.prompts[0].contains("agent ack"));
+    agent_mail::verification::reconcile(&f.store, 1000).await?;
+    // The other registered lane has no pending notification, so it receives its
+    // one bounded standalone probe. The busy target is challenged in its wake.
+    assert_eq!(f.host.lock().await.prompts.len(), 2);
     service::tick(&f.store, 1001).await?;
-    assert_eq!(f.host.lock().await.prompts.len(), 1);
+    assert_eq!(f.host.lock().await.prompts.len(), 2);
     service::tick(&f.store, 1300).await?;
     service::tick(&f.store, 1600).await?;
     f.send("new-arrival").await?;
     let reopened = Store::open(f.store.root(), false).await?;
     service::tick(&reopened, 5000).await?;
     let host = f.host.lock().await;
-    assert_eq!(host.prompts.len(), 3);
+    assert_eq!(host.prompts.len(), 4);
     assert!(
         host.prompts
             .iter()
-            .all(|p| p.len() <= 160 && !p.contains("Durable body"))
+            .all(|p| p.len() <= 480 && !p.contains("Durable body"))
     );
     assert_eq!(host.notifications, 1);
     drop(host);
@@ -510,7 +515,14 @@ async fn cli_worker_crash_keeps_messages_and_reservations() -> Result<()> {
         .kill_on_drop(true)
         .spawn()?;
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while f.host.lock().await.prompts.is_empty() {
+        while !f
+            .host
+            .lock()
+            .await
+            .prompts
+            .iter()
+            .any(|p| !p.starts_with("Agent Mail delivery check."))
+        {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })
@@ -525,7 +537,16 @@ async fn cli_worker_crash_keeps_messages_and_reservations() -> Result<()> {
         "{}",
         String::from_utf8_lossy(&again.stderr)
     );
-    assert_eq!(f.host.lock().await.prompts.len(), 1);
+    assert_eq!(
+        f.host
+            .lock()
+            .await
+            .prompts
+            .iter()
+            .filter(|p| !p.starts_with("Agent Mail delivery check."))
+            .count(),
+        1
+    );
     Ok(())
 }
 
@@ -841,5 +862,46 @@ async fn doctor_checks_plugin_even_when_bound_pane_matches() -> Result<()> {
             .iter()
             .any(|c| c.check == "herdr_plugin" && c.status == agent_mail::doctor::Level::Pass)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn herdr_verification_obeys_policy_and_requires_exact_agent_response() -> Result<()> {
+    use agent_mail::{states::DeliveryReadiness, verification};
+    let f = Fixture::new().await?;
+    let _lock = service::WorkerLock::acquire(f.store.root())?;
+    f.store.set_auto_prompt("g", false).await?;
+    verification::reconcile(&f.store, 1000).await?;
+    assert!(f.host.lock().await.prompts.is_empty());
+    assert_eq!(
+        f.store.delivery_status(&f.b, 1000).await?.state,
+        DeliveryReadiness::NotifyOnly
+    );
+    f.store.set_auto_prompt("g", true).await?;
+    f.host.lock().await.enabled = false;
+    verification::reconcile(&f.store, 1001).await?;
+    assert!(f.host.lock().await.prompts.is_empty());
+    f.host.lock().await.enabled = true;
+    verification::reconcile(&f.store, 1002).await?;
+    let prompts = f.host.lock().await.prompts.clone();
+    assert_eq!(prompts.len(), 2);
+    for prompt in prompts {
+        let nonce = prompt
+            .split("agent ack ")
+            .nth(1)
+            .unwrap()
+            .split('`')
+            .next()
+            .unwrap()
+            .parse()?;
+        // Both challenges have the same group, but each belongs to only one actor.
+        let a = f.store.acknowledge_delivery(&f.a, nonce, 1003).await;
+        let b = f.store.acknowledge_delivery(&f.b, nonce, 1003).await;
+        assert_ne!(a.is_ok(), b.is_ok());
+    }
+    assert!(f.store.delivery_status(&f.b, 1003).await?.ready);
+    f.host.lock().await.enabled = false;
+    verification::reconcile(&f.store, 1004).await?;
+    assert!(!f.store.delivery_status(&f.b, 1004).await?.ready);
     Ok(())
 }

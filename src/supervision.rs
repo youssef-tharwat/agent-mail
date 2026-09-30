@@ -238,3 +238,72 @@ pub fn save_locator(root: &Path) -> Result<()> {
     file.sync_all()?;
     Ok(())
 }
+
+/// Establish one local worker and verify its authenticated event stream.
+/// Managed launches fail before starting the client when this cannot be established.
+/// # Errors
+/// Process startup, current-binary mismatch, stream authentication or timeout fails.
+pub async fn ensure_running(
+    store: &crate::store::Store,
+    actor: &crate::store::Mailbox,
+    executable: &Path,
+) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    let mut child = None;
+    if !crate::service::running(store.root()) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(store.root().join("service.log"))?;
+        let mut command = Command::new(executable);
+        command
+            .args(["--state-dir"])
+            .arg(store.root())
+            .args(["service", "run"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log)
+            .process_group(0);
+        for key in [
+            "AGENT_MAIL_SESSION",
+            "AGENT_MAIL_GROUP",
+            "AGENT_MAIL_LAUNCH",
+            "HERDR_ENV",
+            "HERDR_PLUGIN_ID",
+            "HERDR_SOCKET_PATH",
+        ] {
+            command.env_remove(key);
+        }
+        child = Some(command.spawn().context("start local delivery worker")?);
+    }
+    for _ in 0..80 {
+        if crate::service::running(store.root()) {
+            let ready = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                let mut stream = crate::stream::connect(store, actor, 0).await?;
+                anyhow::ensure!(
+                    matches!(
+                        crate::stream::next(&mut stream).await?,
+                        crate::stream::Frame::Ready { .. }
+                    ),
+                    "stream rejected identity"
+                );
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            if matches!(ready, Ok(Ok(()))) {
+                return Ok(());
+            }
+        }
+        if let Some(child) = child.as_mut() {
+            let _ = child.try_wait()?;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    anyhow::bail!(
+        "delivery worker did not become ready; inspect {}/service.log or run agent-mail service run",
+        store.root().display()
+    )
+}

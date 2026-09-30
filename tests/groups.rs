@@ -112,7 +112,7 @@ async fn overlapping_names_and_large_fleets_do_not_mix_context_or_status() -> Re
         String::from_utf8_lossy(&scoped.stderr)
     );
     assert!(!String::from_utf8_lossy(&scoped.stdout).contains("awp"));
-    let all = cli(tmp.path(), &["status", "--all-groups"]);
+    let all = cli(tmp.path(), &["status", "--all-groups", "--json"]);
     assert!(all.status.success());
     let all: Value = serde_json::from_slice(&all.stdout)?;
     assert_eq!(all["groups"].as_array().unwrap().len(), 2);

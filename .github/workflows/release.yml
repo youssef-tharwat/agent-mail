@@ -52,7 +52,7 @@ jobs:
           ./target/release/agent-mail --version
           smoke_root=$(mktemp -d)
           ./target/release/agent-mail --state-dir "$smoke_root/state" init smoke >/dev/null
-          ./target/release/agent-mail --state-dir "$smoke_root/state" status | jq -e '.attention.work == []' >/dev/null
+          ./target/release/agent-mail --state-dir "$smoke_root/state" status --json | jq -e '.attention.work == []' >/dev/null
           ./target/release/agent-mail adapter watch --help >/dev/null
           ./target/release/agent-mail status --help >/dev/null
           mkdir -p dist package

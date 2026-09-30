@@ -6,7 +6,7 @@ use agent_mail::{
     store::Store,
     work::{WorkDraft, WorkPatch},
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::Value;
 use std::{os::unix::fs::PermissionsExt, sync::Arc};
 use tokio::{
@@ -64,6 +64,7 @@ async fn socket_write_is_unconfirmed_until_matching_hook_and_cancellation_uses_p
             "fixture-token",
         )
         .await?;
+    let now = agent_mail::now()?;
     store
         .work_create(
             &actor,
@@ -76,10 +77,10 @@ async fn socket_write_is_unconfirmed_until_matching_hook_and_cancellation_uses_p
                 deadline: None,
                 evidence: vec![],
             },
-            1000,
+            now,
         )
         .await?;
-    service::tick(&store, 1000).await?;
+    service::tick(&store, now).await?;
     let pool = support::pool(&store).await?;
     let status = sqlx::query!("SELECT delivered,attempts FROM runtime_wakes")
         .fetch_one(&pool)
@@ -141,6 +142,21 @@ async fn socket_write_is_unconfirmed_until_matching_hook_and_cancellation_uses_p
         .await?
         .unwrap();
     assert!(context.to_string().contains("Inspect evidence"));
+    let context_text = context["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .context("Claude notification did not return its delivery context")?;
+    assert!(context_text.contains("agent ack"));
+    let nonce: Uuid = context_text
+        .split("agent ack ")
+        .nth(1)
+        .context("Claude notification omitted its challenge")?
+        .split('`')
+        .next()
+        .context("Claude challenge nonce missing")?
+        .parse()?;
+    store
+        .acknowledge_delivery(&actor, nonce, agent_mail::now()?)
+        .await?;
     assert!(store.notifications(&actor, 0).await?.is_empty());
     assert!(store.work_show(&actor, "task").await?.state.is_open());
     assert!(
@@ -171,10 +187,10 @@ async fn socket_write_is_unconfirmed_until_matching_hook_and_cancellation_uses_p
                 reason: ("Cancel").to_owned(),
                 resolve_message: None,
             },
-            1001,
+            now + 1,
         )
         .await?;
-    service::tick(&store, 1001).await?;
+    service::tick(&store, now + 1).await?;
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while frames.lock().await.len() < 2 {
             tokio::task::yield_now().await;
@@ -445,5 +461,98 @@ async fn detach_survives_startup_hooks_until_explicit_enable() -> Result<()> {
     assert_eq!(store.native_status().await?.as_array().unwrap().len(), 1);
     drop(listener);
     store.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn delivery_probe_hook_is_receipt_not_agent_acknowledgment() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let socket = temp.path().join("claude.sock");
+    let listener = UnixListener::bind(&socket)?;
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+    let frames = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = frames.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let mut lines = BufReader::new(stream).lines();
+            let Some(auth) = lines.next_line().await.unwrap() else {
+                continue;
+            };
+            assert_eq!(
+                serde_json::from_str::<Value>(&auth).unwrap()["token"],
+                "fixture-token"
+            );
+            captured
+                .lock()
+                .await
+                .push(serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap());
+        }
+    });
+    let store = Store::open(temp.path(), true).await?;
+    store.enroll("g", None).await?;
+    store.register("g", "worker", false).await?;
+    let actor = store.mailbox("g", "worker").await?;
+    let session = Uuid::new_v4();
+    store
+        .claude_inbox_hook(
+            &actor,
+            &input(
+                session,
+                agent_mail::states::HookEvent::SessionStart,
+                String::new(),
+            ),
+            &socket,
+            "fixture-token",
+        )
+        .await?;
+
+    let _lock = service::WorkerLock::acquire(temp.path())?;
+    let now = agent_mail::now()?;
+    agent_mail::verification::reconcile(&store, now).await?;
+    for _ in 0..100 {
+        if !frames.lock().await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let frame = frames.lock().await[0].clone();
+    let prompt = frame["message"]["content"].as_str().unwrap().to_owned();
+    let before = store.delivery_status(&actor, now).await?;
+    assert!(!before.ready);
+    assert_eq!(before.runtime_received_at, None);
+    let context = store
+        .claude_inbox_hook(
+            &actor,
+            &input(
+                session,
+                agent_mail::states::HookEvent::UserPromptSubmit,
+                prompt,
+            ),
+            &socket,
+            "fixture-token",
+        )
+        .await?
+        .unwrap();
+    let after = store.delivery_status(&actor, now).await?;
+    assert!(!after.ready);
+    assert!(after.runtime_received_at.is_some());
+    let text = context["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    let nonce: Uuid = text
+        .split("agent ack ")
+        .nth(1)
+        .unwrap()
+        .split('`')
+        .next()
+        .unwrap()
+        .parse()?;
+    store.acknowledge_delivery(&actor, nonce, now).await?;
+    assert!(store.delivery_status(&actor, now).await?.ready);
+    assert!(store.notifications(&actor, 0).await?.is_empty());
+    server.abort();
+    let _ = server.await;
+    agent_mail::verification::reconcile(&store, now + 1).await?;
+    assert!(!store.delivery_status(&actor, now + 1).await?.ready);
     Ok(())
 }

@@ -6,7 +6,6 @@ use agent_mail::{
     work::WorkDraft,
 };
 use anyhow::{Context, Result, ensure};
-use clap::Parser;
 use serde_json::{Value, json};
 use std::{io::Read, path::PathBuf};
 
@@ -24,6 +23,10 @@ struct RunArgs {
 }
 
 enum Command {
+    AckDelivery {
+        group: String,
+        nonce: uuid::Uuid,
+    },
     AgentShow {
         group: String,
         name: String,
@@ -190,6 +193,7 @@ enum Command {
     /// Operator: show durable pending work and the latest service diagnostics.
     Status {
         group: Option<String>,
+        json: bool,
     },
     /// Operator: stop automatic prompts for a group. Message operations still work.
     Pause {
@@ -294,7 +298,7 @@ async fn main() {
 }
 
 async fn execute() -> Result<()> {
-    if let Some(args) = cli::Cli::parse().prepare().await? {
+    if let Some(args) = cli::Cli::parse_cli().prepare().await? {
         run(args).await?;
     }
     Ok(())
@@ -409,7 +413,7 @@ async fn run(cli: RunArgs) -> Result<()> {
             );
             let agent = herdr::agent(std::path::Path::new(socket), &target).await?;
             store.bind(&group, &name, &agent, replace).await?;
-            json!({"bound":name,"group":group,"pane":agent.pane_id})
+            json!({"bound":name,"group":group,"pane":agent.pane_id,"delivery":store.recipient_delivery_outcome(&group,&name).await})
         }
         Command::Register {
             show_session,
@@ -418,7 +422,7 @@ async fn run(cli: RunArgs) -> Result<()> {
             replace,
         } => {
             let session = store.register(&group, &name, replace).await?;
-            let mut result = json!({"group":group,"name":name,"runtime":"standalone"});
+            let mut result = json!({"group":group,"name":name,"runtime":"standalone","delivery":store.recipient_delivery_outcome(&group,&name).await});
             if show_session {
                 result["session"] = json!(session);
             }
@@ -450,16 +454,29 @@ async fn run(cli: RunArgs) -> Result<()> {
             json!({"enabled":name,"group":group,"next_action":"resume the native session to register its endpoint"})
         }
         Command::Retry { group, name } => {
+            let actor = store.mailbox(&group, &name).await?;
+            ensure!(
+                actor.state == agent_mail::states::AgentState::Registered,
+                "agent is retired; restore it before retrying delivery"
+            );
+            supervision::ensure_running(&store, &actor, &std::env::current_exe()?).await?;
             store.rearm(&group, &name).await?;
-            json!({"rearmed":name,"group":group})
+            json!({"retry_started":name,"group":group,"delivery":store.recipient_delivery_outcome(&group,&name).await})
         }
         Command::DetachClaude { group, name } => {
             let actor = store.mailbox(&group, &name).await?;
             store.set_runtime_enabled(&actor, false).await?;
             json!({"detached":name,"group":group})
         }
+        Command::AckDelivery { group, nonce } => {
+            let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+            store.acknowledge_delivery(&actor, nonce, now()?).await?;
+            json!({"group":group,"agent":actor.name,"notification_acknowledged":true,"task_completed":false})
+        }
         Command::AgentShow { group, name } => {
-            serde_json::to_value(store.agent_record(&group, &name).await?)?
+            let mut result = serde_json::to_value(store.agent_record(&group, &name).await?)?;
+            result["delivery"] = store.recipient_delivery_outcome(&group, &name).await;
+            result
         }
         Command::AgentUpdate {
             group,
@@ -576,7 +593,7 @@ async fn run(cli: RunArgs) -> Result<()> {
                     now()?,
                 )
                 .await?;
-            json!({"id":id,"persisted":true})
+            json!({"id":id,"persisted":true,"delivery":store.message_delivery_outcome(&group,id).await})
         }
         Command::Inbox {
             group,
@@ -620,7 +637,7 @@ async fn run(cli: RunArgs) -> Result<()> {
             } else {
                 let reply = reply_key.zip(reply_body);
                 let reply_id = store.resolve(&actor, message, &note, reply, now()?).await?;
-                json!({"id":message,"resolved":true,"reply_id":reply_id})
+                json!({"id":message,"resolved":true,"reply_id":reply_id,"delivery":match reply_id {Some(id)=>store.message_delivery_outcome(&group,id).await,None=>json!([])}})
             }
         }
         Command::Context {
@@ -719,7 +736,12 @@ async fn run(cli: RunArgs) -> Result<()> {
         Command::Work(command) => match command {
             WorkCommand::Decide { group, id, update } => {
                 let actor = store.authenticate(&group, cli.session.as_ref()).await?;
-                serde_json::to_value(store.update_work(&actor, &id, update, now()?).await?)?
+                let mut value =
+                    serde_json::to_value(store.update_work(&actor, &id, update, now()?).await?)?;
+                value["delivery"] = store
+                    .task_delivery_outcome(&group, &id, value["version"].as_i64().unwrap_or(0))
+                    .await;
+                value
             }
             WorkCommand::Create {
                 group,
@@ -732,7 +754,8 @@ async fn run(cli: RunArgs) -> Result<()> {
                 evidence,
             } => {
                 let actor = store.authenticate(&group, cli.session.as_ref()).await?;
-                serde_json::to_value(
+                let task_id = id.clone();
+                let mut value = serde_json::to_value(
                     store
                         .work_create(
                             &actor,
@@ -748,7 +771,11 @@ async fn run(cli: RunArgs) -> Result<()> {
                             now()?,
                         )
                         .await?,
-                )?
+                )?;
+                value["delivery"] = store
+                    .task_delivery_outcome(&group, &task_id, value["version"].as_i64().unwrap_or(0))
+                    .await;
+                value
             }
             WorkCommand::Show { group, id } => {
                 let actor = store.authenticate(&group, cli.session.as_ref()).await?;
@@ -787,7 +814,16 @@ async fn run(cli: RunArgs) -> Result<()> {
                 );
             }
         }
-        Command::Status { group } => agent_mail::status::report(&store, group.as_deref()).await?,
+        Command::Status { group, json } => {
+            if !json {
+                println!(
+                    "{}",
+                    agent_mail::status::summary(&store, group.as_deref()).await?
+                );
+                return Ok(());
+            }
+            agent_mail::status::report(&store, group.as_deref()).await?
+        }
         Command::Pause { group } => {
             store.pause(&group, true).await?;
             json!({"group":group,"paused":true})

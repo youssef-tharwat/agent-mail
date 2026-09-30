@@ -166,8 +166,15 @@ impl Store {
                 .pending_id
                 .as_deref()
                 .is_some_and(|id| input.prompt == notification(id));
+        let observed_at = crate::now()?;
+        let challenge = if receipt {
+            self.unobserved_challenge(&mut tx, actor, observed_at)
+                .await?
+        } else {
+            None
+        };
         let context = if receipt {
-            Some(self.delivery_text(actor).await?)
+            Some(self.delivery_text(actor, challenge.as_deref()).await?)
         } else {
             None
         };
@@ -181,19 +188,32 @@ impl Store {
             )
             .execute(&mut *tx)
             .await?;
+            if let Some(nonce) = challenge.as_deref() {
+                sqlx::query!(
+                    "UPDATE delivery_probes SET runtime_received_at=COALESCE(runtime_received_at,?) WHERE recipient=? AND binding_version=? AND nonce=?",
+                    observed_at,
+                    actor.id,
+                    actor.binding_version,
+                    nonce
+                )
+                .execute(&mut *tx)
+                .await?;
+            }
         }
         tx.commit().await?;
         if receipt {
             Ok(Some(
                 json!({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":context.context("missing receipt context")?}}),
             ))
+        } else if input.hook_event_name == Event::UserPromptSubmit {
+            Ok(self.probe_hook(actor, &input.prompt, crate::now()?).await?.map(|text| json!({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":text}})))
         } else {
             Ok(None)
         }
     }
 }
 
-fn notification(id: &str) -> String {
+pub(crate) fn notification(id: &str) -> String {
     format!("{PREFIX}{id}\nUse the current state supplied by the Agent Mail lifecycle hook.")
 }
 

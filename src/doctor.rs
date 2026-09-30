@@ -262,6 +262,27 @@ pub async fn inspect(
             Some("Inspect database health"),
         ),
     }
+    match store
+        .delivery_status(&actor, crate::now().unwrap_or_default())
+        .await
+    {
+        Ok(info) => report.add(
+            "delivery",
+            if info.ready {
+                Level::Pass
+            } else {
+                Level::Warning
+            },
+            json!(info),
+            None,
+        ),
+        Err(_) => report.add(
+            "delivery",
+            Level::Fail,
+            "Cannot read delivery evidence",
+            Some("Inspect database health"),
+        ),
+    }
     match store.launch_readiness(&actor).await {
         Ok(info) => {
             let observed = info.state == crate::states::RecoveryState::HookObserved;

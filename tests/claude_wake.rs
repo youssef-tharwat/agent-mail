@@ -4,7 +4,7 @@ use agent_mail::{
     store::Store,
     work::{WorkDraft, WorkPatch},
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::sync::{
     Arc,
@@ -23,12 +23,23 @@ async fn claude_uses_shared_delivery_recovery_cancellation_and_retry_rules() -> 
     let session = Uuid::new_v4();
     let listener = UnixListener::bind(&socket)?;
     let delivered = Arc::new(AtomicUsize::new(0));
+    let last_text = Arc::new(std::sync::Mutex::new(String::new()));
     let active = Arc::new(AtomicBool::new(false));
     let lose = Arc::new(AtomicBool::new(false));
-    let (count, busy, loss) = (delivered.clone(), active.clone(), lose.clone());
+    let (count, busy, loss, captured_text) = (
+        delivered.clone(),
+        active.clone(),
+        lose.clone(),
+        last_text.clone(),
+    );
     let server = tokio::spawn(async move {
         while let Ok((io, _)) = listener.accept().await {
-            let (count, busy, loss) = (count.clone(), busy.clone(), loss.clone());
+            let (count, busy, loss, captured_text) = (
+                count.clone(),
+                busy.clone(),
+                loss.clone(),
+                captured_text.clone(),
+            );
             tokio::spawn(async move {
                 let mut io = BufReader::new(io);
                 let mut line = String::new();
@@ -40,8 +51,13 @@ async fn claude_uses_shared_delivery_recovery_cancellation_and_retry_rules() -> 
                     assert_eq!(request["session"], session.to_string());
                     assert_eq!(request["epoch"], 1);
                     assert_eq!(request["active"], busy.load(Ordering::SeqCst));
-                    assert!(request["text"].as_str().unwrap().len() <= 6000);
-                    count.fetch_add(1, Ordering::SeqCst);
+                    let text = request["text"].as_str().unwrap();
+                    assert!(text.len() <= 6000);
+                    let prior = count.fetch_add(1, Ordering::SeqCst);
+                    if prior == 0 {
+                        assert!(text.contains("agent ack"));
+                    }
+                    *captured_text.lock().unwrap() = text.to_owned();
                     if loss.load(Ordering::SeqCst) {
                         return;
                     }
@@ -82,6 +98,16 @@ async fn claude_uses_shared_delivery_recovery_cancellation_and_retry_rules() -> 
     active.store(false, Ordering::SeqCst);
     service::tick(&store, 1001).await?;
     assert_eq!(delivered.load(Ordering::SeqCst), 1);
+    let prompt = last_text.lock().unwrap().clone();
+    let nonce = prompt
+        .split("agent ack ")
+        .nth(1)
+        .context("Claude wake omitted its bundled delivery challenge")?
+        .split('`')
+        .next()
+        .context("Claude wake challenge nonce missing")?
+        .parse()?;
+    store.acknowledge_delivery(&owner, nonce, 1002).await?;
     assert!(store.work_show(&owner, "task").await?.state.is_open());
     assert!(store.notifications(&owner, 0).await?.is_empty());
     store.close().await;

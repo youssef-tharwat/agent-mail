@@ -32,6 +32,35 @@ string_enum! {
     }
 }
 string_enum! {
+    /// Current delivery capability and evidence; never a business disposition.
+    pub enum DeliveryReadiness {
+        /// Diagnostics failed; no readiness claim can be made.
+        Unknown => "unknown",
+        /// Explicit agent acknowledgment and a currently healthy route.
+        Verified => "verified",
+        /// A challenge is pending acknowledgment.
+        Verifying => "verifying",
+        /// No challenge has run for this route.
+        Unverified => "unverified",
+        /// The bounded challenge cycle expired.
+        Expired => "expired",
+        /// No supported endpoint is attached.
+        MissingEndpoint => "missing_endpoint",
+        /// The local worker is not running.
+        WorkerStopped => "worker_stopped",
+        /// Delivery is explicitly paused.
+        Paused => "paused",
+        /// Herdr is restricted to operator notifications.
+        NotifyOnly => "notify_only",
+        /// The registration is retired.
+        Retired => "retired",
+        /// Current endpoint or health evidence is unavailable.
+        Unavailable => "unavailable",
+        /// Remote verification is outside the local protocol.
+        RemoteUnsupported => "remote_unsupported",
+    }
+}
+string_enum! {
     /// Task lifecycle; the designated writer chooses transitions.
     #[derive(clap::ValueEnum)]
     pub enum TaskState {

@@ -417,8 +417,9 @@ binaries. The CLI remains a single local executable with SQLite. See the
 
 ## Agent launch context (v0.5)
 
-`agent` is the public identity command. `run NAME -- COMMAND` reads a standalone
-agent’s existing credential from private Mail state and passes it, the selected
+`agent` is the public identity command. `run NAME -- COMMAND` atomically creates
+an absent standalone identity, then reads its credential from private Mail state
+and passes it, the selected
 group and the canonical state path only to the child. Normal registration output
 contains no credential. There is no current-agent file or global identity switch.
 
@@ -432,8 +433,8 @@ enforced. Herdr owns pane-bound launches; `run` refuses those and remote binding
 
 The interactive Codex launcher owns its two child processes and reaps the private
 backend when the UI exits; termination during startup or discovery also cleans up.
-It does not decide task acceptance or install/start the delivery service. Other
-commands retain Unix `exec` behavior. An explicit identity replacement invalidates
+Managed native launches establish the shared delivery worker before starting the
+client. They do not decide task acceptance. Other commands retain Unix `exec` behavior. An explicit identity replacement invalidates
 old credentials while retaining tasks and mail.
 
 ### Launch evidence and bundled instructions (schema 13, unreleased)

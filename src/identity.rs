@@ -100,6 +100,28 @@ impl Store {
         Ok(session)
     }
 
+    /// Create a missing launch identity atomically, preserving every existing binding.
+    /// # Errors
+    /// Invalid group/name, retired or non-standalone registration, or storage failure.
+    pub async fn launch_identity(&self, group: &str, name: &str) -> Result<Mailbox> {
+        crate::name(name)?;
+        self.group(group).await?;
+        let binding = serde_json::to_string(&Binding::Standalone {
+            session: Uuid::new_v4(),
+        })?;
+        sqlx::query!("INSERT INTO mailboxes(group_name,name,binding) VALUES (?,?,?) ON CONFLICT(group_name,name) DO NOTHING",group,name,binding).execute(self.pool()).await?;
+        let actor = self.mailbox(group, name).await?;
+        anyhow::ensure!(
+            actor.state == crate::states::AgentState::Registered,
+            "agent is retired; restore it explicitly before launching"
+        );
+        anyhow::ensure!(
+            matches!(actor.binding, Binding::Standalone { .. }),
+            "run requires a standalone agent; the existing runtime owns this registration"
+        );
+        Ok(actor)
+    }
+
     /// Authenticate a standalone credential or the current Herdr pane.
     /// An invalid standalone credential never falls back to Herdr identity.
     ///

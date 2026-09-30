@@ -54,6 +54,7 @@ pub async fn report(store: &Store, group: Option<&str>) -> Result<Value> {
     let mut result = json!({
         "state_dir":root.canonicalize()?,"group":group,"all_groups":group.is_none(),
         "service_running":service::running(root),"now":now()?,"groups":groups,"inboxes":pending,
+        "delivery":store.delivery_statuses(group,now()?).await?,
         "notifications":store.notification_status_for(group).await?,
         "runtime_policy":scoped_rows(store.runtime_policy_status().await?,group),
         "native":native,"codex":codex,"attention":store.attention_for(group,now()?).await?,"last_scan":scan
@@ -65,4 +66,71 @@ pub async fn report(store: &Store, group: Option<&str>) -> Result<Value> {
         result["outbox_oldest"] = json!(oldest);
     }
     Ok(result)
+}
+
+/// Render the common health view without loading event history or transport diagnostics.
+/// # Errors
+/// The group, current identity records or readiness evidence cannot be read.
+pub async fn summary(store: &Store, group: Option<&str>) -> Result<String> {
+    use crate::states::DeliveryReadiness as State;
+    use std::fmt::Write;
+    if let Some(group) = group {
+        store.group(group).await?;
+    }
+    let time = now()?;
+    let states = store.delivery_statuses(group, time).await?;
+    let mut output = format!(
+        "{}\nDelivery worker: {}\n",
+        group.map_or_else(|| "All groups".to_owned(), |g| format!("Group: {g}")),
+        if service::running(store.root()) {
+            "running"
+        } else {
+            "stopped"
+        }
+    );
+    if states.is_empty() {
+        output.push_str("\nNo agents yet. Start one with: agent-mail run NAME -- claude");
+        return Ok(output);
+    }
+    let labels: Vec<_> = states
+        .iter()
+        .map(|s| {
+            if group.is_none() {
+                format!("{}/{}", s.group, s.agent)
+            } else {
+                s.agent.clone()
+            }
+        })
+        .collect();
+    let width = labels.iter().map(String::len).max().unwrap_or(5).max(5);
+    writeln!(output, "\n{:<width$}  DELIVERY", "AGENT")?;
+    for (label, status) in labels.iter().zip(&states) {
+        let detail = match status.state {
+            State::Verified => "Ready".into(),
+            State::Verifying if status.attempts == 0 => {
+                "Verifying · waiting for idle client".into()
+            }
+            State::Verifying => status.next_attempt_at.map_or_else(
+                || "Verifying · awaiting acknowledgment".into(),
+                |t| format!("Verifying · retry in {}s", (t - time).max(0)),
+            ),
+            State::Unverified => "Unverified · check pending".into(),
+            State::Expired => "Unverified · check expired".into(),
+            State::MissingEndpoint => "Unavailable · no runtime attached".into(),
+            State::WorkerStopped => "Unavailable · worker stopped".into(),
+            State::Paused => "Paused".into(),
+            State::NotifyOnly => "Notify-only · no idle wake".into(),
+            State::Retired => "Retired".into(),
+            State::Unavailable => "Unavailable · connection unhealthy".into(),
+            State::RemoteUnsupported => "Remote · check on home machine".into(),
+            State::Unknown => "Unknown · diagnostics failed".into(),
+        };
+        writeln!(output, "{label:<width$}  {detail}")?;
+    }
+    output.push_str("\nDetails: agent-mail status --check NAME · JSON: agent-mail status --json");
+    if group.is_none() {
+        output
+            .push_str("\nSelect a group for details: agent-mail --group GROUP status --check NAME");
+    }
+    Ok(output)
 }

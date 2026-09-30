@@ -226,6 +226,9 @@ impl Store {
                 return Ok(());
             }
         } else {
+            sqlx::query!("DELETE FROM runtime_readiness WHERE recipient=?", actor.id)
+                .execute(&mut *tx)
+                .await?;
             sqlx::query!("INSERT INTO runtime_policy(recipient,binding_version,enabled) VALUES(?,?,1) ON CONFLICT(recipient) DO UPDATE SET binding_version=excluded.binding_version,enabled=1",actor.id,actor.binding_version).execute(&mut *tx).await?;
         }
         // Repeating identical attachment preserves its cursor and retry budget.
@@ -385,7 +388,6 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
         _ => return Ok(DeliveryState::Busy),
     };
     peer.prepare(active).await?;
-    let text = store.delivery_text(actor).await?;
     // Persist the attempt before I/O. A crash or lost response consumes its budget.
     let mut tx = store.pool().begin().await?;
     Store::lock_actor(&mut tx, actor).await?;
@@ -405,6 +407,17 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
     if reserved == 0 {
         return Ok(DeliveryState::Ineligible);
     }
+    let challenge = match store.reserve_delivery_challenge(actor, time).await {
+        Ok(challenge) => challenge,
+        Err(error) => {
+            eprintln!(
+                "agent-mail: could not attach delivery check to {}/{} notification: {error:#}",
+                actor.group_name, actor.name
+            );
+            None
+        }
+    };
+    let text = store.delivery_text(actor, challenge.as_deref()).await?;
     // Hold the binding lock during the bounded send: replacement/detachment cannot race it.
     let mut tx = store.pool().begin().await?;
     Store::lock_actor(&mut tx, actor).await?;
@@ -414,6 +427,18 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
         crate::claude_inbox::verify(store, socket, endpoint)?;
     }
     peer.send(thread, text, active, message_id).await?;
+    if let Some(nonce) = challenge.as_deref() {
+        sqlx::query!(
+            "UPDATE delivery_probes SET transport_accepted_at=COALESCE(transport_accepted_at,?),healthy_at=?,failed=0 WHERE recipient=? AND binding_version=? AND nonce=?",
+            time,
+            time,
+            actor.id,
+            actor.binding_version,
+            nonce
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
     if inbox {
         tx.commit().await?;
         return Ok(DeliveryState::AwaitingReceipt);
@@ -430,4 +455,60 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
     sqlx::query!("INSERT OR IGNORE INTO event_receipts(recipient,binding_version,event) SELECT recipient,?,id FROM coordination_events WHERE recipient=? AND id<=?",actor.binding_version,actor.id,latest).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(DeliveryState::Queued)
+}
+
+/// Dispatch a verification challenge through the exact native wake transport.
+pub(crate) async fn send_verification(
+    store: &Store,
+    actor: &Mailbox,
+    nonce: &str,
+    time: i64,
+) -> Result<()> {
+    let endpoint = sqlx::query!(
+        "SELECT runtime,socket,thread FROM runtime_wakes WHERE recipient=? AND binding_version=?",
+        actor.id,
+        actor.binding_version
+    )
+    .fetch_one(store.pool())
+    .await?;
+    let thread = Uuid::parse_str(&endpoint.thread)?;
+    let mut peer = if let Some(inbox) = store.claude_inbox(actor).await? {
+        crate::claude_inbox::verify(store, Path::new(&endpoint.socket), &inbox)?;
+        Peer::ClaudeInbox {
+            socket: endpoint.socket.clone().into(),
+            endpoint: inbox,
+        }
+    } else {
+        Peer::connect(
+            endpoint.runtime.parse()?,
+            Path::new(&endpoint.socket),
+            thread,
+        )
+        .await?
+    };
+    if !matches!(peer.state().await?, State::Idle) {
+        return Ok(());
+    }
+    if !store.reserve_probe(actor, nonce, time).await? {
+        return Ok(());
+    }
+    let mut tx = store.pool().begin().await?;
+    Store::lock_actor(&mut tx, actor).await?;
+    ensure!(
+        Store::probe_current(&mut tx, actor, nonce, time).await?,
+        "verification connection changed"
+    );
+    if let Peer::ClaudeInbox { socket, endpoint } = &peer {
+        crate::claude_inbox::verify(store, socket, endpoint)?;
+    }
+    peer.send(
+        thread,
+        crate::verification::challenge(actor, nonce),
+        false,
+        nonce.into(),
+    )
+    .await?;
+    sqlx::query!("UPDATE delivery_probes SET transport_accepted_at=COALESCE(transport_accepted_at,?),healthy_at=?,failed=0 WHERE recipient=? AND binding_version=? AND nonce=?",time,time,actor.id,actor.binding_version,nonce).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
 }

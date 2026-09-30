@@ -38,14 +38,7 @@ pub(super) fn hook_settings(claude: bool, executable: &str) -> Value {
 pub(super) async fn launch(root: &Path, group: &str, name: &str, args: &[OsString]) -> Result<()> {
     let (program, forwarded) = args.split_first().context("provide a command after --")?;
     let store = Store::open(root, false).await?;
-    let actor = store
-        .mailbox(group, name)
-        .await
-        .context("agent is not registered; run agent-mail agent add NAME")?;
-    anyhow::ensure!(
-        store.agent_record(group, name).await?.state == agent_mail::states::AgentState::Registered,
-        "agent is retired; restore it before launching"
-    );
+    let actor = store.launch_identity(group, name).await?;
     let Binding::Standalone { session } = &actor.binding else {
         bail!("run requires a standalone agent; Herdr owns launches for pane-bound agents")
     };
@@ -54,6 +47,12 @@ pub(super) async fn launch(root: &Path, group: &str, name: &str, args: &[OsStrin
         .and_then(|s| s.to_str())
         .unwrap_or("custom");
     let launch_id = uuid::Uuid::new_v4().to_string();
+    if matches!(runtime, "codex" | "claude") {
+        agent_mail::supervision::ensure_running(&store, &actor, &std::env::current_exe()?).await?;
+        eprintln!(
+            "Agent Mail: worker connected; native delivery verification will run when this client is idle. Registration alone does not prove delivery."
+        );
+    }
     if matches!(runtime, "codex" | "claude") {
         store
             .begin_launch(&actor, &launch_id, runtime.parse()?)

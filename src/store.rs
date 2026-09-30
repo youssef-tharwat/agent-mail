@@ -328,7 +328,7 @@ impl Store {
             .await?
             .user_version
             .context("SQLite did not report its schema version")?;
-        ensure!(version <= 15, "database schema is newer than this binary");
+        ensure!(version <= 16, "database schema is newer than this binary");
         if setup {
             // Rebuilding a referenced table requires FK enforcement off outside
             // the migration transaction. The migration checks every FK before commit.
@@ -365,7 +365,7 @@ impl Store {
             .await?;
         } else {
             ensure!(
-                version == 15,
+                version == 16,
                 "database schema needs initialization or migration; run agent-mail init GROUP"
             );
         }
@@ -601,7 +601,7 @@ impl Store {
             );
             ensure!(
                 old.binding.same_identity(binding) || replace,
-                "participant already exists with a different binding; use participant replace NAME for standalone identity or participant bind NAME --replace for Herdr"
+                "participant already exists with a different binding; use agent replace NAME for standalone identity or agent bind NAME --replace for Herdr"
             );
             if old.binding != *binding {
                 sqlx::query!(
@@ -960,7 +960,7 @@ impl Store {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Reset reminder and native delivery budgets for a participant.
+    /// Reset notification and verification budgets without changing identity, policy or work.
     ///
     /// # Errors
     /// The participant is missing or the transaction fails.
@@ -975,7 +975,11 @@ impl Store {
         .execute(&mut *tx)
         .await?;
         sqlx::query!("UPDATE runtime_wakes SET attempts=0,next_attempt=0 WHERE recipient=? AND binding_version=?",actor.id,actor.binding_version).execute(&mut *tx).await?;
+        sqlx::query!("DELETE FROM delivery_probes WHERE recipient=?", actor.id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
+        crate::stream::hint(self.root()).await;
         Ok(())
     }
 }

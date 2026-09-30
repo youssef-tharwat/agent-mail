@@ -216,18 +216,40 @@ async fn wake(
     if !store.reserve(binding, time).await? {
         return Ok(DeliveryState::Ineligible);
     }
+    let challenge = match store.reserve_delivery_challenge(binding, time).await {
+        Ok(challenge) => challenge,
+        Err(error) => {
+            eprintln!(
+                "agent-mail: could not attach delivery check to {}/{} notification: {error:#}",
+                binding.group_name, binding.name
+            );
+            None
+        }
+    };
     // Group names are validated ASCII identifiers; no message content enters the prompt.
-    let text = format!(
+    let mut text = format!(
         "Agent Mail: work or mail changed. Run agent-mail context --group {}. Handle relevant obligations.",
         binding.group_name
     );
-    anyhow::ensure!(text.len() <= 160, "wake-up exceeds size limit");
+    if let Some(nonce) = challenge.as_deref() {
+        text.push('\n');
+        text.push_str(&crate::verification::challenge(binding, nonce));
+    }
+    anyhow::ensure!(text.len() <= 480, "wake-up exceeds size limit");
     herdr::call(
         socket,
         "agent.prompt",
         json!({"target": target.pane, "text": text}),
     )
     .await?;
+    if let Some(nonce) = challenge.as_deref()
+        && let Err(error) = store.record_delivery_challenge(binding, nonce, time).await
+    {
+        eprintln!(
+            "agent-mail: could not record delivery check for {}/{}: {error:#}",
+            binding.group_name, binding.name
+        );
+    }
     Ok(DeliveryState::Queued)
 }
 
@@ -348,8 +370,15 @@ pub async fn run(store: &Store, once: bool) -> Result<()> {
     let mut last_relay = None::<tokio::time::Instant>;
     let mut relay_jobs = JoinSet::<Result<Vec<Value>>>::new();
     let mut relay_report = Vec::new();
+    let mut verification_jobs = JoinSet::new();
     loop {
         let time = now()?;
+        while verification_jobs.try_join_next().is_some() {}
+        if verification_jobs.is_empty() {
+            let state = store.clone();
+            verification_jobs
+                .spawn(async move { crate::verification::reconcile(&state, time).await });
+        }
         let result = tick(store, time).await;
         if relay_jobs.is_empty()
             && last_relay.is_none_or(|last| last.elapsed() >= Duration::from_secs(30))
@@ -392,6 +421,9 @@ pub async fn run(store: &Store, once: bool) -> Result<()> {
         file.write_all(&bytes)?;
         std::fs::rename(path, store.root().join("service-status.json"))?;
         if once {
+            while let Some(job) = verification_jobs.join_next().await {
+                job??;
+            }
             println!("{}", String::from_utf8(bytes)?);
             break;
         }
@@ -401,6 +433,8 @@ pub async fn run(store: &Store, once: bool) -> Result<()> {
             result = tokio::signal::ctrl_c() => { result?; break; }
         }
     }
+    verification_jobs.abort_all();
+    while verification_jobs.join_next().await.is_some() {}
     relay_jobs.abort_all();
     while relay_jobs.join_next().await.is_some() {}
     if let Some(server) = stream {

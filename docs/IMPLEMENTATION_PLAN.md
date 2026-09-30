@@ -220,3 +220,10 @@ Schema 15 requires v0.7.0; v0.6.0 cannot read the upgraded store.
 Final v0.7.0 validation: 85 tests and strict Clippy passed. Group-specific status,
 pre-limit filtering, explicit all-groups selection and disabled-plugin diagnostics
 are implemented and tested. Both isolated CLI acceptance flows passed.
+
+## v0.8.0 delivery readiness
+
+Implemented and validated automatic local worker startup, bounded end-to-end
+delivery checks, persistence-safe outcomes and recovery guidance. See
+[Delivery readiness implementation](DELIVERY_READINESS_PLAN.md) for the product
+contract, test evidence and known Herdr reminder limitation.

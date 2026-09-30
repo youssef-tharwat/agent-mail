@@ -76,7 +76,15 @@ fn server(listener: UnixListener, thread: Uuid) -> Server {
                             assert_eq!(r["params"]["threadId"], thread.to_string());
                             let text = r["params"]["input"][0]["text"].as_str().unwrap();
                             assert!(text.len() <= 6000 && text.contains("Inspect evidence"));
-                            count.fetch_add(1, Ordering::SeqCst);
+                            let prior = count.fetch_add(1, Ordering::SeqCst);
+                            if prior == 0 {
+                                assert!(text.contains("agent ack"));
+                            }
+                            *loaded.lock().unwrap() = json!({
+                                "data":[thread],
+                                "nextCursor":null,
+                                "challenge":text
+                            });
                             if loss.load(Ordering::SeqCst) {
                                 break;
                             }
@@ -137,11 +145,28 @@ async fn delivery_survives_restart_and_never_accepts_work_or_targets_a_replaceme
     service::tick(&store, 999).await?;
     assert_eq!(server.received.load(Ordering::SeqCst), 0);
     store.pause("g", false).await?;
+    agent_mail::verification::reconcile(&store, 1000).await?;
+    assert_eq!(server.received.load(Ordering::SeqCst), 0);
     server.active.store(true, Ordering::SeqCst);
     service::tick(&store, 1000).await?;
     assert_eq!(server.received.load(Ordering::SeqCst), 0);
     server.active.store(false, Ordering::SeqCst);
     service::tick(&store, 1000).await?;
+    assert_eq!(server.received.load(Ordering::SeqCst), 1);
+    let prompt = server.loaded.lock().unwrap()["challenge"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let nonce: Uuid = prompt
+        .split("agent ack ")
+        .nth(1)
+        .unwrap()
+        .split('`')
+        .next()
+        .unwrap()
+        .parse()?;
+    store.acknowledge_delivery(&actor, nonce, 1001).await?;
+    agent_mail::verification::reconcile(&store, 1002).await?;
     assert_eq!(server.received.load(Ordering::SeqCst), 1);
     assert!(store.notifications(&actor, 0).await?.is_empty());
     assert!(store.work_show(&actor, "task").await?.state.is_open());

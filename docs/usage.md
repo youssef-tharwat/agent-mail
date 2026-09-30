@@ -1,6 +1,6 @@
 # User guide
 
-[README](../README.md) · Agent Mail v0.6
+[README](../README.md) · Agent Mail v0.8
 
 ## Install
 
@@ -24,7 +24,7 @@ Download the archive and its checksum from [GitHub Releases](https://github.com/
 For Apple Silicon:
 
 ```sh
-version=0.6.0
+version=0.8.0
 target=aarch64-apple-darwin
 archive="agent-mail-v${version}-${target}.tar.gz"
 base="https://github.com/youssef-tharwat/agent-mail/releases/download/v${version}"
@@ -49,12 +49,12 @@ by that checkout. npm distribution is not provided.
 
 ```sh
 agent-mail init project
-agent-mail agent add coordinator
-agent-mail agent add worker
 ```
 
-Registration stores a private credential and prints only agent metadata. It does
-not start a process or prove liveness. `agent add` refuses an existing identity;
+In 0.8, the first `run` creates a missing registration. Concurrent
+creation preserves one identity; existing credentials are never rotated implicitly.
+Use `agent add NAME` when preparing assignments before launch. Registration stores
+a private credential and does not prove liveness. `agent add` refuses an existing identity;
 `agent replace NAME` explicitly rotates its credential while preserving tasks and
 mail. Existing sessions then lose access; relaunch them with `run`.
 
@@ -67,7 +67,7 @@ agent-mail run worker -- claude
 
 `run` supplies the stored identity, selected group, state directory and Mail binary
 to the child process. There is no global current agent or credential to copy.
-Unknown agents and Herdr/remote bindings are rejected. For multiple groups, use
+Retired agents and Herdr/remote bindings are rejected; existing standalone identities are reused. For multiple groups, use
 `--group GROUP`. Client arguments pass through, including resume options:
 
 ```sh
@@ -77,7 +77,7 @@ agent-mail run coordinator -- codex resume SESSION_ID
 
 The launcher preserves terminal input/output, exit status and signals. Interactive
 Codex launches supervise a private backend and terminal client; other commands
-replace the launcher process. Neither mode starts the Mail service.
+replace the launcher process. Managed native launches establish the Mail service automatically.
 For one operator command, the same identity handling works with any executable:
 
 ```sh
@@ -214,7 +214,8 @@ and recovery summaries; the public command is `task`.
 
 ## Automatic recovery and delivery
 
-Run one worker for the store:
+Managed `run NAME -- codex` and `run NAME -- claude` launches establish one local
+worker and verify an authenticated stream before launching. For manual integrations, run one worker for the store:
 
 ```sh
 agent-mail service run
@@ -264,8 +265,8 @@ Existing configuration and hook sources remain active. Tested with Codex 0.157.0
 `runtime configure codex --output PATH` remains available for manual integration.
 Remove separately installed Mail hooks before switching to `run`.
 
-Managed interactive launches discover and attach their sole loaded thread; keep
-`agent-mail service run` active for delivery. To integrate an independently managed
+Managed interactive launches discover and attach their sole loaded thread and
+establish the shared worker automatically. To integrate an independently managed
 Codex app-server, explicit attachment remains available:
 
 ```sh
@@ -286,7 +287,7 @@ agent-mail runtime pause
 agent-mail runtime resume
 agent-mail runtime detach worker
 agent-mail runtime enable worker
-agent-mail runtime retry worker
+agent-mail agent retry worker
 ```
 
 Pause/resume affects group delivery, not mail writes. Retry resets only that
@@ -305,7 +306,10 @@ agent-mail status
 agent-mail status --check worker
 ```
 
-Status reports stored coordination and delivery facts. `--check` probes setup and
+Plain `status` shows a short readiness table. `status --json` returns the full
+structured report, including retry timing, state directory and stored coordination.
+`--all-groups` is the explicit installation overview; add `--json` for scripts.
+`--check` probes setup and
 runtime endpoints, exits nonzero on failed checks, and gives corrective actions.
 Neither mode starts agents, repairs state, accepts work or answers permissions.
 Unknown hook trust remains unknown. Delivery receipts and task progress are separate.
@@ -356,17 +360,33 @@ needs no separate skill installer. Print the exact installed instructions with:
 agent-mail --skill
 ```
 
-`--skill` prints instructions; it does not install or register a discoverable
-skill with your agent client. For clients without Mail lifecycle hooks, load that
-output at startup/reset, or install the discoverable skill:
+`--skill` prints the full guide; it does not register a discoverable skill. Use
+[skills.sh](https://skills.sh/docs) to install the lightweight loader:
 
 ```sh
 npx skills add youssef-tharwat/agent-mail --skill agent-mail -g
 ```
 
-Select your agent clients in the installer, then start a new agent session.
-Only that optional installation mechanism requires Node/npm. Keep external skill
-copies matched to the binary; the embedded copy is always version-matched.
+Select Codex and/or Claude Code in the installer. This command requires Node/npm;
+the Agent Mail binary does not. No Mail database or group is needed. Start a new
+client session if it does not discover the installation immediately.
+
+The loader runs `agent-mail --skill`, obtaining instructions from the binary on
+PATH. Updating the binary therefore updates the guide on its next load, without
+copying documentation into every client. Already-loaded conversation context is
+not replaced automatically. Managed launches prepend their binary directory to PATH;
+for direct client launches, ensure PATH selects the intended version.
+
+skills.sh owns the installed skill files. Update the loader itself through its
+[CLI](https://github.com/vercel-labs/skills#skills-update):
+
+```sh
+npx skills update agent-mail -g
+```
+
+Existing installations containing a copied full guide need this update once to
+receive the loader. Agent Mail does not overwrite installed skills during launch
+or binary upgrades.
 
 `status --check NAME` distinguishes `awaiting_hook`, `hook_observed`, and
 `not_observed`. Evidence includes session, event and timestamp. A hook observation
@@ -374,34 +394,16 @@ proves adapter execution, not model consumption or ongoing process health. Endpo
 probing separately checks current delivery capability. Restarting a managed client
 clears prior launch evidence; an old session cannot establish new readiness.
 
-## Upgrading
+## Existing installations
 
-v0.5 replaces `participant` with `agent` and adds `run`. Update the required skill
-and any operator scripts. Normal registration no longer prints a credential;
-manual integrations can explicitly request one with `agent add NAME --show-session`
-or `agent replace NAME --show-session`. Normal use needs neither this flag nor a
-manual `AGENT_MAIL_SESSION` export. v0.6 adds launch-scoped hook evidence and a typed task lifecycle (schema 14).
-Stop the delivery worker and clients, back up the store, then run
-`agent-mail init GROUP` to migrate before restarting. See
-[task-state migration](#upgrading-task-state-storage) for legacy-state validation
-and the removal of `open`, `--close` and `--reopen`.
+Before migration, stop the delivery worker and client processes and back up the
+state directory. Upgrade the binary, then run `agent-mail init GROUP`; it migrates
+the store through schema 16. Older binaries cannot open the migrated store. Upgrade
+both relay peers before syncing.
 
-When upgrading from pre-v0.4, also update scripts to use `task`, `mail`, `runtime`
-and `adapter`; regenerate hooks before restarting clients. When using `run`, remove
-older manually installed Mail hooks to avoid duplicates.
-
-Stop the worker and other Mail commands and back up your state directory. On macOS
-run `service uninstall` before upgrading and `service install` afterward.
-
-```sh
-brew update
-brew upgrade youssef-tharwat/tap/agent-mail
-agent-mail init YOUR_EXISTING_GROUP
-```
-
-Init applies migrations through schema 12. Older binaries cannot open the upgraded
-store. Restart the worker after migrating. Native Claude tokens stay in the private
-database; status excludes them. Uninstalling a package does not erase Mail state.
+On macOS, `agent-mail service uninstall` stops the launchd worker and preserves its
+database. Run `agent-mail service install` after migration. Managed launches load
+the guide bundled with the current binary; skills.sh manages the discoverable loader.
 
 ## Development
 
@@ -483,3 +485,38 @@ restricted to the authenticated registration in its group.
 Binding a Herdr pane fails clearly when the plugin is disabled. `status --check NAME`
 checks plugin enablement and group prompt policy separately from pane identity.
 It never silently enables unguarded prompts or treats binding as delivery proof.
+
+
+## Delivery verification (0.8)
+
+Registration is an address. Transport acceptance is a dispatch receipt. A Claude
+hook is runtime receipt. None alone marks automatic delivery ready.
+
+When a task or message already wakes an agent, the worker includes the small
+challenge in that same delivery. If there is no pending notification, it uses a
+standalone probe when the client is idle. The receiving agent executes the supplied
+`agent ack NONCE` command using its own identity. Only this exact acknowledgment,
+bound to the current group, registration, launch and endpoint, plus connection
+health checked within 30 seconds, yields `delivery.ready: true`. It never resolves
+mail or changes task state. Local administrators are trusted; this is operational
+evidence, not attestation of model understanding.
+
+`status` includes delivery state, acknowledgment/receipt timestamps, attempt count,
+next attempt and deadline. `status --check NAME` reports the same evidence with
+connection diagnostics. There are at most three attempts spaced 60 seconds apart
+within 180 seconds; restart does not reset the budget. A challenge attached to a
+normal notification adds no separate wake. Busy clients are not interrupted by a
+standalone probe. After diagnosing the cause, `agent retry NAME`
+ensures the worker is connected and resets notification and verification budgets
+atomically. It preserves identity, pause/prompt policy and business state. Never execute
+an acknowledgment for another agent or obtain its challenge from storage.
+
+Send/reply and task create/update responses include `delivery` per affected
+recipient. These diagnostics cannot turn a committed write into an error. A
+missing route means work is stored and awaiting delivery, not lost; do not resend
+under a different key. Notifications and business obligations remain separate.
+
+Herdr remains optional. Its notify-only policy cannot wake idle panes; use native
+managed launches or explicitly opt into unguarded Herdr prompts. Verification
+honors pause and policy settings. Custom commands and remote recipients do not
+acquire a native wake route merely by registering.

@@ -1,13 +1,10 @@
 # Agent Mail
 
-**Local, durable coordination for coding agents.**
+**Durable tasks and messages for coding agents, on your machine.**
 
-Keep tasks, ownership, next actions, evidence and unanswered requests across
-context resets and restarts. Agent Mail stores them in SQLite and restores the
-relevant context when an agent resumes.
-
-One native CLI. No account or hosted service. Works with Claude Code and Codex;
-Herdr and Fleet Campaign are optional.
+Keep assignments, decisions, evidence and unanswered requests across context resets.
+Agent Mail stores coordination in SQLite, restores relevant context and wakes connected
+agents when work arrives. Works with **Claude Code and Codex**. No account or hosted service.
 
 ![Assign a task, recover after a reset, send a result, and accept it.](assets/agent-mail-demo.gif)
 
@@ -17,173 +14,119 @@ Herdr and Fleet Campaign are optional.
 brew install youssef-tharwat/tap/agent-mail
 ```
 
-Prebuilt binaries support macOS and Linux on ARM64 and x86-64. No Cargo or Rust
-compiler required. [Other installation options](docs/usage.md#install).
+Prebuilt binaries for macOS and Linux, ARM64 and x86-64. No Rust compiler needed.
+[Other installation options](docs/usage.md#install).
 
-## Agent skill
+## Start
 
-Agents need the [operating skill](skills/agent-mail/SKILL.md) to use Mail correctly.
-It teaches assignment, blockers, review, correction, acceptance and safe retries.
-
-**Managed Codex/Claude launches:** `agent-mail run NAME -- codex` (or `claude`)
-supplies the bundled, version-matched instructions at startup and after context
-resets. Routine updates do not repeat them. No separate skill installation or
-Node/npm is needed for this flow.
-
-**Discoverable skill:** to let your client discover and invoke `$agent-mail`,
-install it with the skills CLI (requires Node/npm):
-
-```sh
-npx skills add youssef-tharwat/agent-mail --skill agent-mail -g
-```
-
-Select your agent clients in the installer, then start a new agent session.
-Keep separately installed skills updated alongside the binary.
-
-**Inspect the bundled instructions:**
-
-```sh
-agent-mail --skill
-```
-
-This prints the skill; it does **not** install or register it with your client.
-
-## Agent lifecycle
-
-Agents have durable `registered` / `retired` states, versions and history:
-
-```sh
-agent-mail agent show worker
-agent-mail agent update worker --version VERSION --state retired --reason "Finished"
-agent-mail agent history worker
-```
-
-Retirement requires owned/written tasks and incoming/outgoing mail to be settled.
-Restore with `--state registered` and the current version, then launch again.
-Old credentials and runtime attachments stay invalid. Registration state is
-separate from whether the client is running.
-
-## Quick start
-
-Create a group, register agents, and start the delivery worker:
+Create a group:
 
 ```sh
 agent-mail init project
-agent-mail agent add coordinator
-agent-mail agent add worker
-agent-mail service run
 ```
 
-Leave the worker running. Launch each agent in a separate terminal:
+Launch each agent in its own terminal:
 
 ```sh
 agent-mail run coordinator -- codex
 agent-mail run worker -- claude
 ```
 
-Mail supplies identity and configures recovery hooks. Review native hook trust
-when prompted; existing agent permissions still apply. Interactive Codex gets a
-private local backend with automatic attachment. Claude uses its native inbox.
+`run` creates a missing identity, starts the shared delivery worker when needed,
+and supplies the agent skill and recovery hooks. Existing identities are preserved;
+retired agents require explicit restoration. Review the client's normal hook trust prompts.
 
-### Assign, report, accept
+## Coordinate
 
-Inside the coordinator's session:
-
-```sh
-agent-mail task create api-review "Review API changes at abc123" --owner worker
-```
-
-The worker receives the assignment through the integration. After doing the work:
+Ask the coordinator to assign work, or run inside its session:
 
 ```sh
-agent-mail mail send coordinator "Reviewed abc123; evidence: reviews/api.md" \
-  --task api-review --key api-review-result-v1
+agent-mail task create api-review "Review the API changes" --owner worker
 ```
 
-The coordinator checks the result and evidence, then reads the current task and
-pending mail with `task show api-review` and `mail list`. Using the observed
-`VERSION` and incoming `MESSAGE_ID`, it can accept and resolve together:
+The worker receives the assignment, does the work, and reports to the coordinator:
 
 ```sh
-agent-mail task update api-review --version VERSION --reason "Evidence verified" \
-  --state accepted --accepted-revision abc123 --evidence reviews/api.md \
-  --resolve MESSAGE_ID
+agent-mail mail send coordinator "Review complete; evidence: reviews/api.md" \
+  --task api-review --key api-review-result
 ```
 
-The task creator is its **writer**; only that identity can change it. The **owner**
-does the work and reports results. Changes publish notifications automatically.
-Your workflow decides what evidence is sufficient for acceptance.
+The task's creator is its **writer** and records decisions. Its **owner** does the
+work and reports results. Task changes publish notifications automatically.
+Reading or delivering a message never accepts a task.
+[Assignment, review and acceptance](docs/agent-guide.md#assignment--result--decision).
 
-## Task lifecycle
-
-Tasks use `open`, `ready`, `active`, `blocked`, `review`, `done`, `accepted`, or
-`cancelled`. The last three close the task automatically—there is no separate
-close flag. `done` records completion; `accepted` records the writer's acceptance.
-
-Updates require the version you observed and a reason. A linked message can be
-resolved in the same transaction. Reading a message, delivering a notification,
-or ending an agent turn never completes a task.
-
-Tasks store evidence references. General resource attachments are not implemented.
-
-## Recovery and delivery
-
-Use injected context directly. If your integration has not supplied it, run
-`agent-mail context`. Fetch `task show ID` or `mail show ID` only for needed details.
-
-The delivery worker uses durable events and bounded retries. It survives restarts
-without relying on the agent to remember delivery bookkeeping. The agent or
-operator still makes business decisions explicitly.
+## Check delivery
 
 ```sh
 agent-mail status
-agent-mail status --check worker
 ```
 
-Diagnostics distinguish missing setup, observed hooks and delivery problems.
-Hook execution is evidence of integration activity, not proof of model consumption.
-Manual CLI use works without the delivery worker; automatic idle wake needs it.
-[Runtime setup and controls](docs/usage.md#automatic-recovery-and-delivery).
+Example:
 
-## Herdr plugin (optional)
+```text
+Group: project
+Delivery worker: running
+
+AGENT        DELIVERY
+coordinator  Ready
+worker       Verifying · retry in 42s
+```
+
+**Ready** requires an explicit agent acknowledgment of a delivery check and a
+healthy current connection. A saved message or successful socket write is not enough.
+Unavailable recipients keep their pending work. After fixing a delivery problem:
+
+```sh
+agent-mail status --check worker
+agent-mail agent retry worker
+```
+
+Retries are bounded. They never change identity, clear a pause, or complete work.
+Use `status --json` for full structured evidence. [Delivery details](docs/usage.md#delivery-verification-08).
+
+## Commands
+
+| Category | Commands | Purpose |
+|---|---|---|
+| Start | `init`, `run` | Create a group and launch agents. |
+| Coordinate | `context`, `task`, `mail` | Recover assignments, manage tasks and exchange requests. |
+| Manage | `status`, `agent` | Check delivery, retry, or manage registrations. |
+| Integrations | `runtime`, `service` | Configure manual integrations and worker supervision. |
+
+Use `agent-mail COMMAND --help` for options. Task/mail operations return JSON.
+Groups have separate agents, tasks and inboxes; select one with `--group NAME` when
+needed. They share one local store and worker. `status --all-groups` shows the operator overview.
+
+## Agent skill
+
+The [operating guide](docs/agent-guide.md) teaches recovery, ownership, blockers,
+reviews, acceptance and safe retries. Managed launches supply it automatically.
+
+Install with [skills.sh](https://skills.sh/docs):
+
+```sh
+npx skills add youssef-tharwat/agent-mail --skill agent-mail -g
+```
+
+The installed skill loads `agent-mail --skill`, so its operating instructions follow
+the binary on PATH when next invoked. skills.sh manages installation and loader
+updates. [Installation and update details](docs/usage.md#agent-skill).
+
+## Herdr (optional)
 
 ```sh
 herdr plugin install youssef-tharwat/agent-mail
 ```
 
-The plugin downloads a verified binary. Herdr owns agent sessions and pane identity;
-Mail owns durable coordination. Load the output of `agent-mail --skill` at startup
-or [install the discoverable skill](#agent-skill). [Herdr setup](docs/usage.md#optional-herdr-integration).
+Herdr owns sessions and panes; Mail owns coordination. Native managed launches work
+without Herdr. [Herdr setup and prompt policy](docs/usage.md#optional-herdr-integration).
+Fleet Campaign is also optional; your workflow defines review and acceptance rules.
 
-## Upgrading to v0.6
+## More
 
-Stop clients and the delivery worker, back up your store, then follow the
-[upgrade guide](docs/usage.md#upgrading). Schema 14 introduces typed task states
-and rejects ambiguous legacy states. Writable `open`, `--close` and `--reopen`
-have been removed. The bundled skill matches the installed binary.
-
-## Documentation and contributing
-
-- [User guide](docs/usage.md): commands, integrations and troubleshooting.
-- [Agent operating skill](skills/agent-mail/SKILL.md): usage flows and decisions.
-- [Architecture](docs/ARCHITECTURE.md): ownership and delivery guarantees.
-- [Live validation and limitations](docs/native-launch-acceptance.md).
-- [Development](docs/usage.md#development) · [Implementation plan](docs/IMPLEMENTATION_PLAN.md).
-- [Issues](https://github.com/youssef-tharwat/agent-mail/issues): bugs and proposals.
+[User guide](docs/usage.md) · [Architecture](docs/ARCHITECTURE.md) ·
+[Implementation plan](docs/IMPLEMENTATION_PLAN.md) · [Development](docs/usage.md#development) ·
+[Issues](https://github.com/youssef-tharwat/agent-mail/issues)
 
 Maintained by [Youssef Tharwat](https://github.com/youssef-tharwat). [MIT](LICENSE).
-
-## Multiple fleets
-
-Each group has its own agents, tasks and inboxes. Groups share the local database
-and delivery service. Adding a group on the current schema does not stop delivery.
-
-```sh
-agent-mail init recall
-agent-mail --group recall agent add coordinator
-agent-mail --group recall status
-agent-mail status --all-groups  # installation-wide operator view
-```
-
-Commands infer the group from the current identity or sole group. Ambiguous
-selection fails rather than choosing another fleet.

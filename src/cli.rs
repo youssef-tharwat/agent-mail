@@ -7,7 +7,7 @@ use agent_mail::{
     work::{WorkPatch, WorkUpdate},
 };
 use anyhow::{Context, Result, ensure};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use std::{io::Write, path::PathBuf};
 use uuid::Uuid;
 
@@ -16,7 +16,7 @@ use uuid::Uuid;
     version,
     about = "Durable tasks and messages for coding agents",
     arg_required_else_help = true,
-    after_help = "Start: agent-mail init project\nThen:  agent-mail agent add worker\n\nAdvanced: agent-mail remote --help; agent-mail adapter --help\nRun:   agent-mail run worker -- claude\nOutput is JSON; run preserves the child interface."
+    after_help = "Start: agent-mail init project\n       agent-mail run worker -- claude\n\nMost commands return JSON. Status is a readable summary; use status --json for structured output.\nAdvanced integrations: agent-mail remote --help; agent-mail adapter --help."
 )]
 pub(super) struct Cli {
     /// Coordination group; otherwise inferred from identity or the sole group.
@@ -62,10 +62,10 @@ enum Action {
     /// Create, inspect and update versioned assignments.
     #[command(subcommand)]
     Task(Task),
-    /// Manage durable agent identities (operator).
+    /// Register, inspect and retry agents.
     #[command(subcommand)]
     Agent(Agent),
-    /// Launch a command as a registered agent; configure Claude/Codex recovery hooks.
+    /// Launch an agent; create its identity if missing and configure recovery.
     Run {
         name: String,
         /// Client or command and its arguments, after --.
@@ -80,6 +80,9 @@ enum Action {
     Service(Service),
     /// Read coordination health; --check also probes runtime setup.
     Status {
+        /// Emit full structured status instead of the short summary.
+        #[arg(long)]
+        json: bool,
         /// Installation-wide operator view, including every group.
         #[arg(long, conflicts_with_all = ["check", "group"])]
         all_groups: bool,
@@ -217,6 +220,11 @@ struct Changes {
 }
 #[derive(Subcommand)]
 enum Agent {
+    /// Retry notifications and delivery verification after repairing the cause.
+    Retry { name: String },
+    /// Respond to the exact delivery challenge received by this agent.
+    #[command(hide = true)]
+    Ack { nonce: uuid::Uuid },
     /// Read durable state and version.
     Show { name: String },
     /// Explicitly retire or restore an agent using the observed version.
@@ -285,8 +293,6 @@ enum Runtime {
     Pause,
     /// Resume this group's delivery without resetting retry budgets.
     Resume,
-    /// Reset this agent's delivery budget after fixing its endpoint.
-    Retry { name: String },
     /// Configure the group's Herdr socket explicitly.
     Herdr {
         #[arg(long, env = "HERDR_SOCKET_PATH")]
@@ -398,7 +404,64 @@ fn parse_deadline(value: &str) -> std::result::Result<i64, String> {
     Ok(date.unix_timestamp())
 }
 
+fn grouped_help(command: clap::Command, categories: &[(&str, &[&str])]) -> clap::Command {
+    let mut template = String::from("{about}\n\n{usage-heading} {usage}\n");
+    for (heading, names) in categories {
+        template.push_str(&format!("\n{heading}:\n"));
+        for name in *names {
+            let sub = command
+                .find_subcommand(name)
+                .expect("category command exists");
+            template.push_str(&format!(
+                "  {:<13} {}\n",
+                sub.get_name(),
+                sub.get_about().expect("command description")
+            ));
+        }
+    }
+    template.push_str("\nOptions:\n{options}\n{after-help}");
+    command.help_template(template)
+}
+
 impl Cli {
+    pub(super) fn parse_cli() -> Self {
+        let command = Self::command()
+            .mut_subcommand("agent", |c| {
+                grouped_help(
+                    c,
+                    &[
+                        ("Inspect", &["list", "show", "history"]),
+                        ("Maintain", &["add", "update", "replace", "retry"]),
+                        ("Herdr", &["bind"]),
+                    ],
+                )
+            })
+            .mut_subcommand("runtime", |c| {
+                grouped_help(
+                    c,
+                    &[
+                        (
+                            "Native clients",
+                            &["configure", "attach", "detach", "enable"],
+                        ),
+                        ("Group delivery", &["pause", "resume"]),
+                        ("Herdr", &["herdr", "herdr-policy"]),
+                    ],
+                )
+            });
+        let matches = grouped_help(
+            command,
+            &[
+                ("Start", &["init", "run"]),
+                ("Coordinate", &["context", "task", "mail"]),
+                ("Manage", &["status", "agent"]),
+                ("Integrations", &["runtime", "service"]),
+            ],
+        )
+        .get_matches();
+        Self::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
+    }
+
     pub(super) async fn prepare(self) -> Result<Option<RunArgs>> {
         if self.skill {
             ensure!(
@@ -449,6 +512,7 @@ impl Cli {
             let agent = matches!(
                 &command,
                 Action::Context { .. }
+                    | Action::Agent(Agent::Ack { .. })
                     | Action::Mail(_)
                     | Action::Task(_)
                     | Action::Adapter(_)
@@ -497,11 +561,15 @@ impl Cli {
             Action::Status {
                 all_groups,
                 check: None,
+                json,
             } => Command::Status {
                 group: if all_groups { None } else { Some(group) },
+                json,
             },
             Action::Service(s) => Command::Service(s),
             Action::Agent(p) => match p {
+                Agent::Retry { name } => Command::Retry { group, name },
+                Agent::Ack { nonce } => Command::AckDelivery { group, nonce },
                 Agent::Add { name, show_session } => Command::Register {
                     show_session,
                     group,
@@ -667,7 +735,6 @@ impl Cli {
                 Runtime::Enable { name } => Command::EnableRuntime { group, name },
                 Runtime::Pause => Command::Pause { group },
                 Runtime::Resume => Command::Resume { group, rearm: None },
-                Runtime::Retry { name } => Command::Retry { group, name },
                 Runtime::Herdr { socket } => Command::Setup {
                     group,
                     socket: Some(socket),
