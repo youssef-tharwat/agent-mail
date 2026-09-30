@@ -43,6 +43,106 @@ impl Demo {
 }
 
 #[test]
+fn followthrough_defaults_and_direct_policy_flags_need_no_file() -> Result<()> {
+    let d = Demo::new()?;
+    assert_eq!(
+        d.ok(None, &["init", "fleet"])?["follow_through"]["mode"],
+        "enabled"
+    );
+    let policy = d.ok(
+        None,
+        &[
+            "attention",
+            "configure",
+            "--observe",
+            "--interval",
+            "10m",
+            "--max",
+            "1h",
+            "--notifier",
+            "/usr/bin/true",
+            "--notifier-arg=--quiet",
+        ],
+    )?;
+    assert_eq!(policy["policy"]["interval_seconds"], 600);
+    assert_eq!(
+        policy["policy"]["notifier"],
+        json!(["/usr/bin/true", "--quiet"])
+    );
+    assert_eq!(
+        d.ok(None, &["init", "fleet"])?["follow_through"]["mode"],
+        "observe"
+    );
+    let policy = d.ok(None, &["attention", "configure", "--enable"])?;
+    assert_eq!(policy["policy"]["interval_seconds"], 600);
+    assert_eq!(
+        policy["policy"]["notifier"],
+        json!(["/usr/bin/true", "--quiet"])
+    );
+    assert!(
+        !d.call(None, &["attention", "configure", "--enable", "--observe"])?
+            .status
+            .success()
+    );
+    assert!(
+        !d.call(None, &["attention", "configure", "--interval", "1h"])?
+            .status
+            .success()
+    );
+    let before_conflict = d.ok(None, &["attention", "configure"])?["policy"].clone();
+    let policy_file = d.0.path().join("conflicting-policy.json");
+    std::fs::write(
+        &policy_file,
+        serde_json::to_vec(&json!({
+            "mode":"observe", "interval_seconds":120, "max_seconds":480, "notifier":null
+        }))?,
+    )?;
+    let conflict = d.call(
+        None,
+        &[
+            "attention",
+            "configure",
+            "--file",
+            policy_file.to_str().unwrap(),
+            "--enable",
+        ],
+    )?;
+    let diagnostic = String::from_utf8_lossy(&conflict.stderr);
+    assert_eq!(
+        conflict.status.code(),
+        Some(2),
+        "FND-5 sensitivity: valid file plus direct flags must be rejected by Clap: {diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("cannot be used with")
+            && diagnostic.contains("--file")
+            && diagnostic.contains("--enable"),
+        "expected argument conflict: {diagnostic}"
+    );
+    assert_eq!(
+        d.ok(None, &["attention", "configure"])?["policy"],
+        before_conflict
+    );
+    assert_eq!(
+        d.ok(None, &["attention", "configure", "--clear-notifier"])?["policy"]["notifier"],
+        Value::Null
+    );
+    assert_eq!(
+        d.ok(None, &["attention", "configure"])?["policy"]["mode"],
+        "enabled"
+    );
+    assert_eq!(
+        d.ok(None, &["init", "manual", "--no-follow-through"])?["follow_through"]["mode"],
+        "observe"
+    );
+    assert_eq!(
+        d.ok(None, &["init", "manual", "--follow-through"])?["follow_through"]["mode"],
+        "enabled"
+    );
+    Ok(())
+}
+
+#[test]
 fn standalone_mail_work_and_session_replacement() -> Result<()> {
     let d = Demo::new()?;
     d.ok(None, &["init", "default"])?;

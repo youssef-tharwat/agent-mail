@@ -26,6 +26,12 @@ pub struct Notification {
     pub version: i64,
 }
 
+pub(crate) struct Delivery {
+    pub text: String,
+    pub events: Vec<Notification>,
+    pub items: Vec<crate::turns::OfferItem>,
+}
+
 impl Store {
     // Retrieval receipts stop transport retries, never resolve business requests.
     pub(crate) async fn retrieve_tx(
@@ -55,13 +61,23 @@ impl Store {
     ) -> Result<()> {
         let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
+        Self::retrieved_tx(&mut tx, actor, mail, work).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn retrieved_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        actor: &Mailbox,
+        mail: &[i64],
+        work: &[(String, i64)],
+    ) -> Result<()> {
         for id in mail {
-            Self::retrieve_tx(&mut tx, actor, EventKind::MailPending, &id.to_string(), 0).await?;
+            Self::retrieve_tx(tx, actor, EventKind::MailPending, &id.to_string(), 0).await?;
         }
         for (id, version) in work {
-            Self::retrieve_tx(&mut tx, actor, EventKind::WorkChanged, id, *version).await?;
+            Self::retrieve_tx(tx, actor, EventKind::WorkChanged, id, *version).await?;
         }
-        tx.commit().await?;
         Ok(())
     }
 
@@ -98,10 +114,17 @@ impl Store {
     async fn latest_changes_since(&self, actor: &Mailbox, after: i64) -> Result<Vec<Notification>> {
         let mut tx = self.pool().begin().await?;
         Self::check_actor(&mut tx, actor).await?;
-        let rows = sqlx::query_as!(Notification,
-            "SELECT e.id,e.kind AS 'kind: EventKind',e.subject,e.version FROM coordination_events e WHERE e.recipient=? AND e.id>? AND NOT EXISTS(SELECT 1 FROM coordination_events newer WHERE newer.recipient=e.recipient AND newer.kind=e.kind AND newer.subject=e.subject AND newer.id>e.id) ORDER BY e.id DESC LIMIT 6",actor.id,after).fetch_all(&mut *tx).await?;
+        let rows = Self::latest_changes_tx(&mut tx, actor, after).await?;
         tx.commit().await?;
         Ok(rows)
+    }
+    pub(crate) async fn latest_changes_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        actor: &Mailbox,
+        after: i64,
+    ) -> Result<Vec<Notification>> {
+        Ok(sqlx::query_as!(Notification,
+            "SELECT e.id,e.kind AS 'kind: EventKind',e.subject,e.version FROM coordination_events e WHERE e.recipient=? AND e.id>? AND NOT EXISTS(SELECT 1 FROM coordination_events newer WHERE newer.recipient=e.recipient AND newer.kind=e.kind AND newer.subject=e.subject AND newer.id>e.id) ORDER BY e.id DESC LIMIT 6",actor.id,after).fetch_all(&mut **tx).await?)
     }
 
     /// Report outstanding notifications and persisted hook emission budgets.
@@ -186,21 +209,33 @@ impl Store {
         stop: bool,
         now: i64,
     ) -> Result<bool> {
-        bounded(session, 160, "client session")?;
-        ensure!(!session.is_empty(), "hook requires a client session ID");
         let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
+        let emit = Self::reserve_hook_tx(&mut tx, actor, session, reset, stop, now).await?;
+        tx.commit().await?;
+        Ok(emit)
+    }
+    pub(crate) async fn reserve_hook_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        actor: &Mailbox,
+        session: &str,
+        reset: bool,
+        stop: bool,
+        now: i64,
+    ) -> Result<bool> {
+        bounded(session, 160, "client session")?;
+        ensure!(!session.is_empty(), "hook requires a client session ID");
         sqlx::query!("INSERT OR IGNORE INTO hook_emissions(recipient,binding_version,client_session) VALUES(?,?,?)",actor.id,actor.binding_version,session)
-            .execute(&mut *tx).await?;
+            .execute(&mut **tx).await?;
         let latest = sqlx::query!(
             "SELECT COALESCE(MAX(id),0) AS 'id!: i64' FROM coordination_events WHERE recipient=?",
             actor.id
         )
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?
         .id;
         let row = sqlx::query!("SELECT last_event,attempts,next_attempt,stop_used FROM hook_emissions WHERE recipient=? AND binding_version=? AND client_session=?",actor.id,actor.binding_version,session)
-            .fetch_one(&mut *tx).await?;
+            .fetch_one(&mut **tx).await?;
         let changed = latest > row.last_event;
         // One Stop continuation per recovery epoch, even if events keep arriving.
         let actionable = sqlx::query!(
@@ -208,7 +243,7 @@ impl Store {
             actor.id,
             row.last_event
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?
         .is_some();
         let emit = reset
@@ -231,9 +266,8 @@ impl Store {
                 .checked_add(300)
                 .ok_or_else(|| anyhow::anyhow!("clock overflow"))?;
             sqlx::query!("UPDATE hook_emissions SET last_event=?,attempts=?,next_attempt=?,stop_used=? WHERE recipient=? AND binding_version=? AND client_session=?",latest,attempts,next,stop_used,actor.id,actor.binding_version,session)
-                .execute(&mut *tx).await?;
+                .execute(&mut **tx).await?;
         }
-        tx.commit().await?;
         Ok(emit)
     }
 }
@@ -269,18 +303,29 @@ impl Store {
 }
 
 impl Store {
-    pub(crate) async fn delivery_text(
+    pub(crate) async fn delivery(
         &self,
         actor: &Mailbox,
         challenge: Option<&str>,
         after: i64,
-    ) -> Result<String> {
-        Self::notification_text(
-            actor,
-            challenge,
-            self.latest_changes_since(actor, after).await?,
-            6000,
-        )
+    ) -> Result<Delivery> {
+        let mut tx = self.pool().begin().await?;
+        Self::check_actor(&mut tx, actor).await?;
+        let delivery = Self::delivery_tx(&mut tx, actor, challenge, after).await?;
+        tx.commit().await?;
+        Ok(delivery)
+    }
+
+    pub(crate) async fn delivery_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        actor: &Mailbox,
+        challenge: Option<&str>,
+        after: i64,
+    ) -> Result<Delivery> {
+        let events = Self::latest_changes_tx(tx, actor, after).await?;
+        let mut delivery = Self::notification_text(actor, challenge, events, 6000)?;
+        delivery.items = crate::turns::capture_tx(tx, actor, &delivery.events).await?;
+        Ok(delivery)
     }
 
     pub(crate) async fn herdr_notification_text(
@@ -292,7 +337,7 @@ impl Store {
         Self::check_actor(&mut tx, actor).await?;
         let events = sqlx::query_as!(Notification,"SELECT id,kind AS 'kind: EventKind',subject,version FROM herdr_wake_events WHERE recipient=? ORDER BY id DESC LIMIT 6",actor.id).fetch_all(&mut *tx).await?;
         tx.commit().await?;
-        Self::notification_text(actor, challenge, events, 480)
+        Ok(Self::notification_text(actor, challenge, events, 480)?.text)
     }
 
     fn notification_text(
@@ -300,7 +345,7 @@ impl Store {
         challenge: Option<&str>,
         events: Vec<Notification>,
         limit: usize,
-    ) -> Result<String> {
+    ) -> Result<Delivery> {
         let mut visible = events
             .iter()
             .rev()
@@ -330,7 +375,11 @@ impl Store {
                 text.push_str(&crate::verification::challenge(actor, nonce));
             }
             if text.len() <= limit {
-                return Ok(text);
+                return Ok(Delivery {
+                    text,
+                    events: visible,
+                    items: vec![],
+                });
             }
             if visible.is_empty() {
                 let mut recovery = String::from(
@@ -343,7 +392,11 @@ impl Store {
                     recovery.len() <= limit,
                     "notification recovery instruction exceeds transport limit"
                 );
-                return Ok(recovery);
+                return Ok(Delivery {
+                    text: recovery,
+                    events: vec![],
+                    items: vec![],
+                });
             }
             visible.remove(0);
             more = true;

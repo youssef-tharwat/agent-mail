@@ -379,33 +379,31 @@ impl Store {
         crate::stream::hint(self.root()).await;
         Ok(())
     }
-    /// Match a Claude notification hook, recording receipt but not agent acknowledgment.
-    pub(crate) async fn probe_hook(
-        &self,
+    /// Match a Claude notification hook under the caller's fenced writer reservation.
+    /// Receipt and its input boundary commit together; agent acknowledgment remains separate.
+    pub(crate) async fn probe_hook_tx(
+        tx: &mut Transaction<'_, Sqlite>,
         actor: &Mailbox,
         prompt: &str,
         now: i64,
     ) -> Result<Option<String>> {
-        let mut tx = self.pool().begin().await?;
-        Self::lock_actor(&mut tx, actor).await?;
         let p = sqlx::query!(
             "SELECT nonce,attempts FROM delivery_probes WHERE recipient=? AND binding_version=?",
             actor.id,
             actor.binding_version
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?;
         let Some(p) = p else {
             return Ok(None);
         };
         if p.attempts == 0
             || prompt != crate::claude_inbox::notification(&p.nonce)
-            || !Self::probe_current(&mut tx, actor, &p.nonce, now).await?
+            || !Self::probe_current(tx, actor, &p.nonce, now).await?
         {
             return Ok(None);
         }
-        sqlx::query!("UPDATE delivery_probes SET runtime_received_at=COALESCE(runtime_received_at,?) WHERE recipient=? AND nonce=?",now,actor.id,p.nonce).execute(&mut *tx).await?;
-        tx.commit().await?;
+        sqlx::query!("UPDATE delivery_probes SET runtime_received_at=COALESCE(runtime_received_at,?) WHERE recipient=? AND nonce=?",now,actor.id,p.nonce).execute(&mut **tx).await?;
         Ok(Some(challenge(actor, &p.nonce)))
     }
 }

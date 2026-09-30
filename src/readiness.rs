@@ -3,6 +3,33 @@ use crate::states::{HookEvent, NativeRuntime, RecoveryState};
 use crate::store::{Mailbox, Store};
 use anyhow::Result;
 use serde::Serialize;
+use sqlx::{Sqlite, Transaction};
+
+pub(crate) async fn hook_current_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    actor: &Mailbox,
+    launch: Option<&str>,
+    session: &str,
+) -> Result<bool> {
+    let Some(launch) = launch else {
+        return Ok(true);
+    };
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM runtime_readiness WHERE recipient=? AND binding_version=? AND launch=? AND client_session=?)")
+        .bind(actor.id).bind(actor.binding_version).bind(launch).bind(session).fetch_one(&mut **tx).await?)
+}
+
+pub(crate) async fn observe_hook_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    actor: &Mailbox,
+    launch: &str,
+    session: &str,
+    event: HookEvent,
+    now: i64,
+) -> Result<bool> {
+    crate::bounded(session, 160, "client session")?;
+    let event = event.as_str();
+    Ok(sqlx::query!("UPDATE runtime_readiness SET client_session=?,last_hook=?,observed_at=? WHERE recipient=? AND binding_version=? AND launch=? AND (client_session IS NULL OR client_session=?)",session,event,now,actor.id,actor.binding_version,launch,session).execute(&mut **tx).await?.rows_affected() == 1)
+}
 
 /// Hook evidence for the current binding and launch.
 #[derive(Debug, Serialize)]
@@ -33,6 +60,7 @@ impl Store {
         let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
         sqlx::query!("INSERT INTO runtime_readiness(recipient,binding_version,launch,runtime) VALUES(?,?,?,?) ON CONFLICT(recipient) DO UPDATE SET binding_version=excluded.binding_version,launch=excluded.launch,runtime=excluded.runtime,client_session=NULL,last_hook=NULL,observed_at=NULL", actor.id,actor.binding_version,launch,runtime).execute(&mut *tx).await?;
+        crate::turns::abandon_hooks_tx(&mut tx, actor).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -60,11 +88,9 @@ impl Store {
         event: HookEvent,
         now: i64,
     ) -> Result<bool> {
-        let event = event.as_str();
-        crate::bounded(session, 160, "client session")?;
         let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
-        let updated = sqlx::query!("UPDATE runtime_readiness SET client_session=?,last_hook=?,observed_at=? WHERE recipient=? AND binding_version=? AND launch=? AND (client_session IS NULL OR client_session=?)",session,event,now,actor.id,actor.binding_version,launch,session).execute(&mut *tx).await?.rows_affected() == 1;
+        let updated = observe_hook_tx(&mut tx, actor, launch, session, event, now).await?;
         tx.commit().await?;
         Ok(updated)
     }

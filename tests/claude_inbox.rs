@@ -557,3 +557,215 @@ async fn delivery_probe_hook_is_receipt_not_agent_acknowledgment() -> Result<()>
     assert!(!store.delivery_status(&actor, now + 1).await?.ready);
     Ok(())
 }
+
+#[tokio::test]
+async fn queued_probe_cannot_complete_prior_hook_offer() -> Result<()> {
+    use agent_mail::{
+        followup::{Mode, Policy},
+        identity::Binding,
+        states::{HookEvent, NativeRuntime, TaskState},
+    };
+    use serde_json::json;
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    let temp = tempfile::Builder::new()
+        .prefix("am-probe-r3-")
+        .tempdir_in("/tmp")?;
+    let socket = temp.path().join("claude.sock");
+    let listener = UnixListener::bind(&socket)?;
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+    let (sent, mut frames) = tokio::sync::mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let mut lines = BufReader::new(stream).lines();
+            let Some(auth) = lines.next_line().await.unwrap() else {
+                continue;
+            };
+            assert_eq!(
+                serde_json::from_str::<Value>(&auth).unwrap()["token"],
+                "fixture-token"
+            );
+            sent.send(
+                serde_json::from_str::<Value>(&lines.next_line().await.unwrap().unwrap()).unwrap(),
+            )
+            .unwrap();
+        }
+    });
+    let store = Store::open(temp.path(), true).await?;
+    store.enroll("g", None).await?;
+    store.register("g", "writer", false).await?;
+    store.register("g", "worker", false).await?;
+    let actor = store.mailbox("g", "worker").await?;
+    let writer = store.mailbox("g", "writer").await?;
+    let now = agent_mail::now()?;
+    store
+        .configure_followups(
+            "g",
+            &Policy {
+                mode: Mode::Enabled,
+                interval_seconds: 60,
+                max_seconds: 240,
+                notifier: None,
+            },
+            now,
+        )
+        .await?;
+    let session = Uuid::new_v4();
+    store
+        .begin_launch(&actor, "A", NativeRuntime::Claude)
+        .await?;
+    assert!(
+        store
+            .bind_launch_session(&actor, "A", &session.to_string())
+            .await?
+    );
+    store
+        .claude_inbox_hook(
+            &actor,
+            &input(session, HookEvent::SessionStart, String::new()),
+            &socket,
+            "fixture-token",
+        )
+        .await?;
+    let worker = service::WorkerLock::acquire(temp.path())?;
+    agent_mail::verification::reconcile(&store, now).await?;
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), frames.recv())
+        .await?
+        .context("queued probe")?;
+    let prompt = frame["message"]["content"]
+        .as_str()
+        .context("probe prompt")?
+        .to_owned();
+    store
+        .work_create(
+            &writer,
+            WorkDraft {
+                id: "probe-work".into(),
+                scope: "Review".into(),
+                owner: "worker".into(),
+                state: TaskState::Active,
+                next_action: "Inspect evidence".into(),
+                deadline: None,
+                evidence: vec![],
+            },
+            now,
+        )
+        .await?;
+    drop(worker);
+    store.close().await;
+    let store = Store::open(temp.path(), false).await?;
+    let Binding::Standalone {
+        session: credential,
+    } = &actor.binding
+    else {
+        anyhow::bail!("fixture identity")
+    };
+    let hook = |event: &'static str, prompt: String| {
+        let root = temp.path().to_owned();
+        let socket = socket.clone();
+        let credential = credential.to_string();
+        async move {
+            let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_agent-mail"))
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("AGENT_MAIL_SESSION", credential)
+                .env("AGENT_MAIL_LAUNCH", "A")
+                .env("CLAUDE_CODE_MESSAGING_SOCKET", socket)
+                .env("CLAUDE_CODE_MESSAGING_TOKEN", "fixture-token")
+                .args([
+                    "--state-dir",
+                    root.to_str().unwrap(),
+                    "--group",
+                    "g",
+                    "adapter",
+                    "claude-hook",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()?;
+            let mut stdin = child.stdin.take().context("stdin")?;
+            stdin
+                .write_all(&serde_json::to_vec(
+                    &json!({"hook_event_name":event,"session_id":session,"prompt":prompt}),
+                )?)
+                .await?;
+            stdin.shutdown().await?;
+            drop(stdin);
+            let out =
+                tokio::time::timeout(std::time::Duration::from_secs(10), child.wait_with_output())
+                    .await??;
+            anyhow::ensure!(
+                out.status.success(),
+                "CLI hook: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            Ok::<Value, anyhow::Error>(serde_json::from_slice(&out.stdout)?)
+        }
+    };
+    let startup = hook("SessionStart", String::new()).await?;
+    assert!(startup.to_string().contains("probe-work"));
+    let pool = support::pool(&store).await?;
+    let old: String = sqlx::query_scalar("SELECT id FROM turn_offers WHERE state='offered'")
+        .fetch_one(&pool)
+        .await?;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM turn_offer_items WHERE offer=?")
+        .bind(&old)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(count, 1);
+    let response = hook("UserPromptSubmit", prompt).await?;
+    let text = response["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .context("probe response")?;
+    assert!(!text.contains("probe-work"));
+    let nonce: Uuid = text
+        .split("agent ack ")
+        .nth(1)
+        .context("nonce")?
+        .split('`')
+        .next()
+        .unwrap()
+        .parse()?;
+    let worker = service::WorkerLock::acquire(temp.path())?;
+    let received = store.delivery_status(&actor, now).await?;
+    assert!(received.runtime_received_at.is_some());
+    assert!(!received.ready);
+    store.acknowledge_delivery(&actor, nonce, now).await?;
+    assert!(store.delivery_status(&actor, now).await?.ready);
+    drop(worker);
+    hook("Stop", String::new()).await?;
+    let state: String = sqlx::query_scalar("SELECT state FROM turn_offers WHERE id=?")
+        .bind(&old)
+        .fetch_one(&pool)
+        .await?;
+    let stage: i64 = sqlx::query_scalar("SELECT stage FROM followups WHERE task='probe-work'")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        (state.as_str(), stage),
+        ("abandoned", 0),
+        "FND-6: probe Stop must not complete the prior offered work"
+    );
+    let new_items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM turn_offer_items WHERE offer<>?")
+        .bind(&old)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(new_items, 0);
+    agent_mail::followup::reconcile(&store, now + 61).await?;
+    let recovered: i64 = sqlx::query_scalar("SELECT stage FROM followups WHERE task='probe-work'")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        recovered, 1,
+        "timer independently recovers the outstanding work"
+    );
+    assert_eq!(
+        store.work_show(&actor, "probe-work").await?.state,
+        TaskState::Active
+    );
+    server.abort();
+    let _ = server.await;
+    Ok(())
+}

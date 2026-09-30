@@ -17,6 +17,17 @@ struct Fixture {
     time: i64,
 }
 impl Fixture {
+    async fn hook(&self, event: &str, time: i64) -> Result<Value> {
+        self.store
+            .hook(
+                &self.owner,
+                serde_json::from_value(json!({
+                    "hook_event_name":event,"session_id":"followup-test-session"
+                }))?,
+                time,
+            )
+            .await
+    }
     async fn new() -> Result<Self> {
         let temp = tempfile::Builder::new()
             .prefix("am-followup-")
@@ -106,6 +117,213 @@ impl Fixture {
             .map(|e| json!({"id":e.subject,"version":e.version}))
             .collect())
     }
+}
+#[tokio::test]
+async fn completed_turns_cover_only_offered_versions_and_escalate_once() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.task("offered").await?;
+    f.hook("SessionStart", f.time).await?;
+    f.task("later").await?;
+    f.hook("Stop", f.time + 1).await?;
+    let pool = support::pool(&f.store).await?;
+    let stages: Vec<(String, i64)> =
+        sqlx::query_as("SELECT task,stage FROM followups ORDER BY task")
+            .fetch_all(&pool)
+            .await?;
+    assert_eq!(stages, vec![("later".into(), 0), ("offered".into(), 1)]);
+    f.hook("Stop", f.time + 2).await?;
+    assert_eq!(
+        f.events(&f.owner).await?.len(),
+        1,
+        "duplicate Stop is idempotent"
+    );
+    // The corrective attention is actually supplied to a subsequent turn.
+    f.hook("UserPromptSubmit", f.time + 3).await?;
+    f.hook("Stop", f.time + 4).await?;
+    assert_eq!(f.events(&f.writer).await?.len(), 1);
+    let stage: i64 = sqlx::query_scalar("SELECT stage FROM followups WHERE task='offered'")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(stage, 3);
+    assert!(f.store.work_show(&f.owner, "offered").await?.state != TaskState::Done);
+    // History survives reopening; replaying Stop cannot create more attention.
+    pool.close().await;
+    f.store.close().await;
+    let store = Store::open(f.temp.path(), false).await?;
+    store
+        .hook(
+            &f.owner,
+            serde_json::from_value(
+                json!({"hook_event_name":"Stop","session_id":"followup-test-session"}),
+            )?,
+            f.time + 5,
+        )
+        .await?;
+    assert_eq!(
+        store.attention_list(&f.writer, 0).await?["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_turns_respect_checkpoints_holds_and_changed_versions() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.task("checkpoint").await?;
+    f.task("held").await?;
+    f.task("revised").await?;
+    f.hook("SessionStart", f.time).await?;
+    f.store
+        .checkpoint(
+            &f.owner,
+            Source::Task {
+                id: "checkpoint".into(),
+                version: 1,
+            },
+            "planned",
+            f.checkpoint(),
+            f.time + 1,
+        )
+        .await?;
+    for (id, state) in [("held", Some(TaskState::Blocked)), ("revised", None)] {
+        f.store
+            .update_work(
+                &f.writer,
+                id,
+                WorkUpdate {
+                    version: 1,
+                    reason: "Record current decision".into(),
+                    patch: WorkPatch {
+                        state,
+                        next_action: Some("Wait for the recorded decision".into()),
+                        ..Default::default()
+                    },
+                    resolve_message: None,
+                },
+                f.time + 1,
+            )
+            .await?;
+    }
+    f.hook("Stop", f.time + 2).await?;
+    assert!(f.events(&f.owner).await?.is_empty());
+    // Offering the current held task still does not authorize implementation.
+    f.hook("SessionStart", f.time + 3).await?;
+    f.hook("Stop", f.time + 4).await?;
+    let pool = support::pool(&f.store).await?;
+    let held: i64 = sqlx::query_scalar("SELECT stage FROM followups WHERE task='held'")
+        .fetch_one(&pool)
+        .await?;
+    let planned: i64 = sqlx::query_scalar("SELECT stage FROM followups WHERE task='checkpoint'")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!((held, planned), (0, 0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_turn_and_wrong_session_do_not_invent_completion() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.task("work").await?;
+    f.hook("SessionStart", f.time).await?;
+    f.store
+        .hook(
+            &f.owner,
+            serde_json::from_value(json!({"hook_event_name":"Stop","session_id":"other"}))?,
+            f.time + 1,
+        )
+        .await?;
+    assert!(f.events(&f.owner).await?.is_empty());
+    f.hook("StopFailure", f.time + 2).await?;
+    f.hook("Stop", f.time + 3).await?;
+    assert!(f.events(&f.owner).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_new_revision_offered_during_the_same_turn_is_not_hidden_by_the_old_one() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.task("review").await?;
+    f.hook("SessionStart", f.time).await?;
+    f.store
+        .update_work(
+            &f.writer,
+            "review",
+            WorkUpdate {
+                version: 1,
+                reason: "New review scope".into(),
+                patch: WorkPatch {
+                    next_action: Some("Check the new revision".into()),
+                    ..Default::default()
+                },
+                resolve_message: None,
+            },
+            f.time + 1,
+        )
+        .await?;
+    f.hook("PostToolUse", f.time + 2).await?;
+    f.hook("Stop", f.time + 3).await?;
+    let pool = support::pool(&f.store).await?;
+    let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM turn_offer_items")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(versions, 2);
+    assert_eq!(f.events(&f.owner).await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn policy_defaults_enabled_and_partial_changes_preserve_routes() -> Result<()> {
+    use agent_mail::followup::PolicyPatch;
+    let f = Fixture::new().await?;
+    f.store.enroll("new", None).await?;
+    assert_eq!(f.store.followup_policy("new").await?.mode, Mode::Enabled);
+    let route = vec!["/usr/bin/true".into(), "fleet".into()];
+    f.store
+        .patch_followups(
+            "new",
+            &PolicyPatch {
+                notifier: Some(Some(route.clone())),
+                ..Default::default()
+            },
+            f.time,
+        )
+        .await?;
+    f.store
+        .patch_followups(
+            "new",
+            &PolicyPatch {
+                mode: Some(Mode::Observe),
+                ..Default::default()
+            },
+            f.time + 1,
+        )
+        .await?;
+    f.store.enroll("new", None).await?;
+    let policy = f.store.followup_policy("new").await?;
+    assert_eq!(policy.mode, Mode::Observe);
+    assert_eq!(policy.notifier, Some(route));
+    assert!(
+        f.store
+            .patch_followups(
+                "new",
+                &PolicyPatch {
+                    interval_seconds: Some(1000),
+                    ..Default::default()
+                },
+                f.time + 2
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        f.store.followup_policy("new").await?.interval_seconds,
+        900,
+        "invalid update rolls back"
+    );
+    Ok(())
 }
 #[tokio::test]
 async fn retrieved_work_is_reminded_then_escalated_without_business_mutation() -> Result<()> {
@@ -367,6 +585,190 @@ async fn holds_escalate_for_review_without_prompting_worker_to_resume() -> Resul
     assert_eq!(f.store.work_show(&f.owner, "review").await?.version, 1);
     Ok(())
 }
+
+#[tokio::test]
+async fn expired_waits_route_to_authority_in_either_completion_order() -> Result<()> {
+    for wait_kind in ["external", "task", "mail"] {
+        for mail_source in [false, true] {
+            for completion_first in [true, false] {
+                let f = Fixture::new().await?;
+                let source = if mail_source {
+                    Source::Mail {
+                        id: f.mail("hold").await?,
+                    }
+                } else {
+                    f.task("hold").await?;
+                    Source::Task {
+                        id: "hold".into(),
+                        version: 1,
+                    }
+                };
+                let mut cp = f.checkpoint();
+                cp.waiting = Some(match wait_kind {
+                    "task" => {
+                        f.store
+                            .work_create(
+                                &f.writer,
+                                WorkDraft {
+                                    id: "dependency".into(),
+                                    scope: "Review dependency".into(),
+                                    owner: "writer".into(),
+                                    state: TaskState::Active,
+                                    next_action: "Review dependency".into(),
+                                    deadline: None,
+                                    evidence: vec![],
+                                },
+                                f.time,
+                            )
+                            .await?;
+                        WaitFor::Task {
+                            id: "dependency".into(),
+                            states: vec![TaskState::Accepted],
+                        }
+                    }
+                    "mail" => {
+                        let id = f
+                            .store
+                            .publish(
+                                &f.owner,
+                                Publish {
+                                    recipients: vec!["writer".into()],
+                                    key: "approval".into(),
+                                    summary: "Approval needed".into(),
+                                    body: String::new(),
+                                    due_after: None,
+                                    reply_to: None,
+                                    work_id: None,
+                                },
+                                f.time,
+                            )
+                            .await?;
+                        WaitFor::Mail { id }
+                    }
+                    _ => WaitFor::External {
+                        responsible: "operator".into(),
+                        reason: "Explicit approval still required".into(),
+                    },
+                });
+                f.store
+                    .checkpoint(&f.owner, source.clone(), "hold", cp, f.time)
+                    .await?;
+                let pool = support::pool(&f.store).await?;
+                let saved: (String, i64) = sqlx::query_as(
+                "SELECT checkpoint,escalate_at FROM followups WHERE recipient=? AND checkpoint IS NOT NULL",
+            ).bind(f.owner.id).fetch_one(&pool).await?;
+                f.hook("SessionStart", f.time + 1).await?;
+                if completion_first {
+                    f.hook("Stop", f.time + 91).await?;
+                } else {
+                    followup::reconcile(&f.store, f.time + 91).await?;
+                }
+                assert!(
+                    f.events(&f.owner).await?.is_empty(),
+                    "FND-1: expired unresolved wait must not prompt its worker; mail={mail_source}, completion_first={completion_first}"
+                );
+                assert_eq!(
+                    f.events(&f.writer).await?.len(),
+                    1,
+                    "FND-1: authority review must not wait for another interval"
+                );
+                if completion_first {
+                    followup::reconcile(&f.store, f.time + 91).await?;
+                } else {
+                    f.hook("Stop", f.time + 91).await?;
+                }
+                f.hook("Stop", f.time + 92).await?;
+                assert!(f.events(&f.owner).await?.is_empty());
+                assert_eq!(f.events(&f.writer).await?.len(), 1);
+                let after: (String, i64) = sqlx::query_as(
+                "SELECT checkpoint,escalate_at FROM followups WHERE recipient=? AND checkpoint IS NOT NULL",
+            ).bind(f.owner.id).fetch_one(&pool).await?;
+                assert_eq!(
+                    after, saved,
+                    "hold and hard boundary must survive escalation"
+                );
+                match source {
+                    Source::Mail { id } => assert_eq!(
+                        f.store.message(&f.owner, id).await?.state,
+                        agent_mail::states::MessageState::Pending,
+                    ),
+                    Source::Task { id, .. } => assert_eq!(
+                        f.store.work_show(&f.owner, &id).await?.state,
+                        TaskState::Active,
+                    ),
+                    Source::Attention { .. } => unreachable!(),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn suppressed_user_input_abandons_the_interrupted_turn() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.task("interrupted").await?;
+    assert_ne!(f.hook("SessionStart", f.time).await?, json!({}));
+    // No Stop arrives for the first turn. Unchanged events suppress context for
+    // the next prompt, but that prompt still starts a different runtime turn.
+    assert_eq!(f.hook("UserPromptSubmit", f.time + 1).await?, json!({}));
+    f.hook("Stop", f.time + 2).await?;
+    assert!(
+        f.events(&f.owner).await?.is_empty(),
+        "FND-2: a suppressed new input cannot complete the interrupted offer"
+    );
+    assert!(f.events(&f.writer).await?.is_empty());
+    let pool = support::pool(&f.store).await?;
+    let completed: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM turn_offers o JOIN turn_offer_items i ON i.offer=o.id WHERE o.state='completed'",
+    ).fetch_one(&pool).await?;
+    assert_eq!(completed, 0);
+    followup::reconcile(&f.store, f.time + 241).await?;
+    assert_eq!(
+        f.events(&f.writer).await?.len(),
+        1,
+        "missing completion must retain independent timer recovery"
+    );
+    assert_eq!(
+        f.store.work_show(&f.owner, "interrupted").await?.state,
+        TaskState::Active
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn same_turn_tool_emissions_accumulate_only_visible_records() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.task("startup").await?;
+    f.hook("SessionStart", f.time).await?;
+    f.task("tool-one").await?;
+    assert_ne!(f.hook("PostToolUse", f.time + 1).await?, json!({}));
+    f.task("tool-two").await?;
+    assert_ne!(f.hook("PostToolUse", f.time + 2).await?, json!({}));
+    f.task("unseen").await?;
+    f.hook("Stop", f.time + 3).await?;
+    let pool = support::pool(&f.store).await?;
+    let stages: Vec<(String, i64)> =
+        sqlx::query_as("SELECT task,stage FROM followups ORDER BY task")
+            .fetch_all(&pool)
+            .await?;
+    assert_eq!(
+        stages,
+        vec![
+            ("startup".into(), 1),
+            ("tool-one".into(), 1),
+            ("tool-two".into(), 1),
+            ("unseen".into(), 0),
+        ]
+    );
+    let completed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM turn_offers WHERE state='completed'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(completed, 1, "tool emissions belong to one runtime turn");
+    Ok(())
+}
+
 #[tokio::test]
 async fn restart_preserves_attempts_and_task_revisions_invalidate_old_plans() -> Result<()> {
     let f = Fixture::new().await?;
@@ -498,7 +900,14 @@ async fn observation_mode_and_pause_keep_due_work_visible_without_dispatch() -> 
     let f = Fixture::new().await?;
     f.mail("pending").await?;
     f.store
-        .configure_followups("g", &Policy::default(), f.time)
+        .configure_followups(
+            "g",
+            &Policy {
+                mode: Mode::Observe,
+                ..Policy::default()
+            },
+            f.time,
+        )
         .await?;
     followup::reconcile(&f.store, f.time + 10000).await?;
     assert!(f.events(&f.writer).await?.is_empty());
@@ -589,6 +998,126 @@ async fn late_dependency_wakes_owner_once_without_erasing_escalation() -> Result
         assert_eq!(status["totals"]["escalated"], 1);
         assert_eq!(status["items"][0]["escalate_at"], f.time + 240);
     }
+    Ok(())
+}
+
+// BEGIN FOUNDATION HEAD CONTROL
+#[tokio::test]
+async fn foundation_head_control_turn_recovery() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.task("work").await?;
+    for (event, offset) in [("SessionStart", 0), ("Stop", 1)] {
+        f.store
+            .hook(
+                &f.owner,
+                serde_json::from_value(json!({
+                    "hook_event_name":event,"session_id":"foundation-control"
+                }))?,
+                f.time + offset,
+            )
+            .await?;
+    }
+    let pool = support::pool(&f.store).await?;
+    let stage: i64 = sqlx::query_scalar("SELECT stage FROM followups WHERE task='work'")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        stage, 1,
+        "an unhandled offered turn needs corrective attention"
+    );
+    for (event, offset) in [("UserPromptSubmit", 2), ("Stop", 3), ("Stop", 4)] {
+        f.store
+            .hook(
+                &f.owner,
+                serde_json::from_value(json!({
+                    "hook_event_name":event,"session_id":"foundation-control"
+                }))?,
+                f.time + offset,
+            )
+            .await?;
+    }
+    let stage: i64 = sqlx::query_scalar("SELECT stage FROM followups WHERE task='work'")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(stage, 3);
+    assert_eq!(f.events(&f.writer).await?.len(), 1);
+    assert_eq!(
+        f.store.work_show(&f.owner, "work").await?.state,
+        TaskState::Active
+    );
+    Ok(())
+}
+// END FOUNDATION HEAD CONTROL
+
+#[tokio::test]
+async fn clearing_notifier_rearms_failed_alerts_without_resetting_business_budgets() -> Result<()> {
+    use agent_mail::followup::PolicyPatch;
+    let f = Fixture::new().await?;
+    f.store
+        .patch_followups(
+            "g",
+            &PolicyPatch {
+                notifier: Some(Some(vec!["/usr/bin/false".into()])),
+                ..Default::default()
+            },
+            f.time,
+        )
+        .await?;
+    f.mail("unhandled").await?;
+    followup::reconcile(&f.store, f.time + 241).await?;
+    for attempt in 0..3 {
+        followup::notify_operators(&f.store, f.time + 542 + attempt * 300).await?;
+    }
+    let before = f.store.followup_status(Some("g"), f.time + 2000).await?;
+    assert_eq!(before["operator_notifications"][0]["state"], "failed");
+    assert_eq!(before["operator_notifications"][0]["attempts"], 3);
+    let pool = support::pool(&f.store).await?;
+    sqlx::query("UPDATE mailboxes SET attempts=3,next_wake=12345 WHERE id=?")
+        .bind(f.owner.id)
+        .execute(&pool)
+        .await?;
+    let clear = PolicyPatch {
+        notifier: Some(None),
+        ..Default::default()
+    };
+    f.store.patch_followups("g", &clear, f.time + 2001).await?;
+    let repaired = f.store.followup_status(Some("g"), f.time + 2001).await?;
+    assert_eq!(repaired["operator_notifications"][0]["attempts"], 0);
+    assert_eq!(repaired["operator_notifications"][0]["state"], "pending");
+    // No Herdr route exists in this fixture: the fallback must be visible.
+    followup::notify_operators(&f.store, f.time + 2001).await?;
+    let fallback = f.store.followup_status(Some("g"), f.time + 2001).await?;
+    assert_eq!(
+        fallback["operator_notifications"][0]["state"],
+        "unconfigured"
+    );
+    assert_eq!(fallback["operator_notifications"][0]["attempts"], 1);
+    f.store.patch_followups("g", &clear, f.time + 2002).await?;
+    assert_eq!(
+        f.store.followup_status(Some("g"), f.time + 2002).await?["operator_notifications"],
+        fallback["operator_notifications"]
+    );
+    let mailbox = f.store.mailbox("g", "owner").await?;
+    assert_eq!((mailbox.attempts, mailbox.next_wake), (3, 12345));
+    assert_eq!(f.store.inbox(&f.owner, 0).await?.len(), 1);
+    f.store
+        .patch_followups(
+            "g",
+            &PolicyPatch {
+                notifier: Some(Some(vec!["/usr/bin/tee".into()])),
+                ..Default::default()
+            },
+            f.time + 2003,
+        )
+        .await?;
+    followup::notify_operators(&f.store, f.time + 2003).await?;
+    let accepted = f.store.followup_status(Some("g"), f.time + 2003).await?;
+    assert_eq!(accepted["operator_notifications"][0]["state"], "accepted");
+    f.store.patch_followups("g", &clear, f.time + 2004).await?;
+    assert_eq!(
+        f.store.followup_status(Some("g"), f.time + 2004).await?["operator_notifications"],
+        accepted["operator_notifications"]
+    );
     Ok(())
 }
 
@@ -905,5 +1434,35 @@ async fn cli_records_checkpoint_and_exposes_it_on_current_records() -> Result<()
         value["followup"]["checkpoint"]["next_step"],
         "Inspect the remaining evidence"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn successful_hook_receipts_only_its_bounded_visible_sources() -> Result<()> {
+    let f = Fixture::new().await?;
+    for i in 0..8 {
+        f.task(&format!("visible-{i}-{}", "x".repeat(35))).await?;
+        f.mail(&format!("visible-mail-{i}")).await?;
+    }
+    let output = f.hook("SessionStart", f.time).await?;
+    let text = output["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    let payload: Value = serde_json::from_str(text.lines().nth(1).unwrap())?;
+    let context = &payload["context"];
+    let tasks = context["work"].as_array().unwrap();
+    let mails = context["mail"].as_array().unwrap();
+    assert!(!tasks.is_empty() || !mails.is_empty());
+    assert!(tasks.len() + mails.len() < 16);
+    let status = f.store.followup_status(Some("g"), f.time).await?;
+    for row in status["items"].as_array().unwrap() {
+        let visible = tasks.iter().any(|t| t["id"] == row["task"])
+            || mails.iter().any(|m| m["id"] == row["message"]);
+        assert_eq!(
+            !row["retrieved_at"].is_null(),
+            visible,
+            "only source details actually returned acquire retrieval: {row}"
+        );
+    }
     Ok(())
 }

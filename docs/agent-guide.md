@@ -403,6 +403,11 @@ remain visible through task/mail details and `attention history --task ID` or
 The service owns follow-up schedules and escalation. Coordinators may end a turn
 while waiting after recording a valid next step. A background `watch` process alone
 does not process events or wake the model. Do not keep a polling loop or reset
-transport budgets to simulate progress. Groups begin in observation mode; operators
-enable dispatch with `attention configure`. Status identifies that mode and whether
-an independent operator notification route exists.
+transport budgets to simulate progress. New groups enable follow-through by default. Operators can opt out with
+`init GROUP --no-follow-through` or `attention configure --observe`; existing saved
+policies survive upgrades. Direct configuration flags preserve omitted settings.
+Where the runtime provides correlated completion receipts, ending a turn without
+an outcome or valid checkpoint triggers one corrective notification, then escalation
+if its next covered turn still ignores it. Later arrivals and explicit holds are
+not treated as neglected work. Timers recover missed events and overdue commitments.
+Status identifies the policy and whether an independent operator route exists.

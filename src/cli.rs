@@ -45,6 +45,12 @@ enum Action {
     Init {
         /// Explicit group name to initialize.
         name: String,
+        /// Explicitly enable follow-through for an existing group.
+        #[arg(long, conflicts_with = "no_follow_through")]
+        follow_through: bool,
+        /// Observe obligations without automatic follow-ups.
+        #[arg(long)]
+        no_follow_through: bool,
     },
     /// Recover my assigned tasks and pending requests in a bounded response.
     Context {
@@ -247,9 +253,66 @@ enum Attention {
     },
     /// Operator: configure observation/dispatch, intervals and optional notifier.
     Configure {
-        #[arg(long)]
-        file: PathBuf,
+        /// Import a complete policy. Cannot be mixed with individual settings.
+        #[arg(long, conflicts_with = "policy_changes")]
+        file: Option<PathBuf>,
+        #[command(flatten)]
+        changes: PolicyChanges,
     },
+}
+#[derive(Args, Default)]
+#[group(id = "policy_changes", multiple = true)]
+struct PolicyChanges {
+    /// Enable automatic follow-through.
+    #[arg(long, conflicts_with = "observe")]
+    enable: bool,
+    /// Keep diagnostics without dispatching follow-ups.
+    #[arg(long)]
+    observe: bool,
+    /// Recovery reminder interval, e.g. 15m. Turn events are checked immediately.
+    #[arg(long, value_parser = parse_duration)]
+    interval: Option<i64>,
+    /// Maximum unattended time, at least four intervals, e.g. 1h.
+    #[arg(long, value_parser = parse_duration)]
+    max: Option<i64>,
+    /// Absolute operator notification executable; receives JSON on stdin.
+    #[arg(long, conflicts_with = "clear_notifier")]
+    notifier: Option<PathBuf>,
+    /// Argument for the notifier, repeatable; no shell evaluation.
+    #[arg(long, requires = "notifier", allow_hyphen_values = true)]
+    notifier_arg: Vec<String>,
+    /// Remove the executable notifier; use the available Herdr route.
+    #[arg(long)]
+    clear_notifier: bool,
+}
+impl PolicyChanges {
+    fn patch(self) -> Result<agent_mail::followup::PolicyPatch> {
+        use agent_mail::followup::{Mode, PolicyPatch};
+        Ok(PolicyPatch {
+            mode: if self.enable {
+                Some(Mode::Enabled)
+            } else if self.observe {
+                Some(Mode::Observe)
+            } else {
+                None
+            },
+            interval_seconds: self.interval,
+            max_seconds: self.max,
+            notifier: if let Some(path) = self.notifier {
+                let mut args = vec![
+                    path.into_os_string()
+                        .into_string()
+                        .map_err(|_| anyhow::anyhow!("notifier path must be UTF-8"))?,
+                ];
+                args.extend(self.notifier_arg);
+                Some(Some(args))
+            } else if self.clear_notifier {
+                Some(None)
+            } else {
+                None
+            },
+        })
+    }
 }
 #[derive(Args, Default)]
 #[group(id = "changes", multiple = true)]
@@ -518,7 +581,7 @@ impl Cli {
             &[
                 ("Start", &["init", "run"]),
                 ("Coordinate", &["context", "task", "mail", "watch"]),
-                ("Manage", &["status", "agent"]),
+                ("Manage", &["status", "agent", "attention"]),
                 ("Integrations", &["runtime", "service"]),
             ],
         )
@@ -604,7 +667,11 @@ impl Cli {
         }
         let command = match command {
             Action::Run { .. } => unreachable!("handled before dispatch"),
-            Action::Init { name } => {
+            Action::Init {
+                name,
+                follow_through,
+                no_follow_through,
+            } => {
                 ensure!(
                     self.group.as_ref().is_none_or(|g| g == &name),
                     "init name conflicts with the selected group"
@@ -614,6 +681,13 @@ impl Cli {
                     socket: None,
                     standalone: true,
                     install_service: false,
+                    follow_through: if follow_through {
+                        Some(true)
+                    } else if no_follow_through {
+                        Some(false)
+                    } else {
+                        None
+                    },
                 }
             }
             Action::Context {
@@ -651,9 +725,15 @@ impl Cli {
                 Attention::History { task, mail } => {
                     Command::AttentionHistory { group, task, mail }
                 }
-                Attention::Configure { file } => Command::AttentionConfigure {
+                Attention::Configure { file, changes } => Command::AttentionConfigure {
                     group,
-                    policy: serde_json::from_str(&read_body(&file)?)?,
+                    patch: if let Some(file) = file {
+                        let policy: agent_mail::followup::Policy =
+                            serde_json::from_str(&read_body(&file)?)?;
+                        policy.into()
+                    } else {
+                        changes.patch()?
+                    },
                 },
             },
             Action::Agent(p) => match p {
@@ -849,6 +929,7 @@ impl Cli {
                     socket: Some(socket),
                     standalone: false,
                     install_service: false,
+                    follow_through: None,
                 },
                 Runtime::HerdrPolicy { policy } => Command::PromptMode {
                     group,

@@ -100,7 +100,7 @@ impl Mode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
-    /// Explicit activation; existing groups begin in observation mode.
+    /// Dispatch mode; new groups default to enabled, saved policies are preserved.
     pub mode: Mode,
     /// Interval between the two follow-up opportunities.
     pub interval_seconds: i64,
@@ -113,12 +113,45 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            mode: Mode::Observe,
+            mode: Mode::Enabled,
             interval_seconds: 900,
             max_seconds: 3600,
             notifier: None,
         }
     }
+}
+/// Partial operator update. Omitted fields retain their saved values.
+#[derive(Debug, Default)]
+pub struct PolicyPatch {
+    /// Dispatch mode.
+    pub mode: Option<Mode>,
+    /// Recovery reminder interval in seconds.
+    pub interval_seconds: Option<i64>,
+    /// Maximum unattended interval in seconds.
+    pub max_seconds: Option<i64>,
+    /// None preserves the route; Some(None) clears it.
+    pub notifier: Option<Option<Vec<String>>>,
+}
+impl From<Policy> for PolicyPatch {
+    fn from(policy: Policy) -> Self {
+        Self {
+            mode: Some(policy.mode),
+            interval_seconds: Some(policy.interval_seconds),
+            max_seconds: Some(policy.max_seconds),
+            notifier: Some(policy.notifier),
+        }
+    }
+}
+fn policy_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Policy> {
+    Ok(Policy {
+        mode: serde_json::from_value(json!(row.get::<String, _>("mode")))?,
+        interval_seconds: row.get("interval_seconds"),
+        max_seconds: row.get("max_seconds"),
+        notifier: row
+            .get::<Option<String>, _>("notifier")
+            .map(|v| serde_json::from_str(&v))
+            .transpose()?,
+    })
 }
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 struct Plan {
@@ -158,6 +191,55 @@ impl Plan {
 impl Store {
     /// Configure bounded follow-through. This is an operator action.
     pub async fn configure_followups(&self, group: &str, policy: &Policy, time: i64) -> Result<()> {
+        self.patch_followups(group, &policy.clone().into(), time)
+            .await?;
+        Ok(())
+    }
+    /// Read the effective group policy without changing it.
+    pub async fn followup_policy(&self, group: &str) -> Result<Policy> {
+        policy_from_row(
+            &sqlx::query("SELECT * FROM followup_policy WHERE group_name=?")
+                .bind(group)
+                .fetch_one(self.pool())
+                .await?,
+        )
+    }
+    /// Atomically merge and validate settings, preserving unspecified values.
+    pub async fn patch_followups(
+        &self,
+        group: &str,
+        patch: &PolicyPatch,
+        time: i64,
+    ) -> Result<Policy> {
+        if patch.mode.is_none()
+            && patch.interval_seconds.is_none()
+            && patch.max_seconds.is_none()
+            && patch.notifier.is_none()
+        {
+            return self.followup_policy(group).await;
+        }
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("UPDATE followup_policy SET updated=updated WHERE group_name=?")
+            .bind(group)
+            .execute(&mut *tx)
+            .await?;
+        let previous = sqlx::query("SELECT * FROM followup_policy WHERE group_name=?")
+            .bind(group)
+            .fetch_one(&mut *tx)
+            .await?;
+        let mut policy = policy_from_row(&previous)?;
+        if let Some(mode) = patch.mode {
+            policy.mode = mode;
+        }
+        if let Some(interval) = patch.interval_seconds {
+            policy.interval_seconds = interval;
+        }
+        if let Some(max) = patch.max_seconds {
+            policy.max_seconds = max;
+        }
+        if let Some(notifier) = &patch.notifier {
+            policy.notifier = notifier.clone();
+        }
         ensure!(
             (60..=86400).contains(&policy.interval_seconds),
             "interval_seconds must be 60..86400"
@@ -177,15 +259,6 @@ impl Store {
                 bounded(arg, 1024, "notifier argument")?;
             }
         }
-        let mut tx = self.pool().begin().await?;
-        sqlx::query("UPDATE followup_policy SET updated=updated WHERE group_name=?")
-            .bind(group)
-            .execute(&mut *tx)
-            .await?;
-        let previous = sqlx::query("SELECT mode,notifier FROM followup_policy WHERE group_name=?")
-            .bind(group)
-            .fetch_one(&mut *tx)
-            .await?;
         let notifier = policy
             .notifier
             .as_ref()
@@ -198,14 +271,14 @@ impl Store {
             sqlx::query("UPDATE followups SET next_check=MAX(next_check,?),escalate_at=MAX(escalate_at,?) WHERE group_name=? AND version=0 AND stage=0")
                 .bind(time.checked_add(policy.interval_seconds).context("clock overflow")?).bind(time.checked_add(policy.max_seconds).context("clock overflow")?).bind(group).execute(&mut *tx).await?;
         }
-        if notifier.is_some() && previous.get::<Option<String>, _>("notifier") != notifier {
+        if previous.get::<Option<String>, _>("notifier") != notifier {
             // Explicit route repair rearms only failed operator alerts, never business delivery.
             sqlx::query("UPDATE attention_occurrences SET operator_attempts=0,operator_next=?,operator_state='pending',operator_detail='Operator notifier configuration changed' WHERE operator_state IN ('failed','unconfigured','uncertain') AND id IN (SELECT o.id FROM active_attention o JOIN followups f ON f.id=o.followup WHERE f.group_name=? AND o.stage=3)")
                 .bind(time).bind(group).execute(&mut *tx).await?;
         }
         tx.commit().await?;
         crate::stream::hint(self.root()).await;
-        Ok(())
+        Ok(policy)
     }
     /// Record an authenticated progress report without changing business state.
     pub async fn checkpoint(
@@ -583,6 +656,84 @@ async fn publish_dependency_ready(
     Ok(())
 }
 
+/// A successful runtime turn ended with a specific offered plan still outstanding.
+/// Version/stage guards coalesce duplicate receipts and overlapping hook/queue offers.
+pub(crate) async fn turn_completed(
+    tx: &mut Transaction<'_, Sqlite>,
+    actor: &Mailbox,
+    id: i64,
+    version: i64,
+    offered_stage: i64,
+    time: i64,
+) -> Result<()> {
+    let Some(p) = sqlx::query_as::<_, Plan>("SELECT f.* FROM active_followups f JOIN followup_policy p ON p.group_name=f.group_name JOIN groups g ON g.name=f.group_name WHERE f.id=? AND f.version=? AND f.stage=? AND p.mode='enabled' AND g.paused=0")
+        .bind(id).bind(version).bind(offered_stage).fetch_optional(&mut **tx).await? else {return Ok(());};
+    let report = p.report()?;
+    let satisfied = waiting_satisfied(tx, &p).await?;
+    if time < p.escalate_at && report.as_ref().is_some_and(|r| r.next_check_at > time) && !satisfied
+    {
+        return Ok(());
+    }
+    // Approval and review holds do not authorize implementation or corrective wakes.
+    let held: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_items WHERE group_name=? AND id=? AND state IN ('blocked','review'))")
+        .bind(&p.group_name).bind(&p.task).fetch_one(&mut **tx).await?;
+    if p.stage == 3 {
+        if actor.id == p.authority {
+            sqlx::query("UPDATE attention_occurrences SET operator_after=MIN(operator_after,?) WHERE followup=? AND plan_version=? AND stage=3")
+                .bind(time).bind(p.id).bind(p.version).execute(&mut **tx).await?;
+        }
+        return Ok(());
+    }
+    if actor.id != p.recipient {
+        return Ok(());
+    }
+    if authority_review_due(&p, report.as_ref(), satisfied, held, time) {
+        return advance_attention(tx, &p, 3, time).await;
+    }
+    if held {
+        return Ok(());
+    }
+    let stage = if p.stage == 0 { 1 } else { 3 };
+    advance_attention(tx, &p, stage, time).await
+}
+
+fn authority_review_due(
+    p: &Plan,
+    report: Option<&Checkpoint>,
+    satisfied: bool,
+    held: bool,
+    time: i64,
+) -> bool {
+    time >= p.escalate_at
+        || (time >= p.next_check
+            && ((report.is_some_and(|r| r.waiting.is_some()) && !satisfied)
+                || (held && report.is_none())))
+}
+
+async fn advance_attention(
+    tx: &mut Transaction<'_, Sqlite>,
+    p: &Plan,
+    stage: i64,
+    time: i64,
+) -> Result<()> {
+    let recipient = if stage == 3 { p.authority } else { p.recipient };
+    let operator_after = (stage == 3).then_some(if recipient == p.recipient {
+        time
+    } else {
+        time.saturating_add(300)
+    });
+    let result = sqlx::query("INSERT OR IGNORE INTO attention_occurrences(followup,plan_version,stage,reason,recipient,created,operator_after) VALUES(?,?,?,?,?,?,?)")
+        .bind(p.id).bind(p.version).bind(stage).bind(if stage==3 {"escalation"} else {"reminder"}).bind(recipient).bind(time).bind(operator_after).execute(&mut **tx).await?;
+    if result.rows_affected() == 1 && (stage != 3 || recipient != p.recipient) {
+        sqlx::query("INSERT INTO coordination_events(recipient,kind,subject,version,created) VALUES(?,'attention_due',?,?,?)")
+            .bind(recipient).bind(result.last_insert_rowid().to_string()).bind(p.version).bind(time).execute(&mut **tx).await?;
+    }
+    // Preserve the hard boundary and the separate recovery interval.
+    sqlx::query("UPDATE followups SET stage=?,next_check=MIN(escalate_at,?+(SELECT interval_seconds FROM followup_policy WHERE group_name=?)) WHERE id=?")
+        .bind(stage).bind(time).bind(&p.group_name).bind(p.id).execute(&mut **tx).await?;
+    Ok(())
+}
+
 /// Reconcile a fair bounded page; the five-second service scan recovers missed hints.
 pub async fn reconcile(store: &Store, time: i64) -> Result<()> {
     let mut tx = store.pool().begin().await?;
@@ -610,7 +761,6 @@ pub async fn reconcile(store: &Store, time: i64) -> Result<()> {
         if policy.get::<String, _>("mode") != "enabled" || policy.get::<i64, _>("paused") != 0 {
             continue;
         }
-        let interval: i64 = policy.get("interval_seconds");
         let binding: i64 = sqlx::query_scalar("SELECT binding_version FROM mailboxes WHERE id=?")
             .bind(p.recipient)
             .fetch_one(&mut *tx)
@@ -647,43 +797,16 @@ pub async fn reconcile(store: &Store, time: i64) -> Result<()> {
             continue;
         }
         let held:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_items WHERE group_name=? AND id=? AND state IN ('blocked','review'))").bind(&p.group_name).bind(&p.task).fetch_one(&mut *tx).await?;
-        let stage = if hard_due
+        let stage = if authority_review_due(&p, report.as_ref(), satisfied, held, time)
             || (unread && exhausted)
-            || (waiting && !satisfied)
-            || (held && report.is_none())
             || p.stage >= 2
         {
             3
         } else {
             p.stage + 1
         };
-        let recipient = if stage == 3 { p.authority } else { p.recipient };
-        // Escalation is an attention event, never a new recursive mail obligation.
-        let operator_after = if stage == 3 {
-            Some(if recipient == p.recipient {
-                time
-            } else {
-                time.saturating_add(300)
-            })
-        } else {
-            None
-        };
-        let result=sqlx::query("INSERT OR IGNORE INTO attention_occurrences(followup,plan_version,stage,reason,recipient,created,operator_after) VALUES(?,?,?,?,?,?,?)")
-            .bind(p.id).bind(p.version).bind(stage).bind(if stage==3{"escalation"}else{"reminder"}).bind(recipient).bind(time).bind(operator_after).execute(&mut *tx).await?;
-        if result.rows_affected() == 1 {
-            let id = result.last_insert_rowid();
-            // Self-escalation goes straight to the independent operator surface.
-            if stage != 3 || recipient != p.recipient {
-                sqlx::query("INSERT INTO coordination_events(recipient,kind,subject,version,created) VALUES(?,'attention_due',?,?,?)")
-                    .bind(recipient).bind(id.to_string()).bind(p.version).bind(time).execute(&mut *tx).await?;
-            }
-        }
-        sqlx::query("UPDATE followups SET stage=?,next_check=? WHERE id=?")
-            .bind(stage)
-            .bind(time.saturating_add(interval).min(p.escalate_at))
-            .bind(p.id)
-            .execute(&mut *tx)
-            .await?;
+        // Escalation is attention metadata, never a recursive mail obligation.
+        advance_attention(&mut tx, &p, stage, time).await?;
         if stage == 3 && newly_satisfied {
             publish_dependency_ready(&mut tx, &p, time).await?;
         }
@@ -718,8 +841,11 @@ impl Store {
         }
         let notifications=sqlx::query("SELECT o.id,f.group_name,o.operator_state,o.operator_detail,o.operator_attempts,o.operator_next FROM active_attention o JOIN followups f ON f.id=o.followup WHERE o.stage=3 AND (? IS NULL OR f.group_name=?) AND (? IS NULL OR f.recipient=? OR f.authority=?) ORDER BY o.id DESC LIMIT 101").bind(group).bind(group).bind(actor).bind(actor).bind(actor).fetch_all(self.pool()).await?;
         let alerts:Vec<Value>=notifications.iter().take(100).map(|r|json!({"id":r.get::<i64,_>("id"),"group":r.get::<String,_>("group_name"),"state":r.get::<String,_>("operator_state"),"detail":r.get::<Option<String>,_>("operator_detail"),"attempts":r.get::<i64,_>("operator_attempts"),"next_attempt":r.get::<i64,_>("operator_next")})).collect();
+        let turns = sqlx::query("SELECT o.id,b.name,o.runtime,o.session,o.turn,o.state,o.created,o.completed_at,(SELECT COUNT(*) FROM turn_offer_items i WHERE i.offer=o.id) AS records FROM turn_offers o JOIN mailboxes b ON b.id=o.recipient WHERE (? IS NULL OR b.group_name=?) AND (? IS NULL OR o.recipient=?) AND o.binding_version=b.binding_version ORDER BY o.created DESC,o.id LIMIT 51")
+            .bind(group).bind(group).bind(actor).bind(actor).fetch_all(self.pool()).await?;
+        let turn_receipts: Vec<Value> = turns.iter().take(50).map(|r| json!({"offer":r.get::<String,_>("id"),"agent":r.get::<String,_>("name"),"runtime":r.get::<String,_>("runtime"),"session":r.get::<String,_>("session"),"turn":r.get::<Option<String>,_>("turn"),"state":r.get::<String,_>("state"),"records":r.get::<i64,_>("records"),"created":r.get::<i64,_>("created"),"completed_at":r.get::<Option<i64>,_>("completed_at")})).collect();
         Ok(
-            json!({"totals":{"pending":totals.get::<i64,_>("pending"),"due":totals.get::<i64,_>("due"),"escalated":totals.get::<i64,_>("escalated")},"items":items,"more":more || notifications.len()>100,"operator_notifications":alerts,"remote_followup":"unsupported"}),
+            json!({"totals":{"pending":totals.get::<i64,_>("pending"),"due":totals.get::<i64,_>("due"),"escalated":totals.get::<i64,_>("escalated")},"items":items,"more":more || notifications.len()>100,"operator_notifications":alerts,"turn_receipts":turn_receipts,"turn_receipts_more":turns.len()>50,"remote_followup":"unsupported"}),
         )
     }
 }

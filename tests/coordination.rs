@@ -211,6 +211,8 @@ fn decisions_resolve_and_publish_once_or_roll_back_everything() -> Result<()> {
 #[test]
 fn hooks_restore_after_reset_suppress_repeats_and_bound_stop_continuations() -> Result<()> {
     let d = Demo::new()?;
+    // Retain coverage for the legacy recovery contract when automatic follow-through is off.
+    d.call(None, &["attention", "configure", "--observe"], None, false)?;
     d.create()?;
     let start = d.hook("SessionStart", false)?;
     assert!(

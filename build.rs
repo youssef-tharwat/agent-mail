@@ -20,6 +20,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=migrations/0016_delivery_probes.sql");
     println!("cargo:rerun-if-changed=migrations/0017_herdr_wakes.sql");
     println!("cargo:rerun-if-changed=migrations/0018_followups.sql");
+    println!("cargo:rerun-if-changed=migrations/0019_turn_followthrough.sql");
+    println!("cargo:rerun-if-changed=migrations/0020_native_offer_snapshots.sql");
     let path = PathBuf::from(env::var("OUT_DIR")?).join("compile-schema.db");
     if path.exists() {
         std::fs::remove_file(&path)?;
@@ -85,6 +87,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .execute(&mut connection)
                 .await?;
             sqlx::raw_sql(include_str!("migrations/0018_followups.sql"))
+                .execute(&mut connection)
+                .await?;
+            sqlx::raw_sql(include_str!("migrations/0019_turn_followthrough.sql"))
+                .execute(&mut connection)
+                .await?;
+            sqlx::raw_sql(include_str!("migrations/0020_native_offer_snapshots.sql"))
                 .execute(&mut connection)
                 .await?;
             connection.close().await

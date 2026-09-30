@@ -123,6 +123,18 @@ impl Fixture {
         let root = temp.path().join("state");
         let initial = Store::open(&root, true).await?;
         initial.enroll("g", Some(&socket)).await?;
+        // These tests measure transport retry budgets in isolation. Follow-through
+        // now defaults on and has its own completion/escalation coverage.
+        initial
+            .patch_followups(
+                "g",
+                &agent_mail::followup::PolicyPatch {
+                    mode: Some(agent_mail::followup::Mode::Observe),
+                    ..Default::default()
+                },
+                1000,
+            )
+            .await?;
         initial.set_auto_prompt("g", true).await?;
         initial.bind("g", "a", &agents[0], false).await?;
         initial.bind("g", "b", &agents[1], false).await?;
@@ -162,7 +174,7 @@ impl Fixture {
             .env("HERDR_ENV", "1")
             .env("HERDR_PANE_ID", pane)
             .env("HERDR_SOCKET_PATH", &self.socket)
-            .env_remove("CODEX_SESSION_ID")
+            .env("CODEX_SESSION_ID", format!("session-{pane}"))
             .env_remove("HERDR_PLUGIN_ID")
             .env_remove("AGENT_MAIL_GROUP")
             .env_remove("AGENT_MAIL_GROUP")

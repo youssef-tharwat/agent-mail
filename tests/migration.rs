@@ -45,7 +45,7 @@ async fn existing_version_four_state_upgrades_to_opt_in_sync() -> Result<()> {
     let version = sqlx::query!("PRAGMA user_version")
         .fetch_one(&support::pool(&store).await?)
         .await?;
-    assert_eq!(version.user_version, Some(18));
+    assert_eq!(version.user_version, Some(20));
     let peer = uuid::Uuid::new_v4();
     store.add_peer(peer, "test-host").await?;
     assert!(!store.peers_status().await?[0].auto_sync);
@@ -384,7 +384,7 @@ async fn version_sixteen_upgrades_without_changing_business_or_legacy_budgets() 
             .fetch_one(&pool)
             .await?
             .user_version,
-        Some(18)
+        Some(20)
     );
     Ok(())
 }
@@ -432,6 +432,119 @@ async fn concurrent_first_use_migrates_once_and_keeps_a_verified_backup() -> Res
 }
 
 #[tokio::test]
+async fn version_eighteen_preserves_saved_policies_and_all_existing_records() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("state");
+    let migrations = temp.path().join("migrations");
+    fs::create_dir_all(&root)?;
+    fs::create_dir_all(&migrations)?;
+    for entry in fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy()[..4].parse::<u32>()? <= 18 {
+            fs::copy(entry.path(), migrations.join(entry.file_name()))?;
+        }
+    }
+    let options = SqliteConnectOptions::new().filename(root.join("mail.db"));
+    let pool = SqlitePoolOptions::new()
+        .connect_with(options.clone().create_if_missing(true))
+        .await?;
+    sqlx::migrate::Migrator::new(migrations.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+    sqlx::raw_sql(r#"
+        INSERT INTO node VALUES ('00000000-0000-4000-8000-000000000001');
+        INSERT INTO groups(name,socket,home_machine) VALUES
+          ('observe','','00000000-0000-4000-8000-000000000001'),
+          ('enabled','','00000000-0000-4000-8000-000000000001');
+        UPDATE followup_policy SET interval_seconds=120,max_seconds=600,notifier='["/usr/bin/true","saved"]',updated=123;
+        UPDATE followup_policy SET mode='enabled' WHERE group_name='enabled';
+        INSERT INTO mailboxes(id,group_name,name,binding,attempts,next_wake,alerted) VALUES
+          (1,'enabled','writer','{"runtime":"standalone","session":"00000000-0000-4000-8000-000000000002"}',2,400,1),
+          (2,'enabled','owner','{"runtime":"standalone","session":"00000000-0000-4000-8000-000000000003"}',3,500,1);
+        INSERT INTO work_items(group_name,id,scope,owner,writer,state,next_action,updated) VALUES
+          ('enabled','task','Review','owner','writer','review','Await approval',100);
+        INSERT INTO messages(id,sender,dedup_key,canonical,summary,body,created,due,work_id) VALUES
+          (71,1,'migration','{}','Review','Evidence',100,2000,'task');
+        INSERT INTO deliveries(message,recipient) VALUES (71,2);
+        INSERT INTO event_receipts(recipient,binding_version,event) SELECT recipient,1,id FROM coordination_events;
+        UPDATE followups SET version=1,checkpoint='{"version":0,"next_step":"Await approval","next_check_at":500,"waiting":{"kind":"external","responsible":"writer","reason":"Approval required"},"evidence":[]}',next_check=500,retrieved_at=150,retrieved_binding=1;
+        INSERT INTO followup_history(followup,version,actor,key,canonical,snapshot,created)
+          SELECT id,1,2,'checkpoint-'||id,'{}','{}',150 FROM followups;
+    "#).execute(&pool).await?;
+    let tables: Vec<String> = sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name<>'_sqlx_migrations' ORDER BY name")
+        .fetch_all(&pool).await?;
+    let before = snapshot(&pool, &tables).await?;
+    pool.close().await;
+
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_agent-mail"))
+        .arg("--state-dir")
+        .arg(&root)
+        .args(["--group", "enabled", "status", "--check", "owner"])
+        .output()
+        .await?;
+    assert!(!output.status.success());
+    assert!(!root.join("backups").exists());
+    let unchanged = SqlitePoolOptions::new()
+        .connect_with(options.read_only(true))
+        .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+            .fetch_one(&unchanged)
+            .await?,
+        18
+    );
+    assert_eq!(snapshot(&unchanged, &tables).await?, before);
+    unchanged.close().await;
+    let store = upgrade::open(&root, OpenMode::Existing).await?;
+    let pool = support::pool(&store).await?;
+    assert_eq!(snapshot(&pool, &tables).await?, before);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await?,
+        20
+    );
+    assert!(
+        sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await?
+            .is_empty()
+    );
+    store.enroll("new", None).await?;
+    assert_eq!(
+        store.followup_policy("new").await?.mode,
+        agent_mail::followup::Mode::Enabled
+    );
+    assert_eq!(
+        store.followup_policy("observe").await?.mode,
+        agent_mail::followup::Mode::Observe
+    );
+    assert_eq!(
+        store.followup_policy("enabled").await?.notifier,
+        Some(vec!["/usr/bin/true".into(), "saved".into()])
+    );
+
+    let backups = fs::read_dir(root.join("backups"))?.collect::<std::io::Result<Vec<_>>>()?;
+    assert_eq!(backups.len(), 1);
+    let backup = SqlitePoolOptions::new()
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(backups[0].path())
+                .read_only(true),
+        )
+        .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+            .fetch_one(&backup)
+            .await?,
+        18
+    );
+    assert_eq!(snapshot(&backup, &tables).await?, before);
+    Ok(())
+}
+
+#[tokio::test]
 async fn automatic_open_never_initializes_missing_state_or_downgrades() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path().join("missing");
@@ -443,7 +556,7 @@ async fn automatic_open_never_initializes_missing_state_or_downgrades() -> Resul
     let pool = SqlitePoolOptions::new()
         .connect_with(SqliteConnectOptions::new().filename(root.join("mail.db")))
         .await?;
-    sqlx::query!("PRAGMA user_version=19")
+    sqlx::query!("PRAGMA user_version=21")
         .execute(&pool)
         .await?;
     pool.close().await;
@@ -539,5 +652,133 @@ async fn scoped_cli_commands_upgrade_but_diagnostics_remain_read_only() -> Resul
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(root.join("backups").is_dir());
+    Ok(())
+}
+
+async fn snapshot(
+    pool: &sqlx::SqlitePool,
+    tables: &[String],
+) -> Result<Vec<(String, Vec<String>)>> {
+    let mut result = Vec::new();
+    for table in tables {
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
+                .bind(table)
+                .fetch_all(pool)
+                .await?;
+        let columns = columns
+            .iter()
+            .map(|name| format!("\"{}\"", name.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let query = format!(
+            "SELECT json_array({columns}) FROM \"{}\"",
+            table.replace('"', "\"\"")
+        );
+        let mut rows: Vec<String> = sqlx::query_scalar(&query).fetch_all(pool).await?;
+        rows.sort();
+        result.push((table.clone(), rows));
+    }
+    Ok(result)
+}
+
+#[tokio::test]
+async fn version_nineteen_abandons_only_unreconstructible_native_offers() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("state");
+    let migrations = temp.path().join("migrations");
+    fs::create_dir_all(&root)?;
+    fs::create_dir_all(&migrations)?;
+    for entry in fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy()[..4].parse::<u32>()? <= 19 {
+            fs::copy(entry.path(), migrations.join(entry.file_name()))?;
+        }
+    }
+    let pool = SqlitePoolOptions::new()
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(root.join("mail.db"))
+                .create_if_missing(true),
+        )
+        .await?;
+    sqlx::migrate::Migrator::new(migrations.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+    sqlx::raw_sql(r#"
+        INSERT INTO node VALUES ('00000000-0000-4000-8000-000000000001');
+        INSERT INTO groups(name,socket,home_machine) VALUES ('g','','00000000-0000-4000-8000-000000000001');
+        INSERT INTO mailboxes(id,group_name,name,binding,attempts,next_wake) VALUES
+          (1,'g','writer','{"runtime":"standalone","session":"00000000-0000-4000-8000-000000000002"}',2,400),
+          (2,'g','owner','{"runtime":"standalone","session":"00000000-0000-4000-8000-000000000003"}',3,500);
+        INSERT INTO work_items(group_name,id,scope,owner,writer,state,next_action,updated) VALUES
+          ('g','task','Review','owner','writer','active','Inspect evidence',100);
+        INSERT INTO runtime_wakes(recipient,binding_version,socket,thread,runtime,attempts,attempted,next_attempt)
+          VALUES(2,1,'/tmp/fixture-codex.sock','00000000-0000-4000-8000-000000000004','codex',3,5,900);
+        INSERT INTO turn_offers(id,recipient,binding_version,runtime,session,state,turn,created,completed_at) VALUES
+          ('native-open',2,1,'codex','old-session','offered','old-turn',100,NULL),
+          ('native-completed',2,1,'codex','old-session','completed','done-turn',100,102),
+          ('hook-open',2,1,'hook','hook-session','offered',NULL,100,NULL);
+        INSERT INTO turn_offer_items(offer,followup,plan_version,stage)
+          SELECT o.id,f.id,0,0 FROM turn_offers o CROSS JOIN followups f;
+    "#).execute(&pool).await?;
+    let tables: Vec<String> = sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('_sqlx_migrations','turn_offers') ORDER BY name")
+        .fetch_all(&pool).await?;
+    let before = snapshot(&pool, &tables).await?;
+    type Receipt = (String, String, Option<String>, i64, Option<i64>);
+    let receipts: Vec<Receipt> =
+        sqlx::query_as("SELECT id,session,turn,created,completed_at FROM turn_offers ORDER BY id")
+            .fetch_all(&pool)
+            .await?;
+    pool.close().await;
+    let store = upgrade::open(&root, OpenMode::Existing).await?;
+    let pool = support::pool(&store).await?;
+    assert_eq!(
+        snapshot(&pool, &tables).await?,
+        before,
+        "business records, history and budgets must survive correction"
+    );
+    assert_eq!(
+        sqlx::query_as::<_, Receipt>(
+            "SELECT id,session,turn,created,completed_at FROM turn_offers ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await?,
+        receipts
+    );
+    assert_eq!(
+        sqlx::query_as::<_, (String, String)>("SELECT id,state FROM turn_offers ORDER BY id")
+            .fetch_all(&pool)
+            .await?,
+        vec![
+            ("hook-open".into(), "offered".into()),
+            ("native-completed".into(), "completed".into()),
+            ("native-open".into(), "abandoned".into()),
+        ]
+    );
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM turn_offers WHERE native_payload IS NOT NULL OR native_nonce IS NOT NULL").fetch_one(&pool).await?, 0);
+    assert!(
+        sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await?
+            .is_empty()
+    );
+    let backups = fs::read_dir(root.join("backups"))?.collect::<std::io::Result<Vec<_>>>()?;
+    assert_eq!(backups.len(), 1);
+    let backup = SqlitePoolOptions::new()
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(backups[0].path())
+                .read_only(true),
+        )
+        .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+            .fetch_one(&backup)
+            .await?,
+        19
+    );
+    assert_eq!(snapshot(&backup, &tables).await?, before);
     Ok(())
 }

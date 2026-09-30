@@ -44,7 +44,7 @@ enum Command {
     },
     AttentionConfigure {
         group: String,
-        policy: agent_mail::followup::Policy,
+        patch: agent_mail::followup::PolicyPatch,
     },
     WatchChanges {
         group: String,
@@ -91,6 +91,7 @@ enum Command {
         /// Create a group without Herdr, ignoring an inherited socket environment.
         standalone: bool,
         install_service: bool,
+        follow_through: Option<bool>,
     },
     /// Operator: associate an inbox with a verified native agent session.
     Bind {
@@ -409,6 +410,7 @@ async fn run(cli: RunArgs) -> Result<()> {
             socket,
             standalone,
             install_service,
+            follow_through,
         } => {
             let socket = if standalone {
                 store
@@ -421,6 +423,23 @@ async fn run(cli: RunArgs) -> Result<()> {
                 socket
             };
             store.enroll(&group, socket.as_deref()).await?;
+            if let Some(enabled) = follow_through {
+                store
+                    .patch_followups(
+                        &group,
+                        &agent_mail::followup::PolicyPatch {
+                            mode: Some(if enabled {
+                                agent_mail::followup::Mode::Enabled
+                            } else {
+                                agent_mail::followup::Mode::Observe
+                            }),
+                            ..Default::default()
+                        },
+                        now()?,
+                    )
+                    .await?;
+            }
+            let policy = store.followup_policy(&group).await?;
             if !explicit_state {
                 supervision::save_locator(&root)?;
             }
@@ -430,7 +449,7 @@ async fn run(cli: RunArgs) -> Result<()> {
             }
             println!(
                 "{}",
-                json!({"group":group,"state_dir":root.canonicalize()?,"service_installed":install_service})
+                json!({"group":group,"state_dir":root.canonicalize()?,"service_installed":install_service,"follow_through":policy})
             );
             return Ok(());
         }
@@ -644,8 +663,8 @@ async fn run(cli: RunArgs) -> Result<()> {
                 .checkpoint(&actor, source, &key, report, now()?)
                 .await?
         }
-        Command::AttentionConfigure { group, policy } => {
-            store.configure_followups(&group, &policy, now()?).await?;
+        Command::AttentionConfigure { group, patch } => {
+            let policy = store.patch_followups(&group, &patch, now()?).await?;
             json!({"group":group,"policy":policy})
         }
         Command::AttentionList { group, after } => {
@@ -727,7 +746,12 @@ async fn run(cli: RunArgs) -> Result<()> {
             let mut bytes = Vec::new();
             std::io::stdin().take(65537).read_to_end(&mut bytes)?;
             ensure!(bytes.len() <= 65536, "hook input exceeds 64 KiB");
-            observe_hook(&store, &actor, &bytes).await?;
+            let current_launch = observe_hook(&store, &actor, &bytes).await?;
+            let launch = std::env::var("AGENT_MAIL_LAUNCH").ok();
+            if launch.is_some() && !current_launch {
+                println!("{{}}");
+                return Ok(());
+            }
             let input: agent_mail::claude_inbox::Input = serde_json::from_slice(&bytes)?;
             let receipt = match (
                 std::env::var("CLAUDE_CODE_MESSAGING_SOCKET").ok(),
@@ -735,11 +759,12 @@ async fn run(cli: RunArgs) -> Result<()> {
             ) {
                 (Some(socket), Some(token)) => {
                     store
-                        .claude_inbox_hook(
+                        .claude_inbox_hook_scoped(
                             &actor,
                             &input,
                             std::path::Path::new(socket.strip_prefix("uds:").unwrap_or(&socket)),
                             &token,
+                            launch.as_deref(),
                         )
                         .await?
                 }
@@ -747,23 +772,15 @@ async fn run(cli: RunArgs) -> Result<()> {
                 _ => anyhow::bail!("incomplete Claude messaging environment"),
             };
             match receipt {
-                Some(receipt_context) => {
-                    store
-                        .reserve_hook(&actor, &input.session_id.to_string(), false, false, now()?)
-                        .await?;
-                    receipt_context
-                }
-                None if matches!(
-                    input.hook_event_name,
-                    agent_mail::claude_inbox::Event::SessionEnd
-                        | agent_mail::claude_inbox::Event::StopFailure
-                ) =>
-                {
-                    json!({})
-                }
+                Some(receipt_context) => receipt_context,
                 None => {
                     store
-                        .hook(&actor, serde_json::from_slice(&bytes)?, now()?)
+                        .hook_scoped(
+                            &actor,
+                            serde_json::from_slice(&bytes)?,
+                            launch.as_deref(),
+                            now()?,
+                        )
                         .await?
                 }
             }
@@ -774,6 +791,11 @@ async fn run(cli: RunArgs) -> Result<()> {
             std::io::stdin().take(65537).read_to_end(&mut bytes)?;
             ensure!(bytes.len() <= 65536, "hook input exceeds 64 KiB");
             let current_launch = observe_hook(&store, &actor, &bytes).await?;
+            let launch = std::env::var("AGENT_MAIL_LAUNCH").ok();
+            if launch.is_some() && !current_launch {
+                println!("{{}}");
+                return Ok(());
+            }
             let input: agent_mail::hooks::HookInput = serde_json::from_slice(&bytes)?;
             if let Some(socket) = std::env::var_os("AGENT_MAIL_CODEX_SOCKET") {
                 if current_launch && store.runtime_enabled(&actor).await? {
@@ -792,7 +814,9 @@ async fn run(cli: RunArgs) -> Result<()> {
                     }
                 }
             }
-            store.hook(&actor, input, now()?).await?
+            store
+                .hook_scoped(&actor, input, launch.as_deref(), now()?)
+                .await?
         }
         Command::Events { group, after } => {
             let actor = store.authenticate(&group, cli.session.as_ref()).await?;

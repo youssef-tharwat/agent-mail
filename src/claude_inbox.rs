@@ -70,6 +70,21 @@ impl Store {
         socket: &Path,
         token: &str,
     ) -> Result<Option<Value>> {
+        self.claude_inbox_hook_scoped(actor, input, socket, token, None)
+            .await
+    }
+
+    /// Observe a Claude inbox hook under an optional managed launch fence.
+    /// # Errors
+    /// Identity, socket, lifecycle or persistence errors are returned.
+    pub async fn claude_inbox_hook_scoped(
+        &self,
+        actor: &Mailbox,
+        input: &Input,
+        socket: &Path,
+        token: &str,
+        launch: Option<&str>,
+    ) -> Result<Option<Value>> {
         ensure!(
             matches!(actor.binding, Binding::Standalone { .. }),
             "Claude inbox requires a standalone Mail identity"
@@ -88,6 +103,9 @@ impl Store {
             let session = input.session_id.to_string();
             let mut tx = self.pool().begin().await?;
             Self::lock_actor(&mut tx, actor).await?;
+            if !crate::readiness::hook_current_tx(&mut tx, actor, launch, &session).await? {
+                return Ok(Some(json!({})));
+            }
             let updated = sqlx::query!("UPDATE claude_inboxes SET activity='ended' WHERE recipient=? AND token=? AND EXISTS(SELECT 1 FROM runtime_wakes w WHERE w.recipient=claude_inboxes.recipient AND w.binding_version=? AND w.socket=? AND w.thread=? AND w.runtime='claude')", actor.id,token,actor.binding_version,socket,session).execute(&mut *tx).await?;
             ensure!(
                 updated.rows_affected() == 1,
@@ -101,6 +119,9 @@ impl Store {
         let session = input.session_id.to_string();
         let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
+        if !crate::readiness::hook_current_tx(&mut tx, actor, launch, &session).await? {
+            return Ok(Some(json!({})));
+        }
         if sqlx::query!(
             "SELECT enabled FROM runtime_policy WHERE recipient=? AND binding_version=?",
             actor.id,
@@ -167,6 +188,18 @@ impl Store {
                 .as_deref()
                 .is_some_and(|id| input.prompt == notification(id));
         let observed_at = crate::now()?;
+        let probe = if input.hook_event_name == Event::UserPromptSubmit && !receipt {
+            Self::probe_hook_tx(&mut tx, actor, &input.prompt, observed_at).await?
+        } else {
+            None
+        };
+        // Every handled input starts one turn, including a probe-only response.
+        // Unmatched prompts take the generic hook boundary after returning None.
+        let offer = if receipt || probe.is_some() {
+            Some(crate::turns::begin_hook_tx(&mut tx, actor, &session, true, observed_at).await?)
+        } else {
+            None
+        };
         let challenge = if receipt {
             self.unobserved_challenge(&mut tx, actor, observed_at)
                 .await?
@@ -174,9 +207,15 @@ impl Store {
             None
         };
         let context = if receipt {
-            Some(self.delivery_text(actor, challenge.as_deref(), 0).await?)
+            let delivery = Self::delivery_tx(&mut tx, actor, challenge.as_deref(), 0).await?;
+            if let Some(id) = offer {
+                crate::turns::append_hook_tx(&mut tx, actor, &id, &session, &delivery.items)
+                    .await?;
+            }
+            Self::reserve_hook_tx(&mut tx, actor, &session, false, false, observed_at).await?;
+            Some(delivery.text)
         } else {
-            None
+            probe
         };
         if receipt {
             let event = endpoint.pending_event;
@@ -201,15 +240,7 @@ impl Store {
             }
         }
         tx.commit().await?;
-        if receipt {
-            Ok(Some(
-                json!({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":context.context("missing receipt context")?}}),
-            ))
-        } else if input.hook_event_name == Event::UserPromptSubmit {
-            Ok(self.probe_hook(actor, &input.prompt, crate::now()?).await?.map(|text| json!({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":text}})))
-        } else {
-            Ok(None)
-        }
+        Ok(context.map(|text| json!({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":text}})))
     }
 }
 

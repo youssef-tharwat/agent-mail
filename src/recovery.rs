@@ -7,6 +7,14 @@
 use crate::store::{Mailbox, Store};
 use anyhow::Result;
 use serde_json::{Value, json};
+
+/// A bounded view and the exact source records whose details it contains.
+pub(crate) struct RecoveryView {
+    pub value: Value,
+    pub mail: Vec<i64>,
+    pub work: Vec<(String, i64)>,
+}
+
 impl Store {
     /// Read bounded recovery state and continuation cursors for a participant.
     ///
@@ -18,6 +26,18 @@ impl Store {
         work_after: String,
         mail_after: i64,
     ) -> Result<Value> {
+        let view = self.recovery_view(actor, work_after, mail_after).await?;
+        self.retrieved(actor, &view.mail, &view.work).await?;
+        Ok(view.value)
+    }
+
+    /// Assemble context without claiming that its sources were returned.
+    pub(crate) async fn recovery_view(
+        &self,
+        actor: &Mailbox,
+        work_after: String,
+        mail_after: i64,
+    ) -> Result<RecoveryView> {
         let group = &actor.group_name;
         let work = self.work_list(actor, &work_after).await?;
         let mail = self.inbox(actor, mail_after).await?;
@@ -110,15 +130,84 @@ impl Store {
                     json!(works.last().map_or(work_after.as_str(), |w| w.id.as_str()));
             }
         }
-        self.retrieved(
-            actor,
-            &mails.iter().map(|m| m.id).collect::<Vec<_>>(),
-            &works
-                .iter()
-                .map(|w| (w.id.clone(), w.version))
-                .collect::<Vec<_>>(),
-        )
-        .await?;
-        Ok(value)
+        Ok(RecoveryView {
+            value,
+            mail: mails.iter().map(|m| m.id).collect(),
+            work: works.iter().map(|w| (w.id.clone(), w.version)).collect(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        states::TaskState,
+        work::{WorkDraft, WorkPatch, WorkUpdate},
+    };
+
+    #[tokio::test]
+    async fn deferred_context_receipts_preserve_newer_task_revisions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path(), true).await?;
+        store.enroll("g", None).await?;
+        store.register("g", "writer", false).await?;
+        store.register("g", "worker", false).await?;
+        let writer = store.mailbox("g", "writer").await?;
+        let actor = store.mailbox("g", "worker").await?;
+        let now = crate::now()?;
+        store
+            .work_create(
+                &writer,
+                WorkDraft {
+                    id: "revision".into(),
+                    scope: "Review".into(),
+                    owner: "worker".into(),
+                    state: TaskState::Active,
+                    next_action: "First action".into(),
+                    deadline: None,
+                    evidence: vec![],
+                },
+                now,
+            )
+            .await?;
+        let view = store.recovery_view(&actor, String::new(), 0).await?;
+        assert_eq!(view.value["work"][0]["version"], 1);
+        store
+            .update_work(
+                &writer,
+                "revision",
+                WorkUpdate {
+                    version: 1,
+                    patch: WorkPatch {
+                        next_action: Some("Second action".into()),
+                        ..Default::default()
+                    },
+                    reason: "New evidence".into(),
+                    resolve_message: None,
+                },
+                now + 1,
+            )
+            .await?;
+        let mut tx = store.pool().begin().await?;
+        Store::lock_actor(&mut tx, &actor).await?;
+        Store::retrieved_tx(&mut tx, &actor, &view.mail, &view.work).await?;
+        tx.commit().await?;
+        let current = store
+            .source_followup(&actor, Some("revision"), None)
+            .await?;
+        assert!(
+            current["retrieved_at"].is_null(),
+            "old rendered revision cannot receipt current work"
+        );
+        let current_view = store.context_value(&actor, String::new(), 0).await?;
+        assert_eq!(current_view["work"][0]["version"], 2);
+        assert!(
+            !store
+                .source_followup(&actor, Some("revision"), None)
+                .await?["retrieved_at"]
+                .is_null()
+        );
+        Ok(())
     }
 }

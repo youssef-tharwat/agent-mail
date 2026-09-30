@@ -557,23 +557,64 @@ recorded outcome. Agent Mail now keeps an attention plan beside each local pendi
 request and task. Runtime readiness, retrieval, the next check, and escalations are
 reported separately by `status --json` and `status --check NAME`.
 
-Existing groups start in **observation mode**. To enable follow-up dispatch, an
-operator supplies a complete group policy:
+New groups enable follow-through by default:
+
+```sh
+agent-mail init project
+# Observation only, without automatic follow-up dispatch:
+agent-mail init manual-project --no-follow-through
+
+# Change only the settings supplied; omitted settings retain their saved values.
+agent-mail --group project attention configure --interval 15m --max 1h
+agent-mail --group project attention configure --observe
+agent-mail --group project attention configure --enable
+agent-mail --group project attention configure --notifier /absolute/path/to/notify --notifier-arg fleet
+agent-mail --group project attention configure --clear-notifier
+```
+
+Plain `init` and upgrades preserve existing group policies. Use `init project
+--follow-through` or `attention configure --enable` to enable an existing group.
+Calling `attention configure` without flags reads the effective policy. Optional
+`--file policy.json` imports a complete policy, and cannot be mixed with change flags:
 
 ```json
 {"mode":"enabled","interval_seconds":900,"max_seconds":3600,"notifier":null}
 ```
 
-```sh
-agent-mail --group project attention configure --file policy.json
-```
+Native Codex delivery correlates its client message ID with persisted user input
+and completed-turn notifications. Trusted Claude/Codex hooks record the bounded
+context they supply and reconcile it at Stop. Only versions offered to that turn
+are considered. Later arrivals and superseded records are excluded; future
+checkpoints retain their review time. An overdue unresolved hold goes directly
+to its writer or sender for review, without prompting the worker to resume.
+One unhandled completed turn creates corrective
+attention; ignoring that offered correction in a later completed turn escalates
+to the task writer or mail sender. Duplicate receipts are idempotent, including
+after worker restart. A queue receipt or idle runtime state is never a completion.
 
-The interval controls two follow-up opportunities for retrieved but unhandled work;
-the third check escalates to the task writer or mail sender. Work with no usable
-runtime escalates by `max_seconds`. Exhausted delivery of an unread source escalates
-without resetting the original delivery budget. Existing pause and Herdr prompt
-policies still apply. Switch `mode` to `observe` to stop follow-up dispatch and retain
-its history. These scheduling times are independent of business deadlines.
+Native retries retain the original payload and offered versions. A newer checkpoint
+requires a separately correlated input or timer recovery. A new user input ends
+the previous hook offer even when notification context is suppressed by cooldown.
+This includes Claude delivery-verification prompts, which start an empty offer;
+their receipt and explicit agent acknowledgment remain separate. A hook whose
+output is discarded after a newer input or launch does not record source retrieval
+or change its recovery deadline. Successful output receipts cover only the source
+records and revisions included in that bounded response.
+Managed hooks from an earlier launch or a different pinned session cannot change
+current offers; authenticated hooks without managed-launch metadata remain supported.
+
+Dependency changes prioritize reconciliation immediately through service hints.
+The interval and maximum remain recovery bounds for missed lifecycle events,
+unavailable runtimes, and overdue checkpoints. The timer path retains two reminder
+opportunities before escalation. `max` must be at least four intervals and at most
+seven days. Existing pause and Herdr prompt policies still apply. These times are
+independent of business deadlines.
+
+Native Codex subscriptions rejoin only already loaded threads and replay a bounded
+recent history page after reconnect. Older clients without correlated input IDs,
+Claude bridge sessions without trusted hooks, and Herdr sessions without lifecycle
+hooks retain timer recovery. Failed/interrupted turns and missing history never
+count as successful completion. No adapter answers approval requests.
 
 ### Record a next step when yielding
 
@@ -660,7 +701,8 @@ Neither reading status nor inspecting history records retrieval for another agen
 Escalation first targets the writer/sender. A self-escalation goes directly to the
 operator; an unhandled escalation reaches that route after five minutes. Herdr
 uses its operator notification surface. Standalone groups can configure `notifier`
-as an array containing an **absolute executable** and arguments. It is launched
+with `attention configure --notifier /absolute/executable`, repeatable
+`--notifier-arg VALUE`, or a policy-file array containing that executable and arguments. It is launched
 without a shell, receives bounded group/attention JSON on stdin, has a five-second
 timeout, and gets at most three attempts with five-minute cooldowns. An explicitly
 configured notifier takes precedence over Herdr. Configure only a program you
@@ -674,12 +716,17 @@ with a new bounded operator budget. It does not reset business delivery attempts
 on process supervision to restart before it can send anything.
 
 Status totals cover all active sources, even when its detail list is truncated.
+`turn_receipts` distinguishes reserved offers from correlated completed turns;
+these receipts never imply a business outcome.
 Agent checks filter before pagination. Recovery responses stay within 4 KiB and
 mark only returned records retrieved; `checkpoints_more` directs agents to fetch
 full metadata through `task show` or `mail show`.
 
-Schema 18 adds attention metadata and preserves existing business records and
-receipts. Event subscriptions use protocol 2; an old subscriber gets an explicit
+Schema 20 retains immutable native payloads. During the upgrade from schema 19,
+open native offers without a reconstructible payload are abandoned; their history,
+business records and retry budgets remain intact. New native input uses a distinct
+client-ID namespace, and unfinished plans retain timer recovery.
+Event subscriptions use protocol 2; an old subscriber gets an explicit
 upgrade error. The existing automatic upgrade path drains the old worker and
 backs up the database. Follow-up dispatch covers local tasks and local deliveries
 on Herdr, managed Codex and managed Claude. Remote task snapshots and cross-machine

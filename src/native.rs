@@ -376,7 +376,10 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
     let message_id = if inbox {
         Uuid::new_v4().to_string()
     } else {
-        format!("agent-mail-{}-{}-{latest}", actor.id, actor.binding_version)
+        format!(
+            "agent-mail-snapshot1-{}-{}-{}-{latest}",
+            actor.id, actor.binding_version, endpoint.thread
+        )
     };
     let active = match peer.state().await? {
         State::Active if cancellation => true,
@@ -407,19 +410,49 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
     if reserved == 0 {
         return Ok(DeliveryState::Ineligible);
     }
-    let challenge = match store.reserve_delivery_challenge(actor, time).await {
-        Ok(challenge) => challenge,
-        Err(error) => {
-            eprintln!(
-                "agent-mail: could not attach delivery check to {}/{} notification: {error:#}",
-                actor.group_name, actor.name
-            );
-            None
+    let immutable = !inbox && kind == NativeRuntime::Codex && !active;
+    let prior = if immutable {
+        store
+            .native_snapshot(actor, &message_id, &endpoint.thread)
+            .await?
+    } else {
+        None
+    };
+    let (text, challenge) = if let Some(snapshot) = prior {
+        (snapshot.text, snapshot.nonce)
+    } else {
+        let challenge = match store.reserve_delivery_challenge(actor, time).await {
+            Ok(challenge) => challenge,
+            Err(error) => {
+                eprintln!(
+                    "agent-mail: could not attach delivery check to {}/{} notification: {error:#}",
+                    actor.group_name, actor.name
+                );
+                None
+            }
+        };
+        let delivery = store
+            .delivery(actor, challenge.as_deref(), endpoint.scanned)
+            .await?;
+        if immutable {
+            let mut tx = store.pool().begin().await?;
+            Store::lock_actor(&mut tx, actor).await?;
+            let snapshot = crate::turns::reserve_native_tx(
+                &mut tx,
+                actor,
+                &message_id,
+                &endpoint.thread,
+                &delivery,
+                challenge.as_deref(),
+                time,
+            )
+            .await?;
+            tx.commit().await?;
+            (snapshot.text, snapshot.nonce)
+        } else {
+            (delivery.text, challenge)
         }
     };
-    let text = store
-        .delivery_text(actor, challenge.as_deref(), endpoint.scanned)
-        .await?;
     // Hold the binding lock during the bounded send: replacement/detachment cannot race it.
     let mut tx = store.pool().begin().await?;
     Store::lock_actor(&mut tx, actor).await?;
