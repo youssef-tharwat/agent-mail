@@ -314,6 +314,7 @@ Unknown hook trust remains unknown. Delivery receipts and task progress are sepa
 
 ```sh
 herdr plugin install youssef-tharwat/agent-mail
+herdr plugin enable youssef-tharwat.agent-mail
 ```
 
 The plugin downloads the checksum-verified release binary. No Cargo is required.
@@ -438,3 +439,47 @@ them explicitly in a backed-up copy before upgrading. Mail does not guess their
 business meaning. Upgrade relay peers together. Old update retry documents that
 used `open` must not be replayed with different content; inspect the recorded
 result and current version before issuing a new decision.
+
+## Agent registration lifecycle (v0.7.0)
+
+`agent list` and `agent show NAME` expose typed state and version.
+`agent history NAME` returns the last 20 changes, newest first.
+
+```sh
+agent-mail agent show worker
+agent-mail agent update worker --version 1 --state retired --reason "Work settled"
+agent-mail agent update worker --version 2 --state registered --reason "New assignment"
+agent-mail run worker -- claude
+```
+
+Use observed versions, not the example numbers. Identical retries return the original
+result without applying it again; changed retries conflict. Binding changes also
+advance the registration version. Runtime observations never retire agents.
+
+Retirement rejects open tasks owned or written by the agent, open remote snapshots,
+and pending incoming/outgoing requests. The task writer cannot be transferred:
+settle its tasks through the workflow. Retired agents reject authentication, launches,
+new mail, assignments and rebinding. Restore explicitly; standalone credentials rotate,
+runtime attachments become invalid, and explicit delivery pause remains in effect.
+History and coordination records are preserved. Manage remote registrations at home.
+
+Schema 15 imports existing agents as registered/version 1 with an import history entry.
+Run `init GROUP` for migration with the service stopped. Once the schema is current,
+adding other groups does not require stopping delivery. Select campaigns explicitly
+with `--group GROUP`; sharing a store does not mean sharing a group's inboxes.
+Available starting with v0.7.0.
+
+## Fleet-scoped status
+
+`agent-mail --group GROUP status` shows that group's inboxes, attention, notification
+budgets, endpoints, policies and service observations. Group inference follows the
+current credential/Herdr identity, then the sole group; ambiguity is an error.
+`agent-mail status --all-groups` is the explicit installation-wide operator view,
+including peers and relay outbox counts. Do not combine it with `--group` or `--check`.
+Group filters apply before bounded-query limits. A large fleet cannot hide another
+fleet's pending work. Message IDs are installation-wide, but mailbox access remains
+restricted to the authenticated registration in its group.
+
+Binding a Herdr pane fails clearly when the plugin is disabled. `status --check NAME`
+checks plugin enablement and group prompt policy separately from pane identity.
+It never silently enables unguarded prompts or treats binding as delivery proof.

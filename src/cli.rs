@@ -80,6 +80,9 @@ enum Action {
     Service(Service),
     /// Read coordination health; --check also probes runtime setup.
     Status {
+        /// Installation-wide operator view, including every group.
+        #[arg(long, conflicts_with_all = ["check", "group"])]
+        all_groups: bool,
         /// Probe setup, optionally for a named agent; never repairs or prompts.
         #[arg(long,num_args=0..=1,default_missing_value="")]
         check: Option<String>,
@@ -214,6 +217,20 @@ struct Changes {
 }
 #[derive(Subcommand)]
 enum Agent {
+    /// Read durable state and version.
+    Show { name: String },
+    /// Explicitly retire or restore an agent using the observed version.
+    Update {
+        name: String,
+        #[arg(long)]
+        version: i64,
+        #[arg(long)]
+        state: agent_mail::states::AgentState,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Show the latest 20 registration changes.
+    History { name: String },
     /// Issue a new standalone identity. Never replaces an existing credential.
     Add {
         name: String,
@@ -392,6 +409,16 @@ impl Cli {
             return Ok(None);
         }
         let command = self.command.context("provide a command or --skill")?;
+        ensure!(
+            !matches!(
+                &command,
+                Action::Status {
+                    all_groups: true,
+                    ..
+                }
+            ) || self.group.is_none(),
+            "--all-groups cannot be combined with --group or AGENT_MAIL_GROUP"
+        );
         let root = supervision::state_root(self.state_dir.clone())?;
         if let Action::Runtime(Runtime::Configure { client, output }) = &command {
             configure(*client, output)?;
@@ -401,7 +428,10 @@ impl Cli {
             &command,
             Action::Init { .. }
                 | Action::Service(_)
-                | Action::Status { check: None }
+                | Action::Status {
+                    all_groups: true,
+                    ..
+                }
                 | Action::Remote(
                     Remote::Id
                         | Remote::Peer { .. }
@@ -413,10 +443,16 @@ impl Cli {
                 )
         );
         let group = if scoped {
-            let store = Store::open(&root, false).await?;
+            let store = Store::open(&root, false)
+                .await
+                .with_context(|| format!("open Agent Mail store {}", root.display()))?;
             let agent = matches!(
                 &command,
-                Action::Context { .. } | Action::Mail(_) | Action::Task(_) | Action::Adapter(_)
+                Action::Context { .. }
+                    | Action::Mail(_)
+                    | Action::Task(_)
+                    | Action::Adapter(_)
+                    | Action::Status { .. }
             );
             let selected = store
                 .select_group(self.group.as_deref(), self.session.as_ref(), agent)
@@ -452,11 +488,18 @@ impl Cli {
                 work_after: task_after,
                 mail_after,
             },
-            Action::Status { check: Some(name) } => Command::Doctor {
+            Action::Status {
+                check: Some(name), ..
+            } => Command::Doctor {
                 group,
                 name: if name.is_empty() { None } else { Some(name) },
             },
-            Action::Status { check: None } => Command::Status,
+            Action::Status {
+                all_groups,
+                check: None,
+            } => Command::Status {
+                group: if all_groups { None } else { Some(group) },
+            },
             Action::Service(s) => Command::Service(s),
             Action::Agent(p) => match p {
                 Agent::Add { name, show_session } => Command::Register {
@@ -471,6 +514,20 @@ impl Cli {
                     name,
                     replace: true,
                 },
+                Agent::Show { name } => Command::AgentShow { group, name },
+                Agent::Update {
+                    name,
+                    version,
+                    state,
+                    reason,
+                } => Command::AgentUpdate {
+                    group,
+                    name,
+                    version,
+                    state,
+                    reason,
+                },
+                Agent::History { name } => Command::AgentHistory { group, name },
                 Agent::List => Command::Participants { group },
                 Agent::Bind {
                     name,

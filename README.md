@@ -48,6 +48,21 @@ agent-mail --skill
 
 This prints the skill; it does **not** install or register it with your client.
 
+## Agent lifecycle
+
+Agents have durable `registered` / `retired` states, versions and history:
+
+```sh
+agent-mail agent show worker
+agent-mail agent update worker --version VERSION --state retired --reason "Finished"
+agent-mail agent history worker
+```
+
+Retirement requires owned/written tasks and incoming/outgoing mail to be settled.
+Restore with `--state registered` and the current version, then launch again.
+Old credentials and runtime attachments stay invalid. Registration state is
+separate from whether the client is running.
+
 ## Quick start
 
 Create a group, register agents, and start the delivery worker:
@@ -157,3 +172,18 @@ have been removed. The bundled skill matches the installed binary.
 - [Issues](https://github.com/youssef-tharwat/agent-mail/issues): bugs and proposals.
 
 Maintained by [Youssef Tharwat](https://github.com/youssef-tharwat). [MIT](LICENSE).
+
+## Multiple fleets
+
+Each group has its own agents, tasks and inboxes. Groups share the local database
+and delivery service. Adding a group on the current schema does not stop delivery.
+
+```sh
+agent-mail init recall
+agent-mail --group recall agent add coordinator
+agent-mail --group recall status
+agent-mail status --all-groups  # installation-wide operator view
+```
+
+Commands infer the group from the current identity or sole group. Ambiguous
+selection fails rather than choosing another fleet.

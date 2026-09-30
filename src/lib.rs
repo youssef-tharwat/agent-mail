@@ -27,10 +27,14 @@
 //! # }
 //! ```
 
+/// Versioned agent registration lifecycle.
+pub mod agents;
 pub mod herdr;
 pub mod identity;
 pub mod relay;
 pub mod service;
+/// Group-scoped diagnostics and explicit installation overview.
+pub mod status;
 pub mod store;
 pub mod supervision;
 pub mod work;

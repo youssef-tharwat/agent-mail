@@ -6,7 +6,7 @@
 //! All clones must be dropped before migration; [`Store::close`] first drains the pool.
 //! Socket paths use OS path types, with UTF-8 encoding required by the SQLite schema.
 
-use crate::states::{Availability, MessageState};
+use crate::states::{AgentState, Availability, MessageState};
 use crate::{
     BODY_LIMIT, SUMMARY_LIMIT, bounded,
     identity::{Binding, Participant},
@@ -42,6 +42,12 @@ pub struct Mailbox {
     pub binding: Binding,
     /// Generation invalidated by explicit identity replacement.
     pub binding_version: i64,
+    /// Durable registration state.
+    pub state: AgentState,
+    /// Registration version.
+    pub version: i64,
+    /// Last registration change.
+    pub updated: i64,
     /// Persisted delivery attempt count for the current retry budget.
     pub attempts: i64,
     /// Earliest next reminder attempt, in Unix seconds.
@@ -57,6 +63,9 @@ struct MailboxRow {
     name: String,
     binding: String,
     binding_version: i64,
+    state: AgentState,
+    version: i64,
+    updated: i64,
     attempts: i64,
     next_wake: i64,
     alerted: i64,
@@ -70,6 +79,9 @@ impl TryFrom<MailboxRow> for Mailbox {
             name: row.name,
             binding: serde_json::from_str(&row.binding).context("decode participant binding")?,
             binding_version: row.binding_version,
+            state: row.state,
+            version: row.version,
+            updated: row.updated,
             attempts: row.attempts,
             next_wake: row.next_wake,
             alerted: row.alerted,
@@ -316,7 +328,7 @@ impl Store {
             .await?
             .user_version
             .context("SQLite did not report its schema version")?;
-        ensure!(version <= 14, "database schema is newer than this binary");
+        ensure!(version <= 15, "database schema is newer than this binary");
         if setup {
             // Rebuilding a referenced table requires FK enforcement off outside
             // the migration transaction. The migration checks every FK before commit.
@@ -353,7 +365,7 @@ impl Store {
             .await?;
         } else {
             ensure!(
-                version == 14,
+                version == 15,
                 "database schema needs initialization or migration; run agent-mail init GROUP"
             );
         }
@@ -503,7 +515,7 @@ impl Store {
     /// The participant is missing, its binding cannot be decoded, or the query fails.
     pub async fn mailbox(&self, group: &str, participant: &str) -> Result<Mailbox> {
         sqlx::query_as!(MailboxRow,
-            "SELECT id,group_name,name,binding,binding_version,attempts,next_wake,alerted FROM mailboxes WHERE group_name=? AND name=?",
+            "SELECT id,group_name,name,binding,binding_version,agent_state AS 'state: AgentState',agent_version AS version,agent_updated AS updated,attempts,next_wake,alerted FROM mailboxes WHERE group_name=? AND name=?",
             group, participant).fetch_optional(self.pool()).await?
             .context("participant is not registered in this group")?.try_into()
     }
@@ -514,7 +526,7 @@ impl Store {
     /// The pane is unbound, the binding cannot be decoded, or the query fails.
     pub async fn caller(&self, group: &str, pane: &str) -> Result<Mailbox> {
         sqlx::query_as!(MailboxRow,
-            "SELECT id,group_name,name,binding,binding_version,attempts,next_wake,alerted FROM mailboxes WHERE group_name=? AND pane=?",
+            "SELECT id,group_name,name,binding,binding_version,agent_state AS 'state: AgentState',agent_version AS version,agent_updated AS updated,attempts,next_wake,alerted FROM mailboxes WHERE group_name=? AND pane=? AND agent_state='registered'",
             group, pane).fetch_optional(self.pool()).await?
             .context("caller pane is not bound in this group")?.try_into()
     }
@@ -526,7 +538,7 @@ impl Store {
     ) -> Result<Mailbox> {
         let session = session.to_string();
         sqlx::query_as!(MailboxRow,
-            "SELECT id,group_name,name,binding,binding_version,attempts,next_wake,alerted FROM mailboxes WHERE group_name=? AND standalone_session=?",
+            "SELECT id,group_name,name,binding,binding_version,agent_state AS 'state: AgentState',agent_version AS version,agent_updated AS updated,attempts,next_wake,alerted FROM mailboxes WHERE group_name=? AND standalone_session=? AND agent_state='registered'",
             group, session).fetch_optional(self.pool()).await?
             .context("standalone session is unknown or replaced in this group")?.try_into()
     }
@@ -538,7 +550,7 @@ impl Store {
     pub async fn participants(&self, group: &str) -> Result<Vec<Participant>> {
         self.group(group).await?;
         let rows = sqlx::query_as!(MailboxRow,
-            "SELECT id,group_name,name,binding,binding_version,attempts,next_wake,alerted FROM mailboxes WHERE group_name=? ORDER BY name",
+            "SELECT id,group_name,name,binding,binding_version,agent_state AS 'state: AgentState',agent_version AS version,agent_updated AS updated,attempts,next_wake,alerted FROM mailboxes WHERE group_name=? ORDER BY name",
             group).fetch_all(self.pool()).await?;
         rows.into_iter()
             .map(|row| {
@@ -549,6 +561,9 @@ impl Store {
                     runtime: mailbox.binding.runtime(),
                     pane: mailbox.binding.herdr().map(|binding| binding.pane.clone()),
                     availability: Availability::Unknown,
+                    state: mailbox.state,
+                    version: mailbox.version,
+                    updated: mailbox.updated,
                 })
             })
             .collect()
@@ -568,11 +583,18 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         let old = sqlx::query_as!(MailboxRow,
-            "SELECT id,group_name,name,binding,binding_version,attempts,next_wake,alerted FROM mailboxes WHERE group_name=? AND name=?",
+            "SELECT id,group_name,name,binding,binding_version,agent_state AS 'state: AgentState',agent_version AS version,agent_updated AS updated,attempts,next_wake,alerted FROM mailboxes WHERE group_name=? AND name=?",
             group, participant).fetch_optional(&mut *tx).await?;
         let encoded = serde_json::to_string(binding)?;
         if let Some(old) = old {
             let old = Mailbox::try_from(old)?;
+            let state = sqlx::query!("SELECT agent_state FROM mailboxes WHERE id=?", old.id)
+                .fetch_one(&mut *tx)
+                .await?;
+            ensure!(
+                state.agent_state == "registered",
+                "agent is retired; restore it explicitly before rebinding"
+            );
             ensure!(
                 !matches!(old.binding, Binding::Remote { .. }),
                 "remote route cannot be rebound as a local agent"
@@ -609,7 +631,7 @@ impl Store {
         tx: &mut Transaction<'_, Sqlite>,
         actor: &Mailbox,
     ) -> Result<()> {
-        let result = sqlx::query!("UPDATE mailboxes SET attempts=attempts WHERE id=? AND binding_version=? AND remote_machine IS NULL",
+        let result = sqlx::query!("UPDATE mailboxes SET attempts=attempts WHERE id=? AND binding_version=? AND remote_machine IS NULL AND agent_state='registered'",
             actor.id, actor.binding_version).execute(&mut **tx).await?;
         ensure!(
             result.rows_affected() == 1,
@@ -623,7 +645,7 @@ impl Store {
         actor: &Mailbox,
     ) -> Result<()> {
         let current = sqlx::query!(
-            "SELECT id FROM mailboxes WHERE id=? AND binding_version=? AND remote_machine IS NULL",
+            "SELECT id FROM mailboxes WHERE id=? AND binding_version=? AND remote_machine IS NULL AND agent_state='registered'",
             actor.id,
             actor.binding_version
         )
@@ -914,7 +936,7 @@ impl Store {
     /// The database query fails.
     pub async fn pending(&self) -> Result<Vec<Pending>> {
         Ok(sqlx::query_as!(Pending,
-            "SELECT b.id AS 'id!: i64',b.group_name AS 'group_name!: String',b.name AS 'name!: String',COUNT(*) AS 'pending!: i64',MIN(m.created) AS 'oldest!: i64',MIN(m.due) AS 'due?: i64',b.attempts AS 'attempts!: i64',b.next_wake AS 'next_wake!: i64',b.alerted AS 'alerted!: i64' FROM mailboxes b JOIN (SELECT d.recipient,m.created,m.deadline AS due FROM deliveries d JOIN messages m ON m.id=d.message WHERE d.state='pending' UNION ALL SELECT recipient,created,created+900 AS due FROM pending_work_events) m ON m.recipient=b.id WHERE b.remote_machine IS NULL GROUP BY b.id ORDER BY b.group_name,b.id")
+            "SELECT b.id AS 'id!: i64',b.group_name AS 'group_name!: String',b.name AS 'name!: String',COUNT(*) AS 'pending!: i64',MIN(m.created) AS 'oldest!: i64',MIN(m.due) AS 'due?: i64',b.attempts AS 'attempts!: i64',b.next_wake AS 'next_wake!: i64',b.alerted AS 'alerted!: i64' FROM mailboxes b JOIN (SELECT d.recipient,m.created,m.deadline AS due FROM deliveries d JOIN messages m ON m.id=d.message WHERE d.state='pending' UNION ALL SELECT recipient,created,created+900 AS due FROM pending_work_events) m ON m.recipient=b.id WHERE b.remote_machine IS NULL AND b.agent_state='registered' GROUP BY b.id ORDER BY b.group_name,b.id")
             .fetch_all(self.pool()).await?)
     }
 
@@ -924,7 +946,7 @@ impl Store {
     /// The database update fails; an ineligible reservation returns false.
     pub async fn reserve(&self, actor: &Mailbox, now: i64) -> Result<bool> {
         let next = now.checked_add(300).context("clock overflow")?;
-        let result = sqlx::query!("UPDATE mailboxes SET attempts=attempts+1,next_wake=? WHERE id=? AND binding_version=? AND pane IS NOT NULL AND attempts<3 AND next_wake<=? AND EXISTS(SELECT 1 FROM groups WHERE name=mailboxes.group_name AND paused=0 AND auto_prompt=1) AND (EXISTS(SELECT 1 FROM deliveries WHERE recipient=mailboxes.id AND state='pending') OR EXISTS(SELECT 1 FROM pending_work_events WHERE recipient=mailboxes.id))",
+        let result = sqlx::query!("UPDATE mailboxes SET attempts=attempts+1,next_wake=? WHERE id=? AND binding_version=? AND agent_state='registered' AND pane IS NOT NULL AND attempts<3 AND next_wake<=? AND EXISTS(SELECT 1 FROM groups WHERE name=mailboxes.group_name AND paused=0 AND auto_prompt=1) AND (EXISTS(SELECT 1 FROM deliveries WHERE recipient=mailboxes.id AND state='pending') OR EXISTS(SELECT 1 FROM pending_work_events WHERE recipient=mailboxes.id))",
             next, actor.id, actor.binding_version, now).execute(self.pool()).await?;
         Ok(result.rows_affected() == 1)
     }

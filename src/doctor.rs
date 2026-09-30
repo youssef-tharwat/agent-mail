@@ -141,6 +141,29 @@ pub async fn inspect(
         }
     };
     report.add("identity",Level::Pass,json!({"participant":actor.name,"generation":actor.binding_version,"runtime":actor.binding.runtime()}),None);
+    if actor.state == crate::states::AgentState::Retired {
+        report.add(
+            "registration",
+            Level::Fail,
+            "Agent is retired",
+            Some("Restore the registration explicitly before launching or binding"),
+        );
+        return report;
+    }
+    if matches!(actor.binding, Binding::Herdr(_)) {
+        let enabled = match config.socket.as_deref() {
+            Some(socket) => crate::herdr::plugin_enabled(socket).await,
+            None => Err(anyhow::anyhow!("missing Herdr socket")),
+        };
+        match enabled {
+            Ok(true) => report.add("herdr_plugin", Level::Pass, "Mail plugin is enabled", None),
+            Ok(false) => report.add("herdr_plugin", Level::Fail, "plugin_disabled", Some("Run herdr plugin enable youssef-tharwat.agent-mail in the intended Herdr session")),
+            Err(_) => report.add("herdr_plugin", Level::Fail, "Cannot verify Mail plugin enablement", Some("Verify the configured Herdr socket and plugin installation")),
+        }
+        report.add("herdr_delivery", if config.paused == 0 && config.auto_prompt != 0 { Level::Pass } else { Level::Fail },
+            json!({"paused":config.paused != 0,"auto_prompt":config.auto_prompt != 0}),
+            if config.paused == 0 && config.auto_prompt != 0 { None } else { Some("Resume this group and configure its Herdr prompt policy before relying on automatic delivery") });
+    }
     let stream = tokio::time::timeout(Duration::from_secs(3), async {
         let mut reader = crate::stream::connect(&store, &actor, 0).await?;
         anyhow::ensure!(

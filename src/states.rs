@@ -22,6 +22,16 @@ macro_rules! string_enum {
     };
 }
 string_enum! {
+    /// Durable agent registration, independent of runtime liveness.
+    #[derive(clap::ValueEnum)]
+    pub enum AgentState {
+        /// May own tasks and exchange messages.
+        Registered => "registered",
+        /// Explicitly withdrawn from coordination.
+        Retired => "retired",
+    }
+}
+string_enum! {
     /// Task lifecycle; the designated writer chooses transitions.
     #[derive(clap::ValueEnum)]
     pub enum TaskState {

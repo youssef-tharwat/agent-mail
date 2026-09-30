@@ -1,6 +1,6 @@
 id = "youssef-tharwat.agent-mail"
 name = "Agent Mail"
-version = "0.6.0"
+version = "0.7.0"
 min_herdr_version = "0.9.1"
 description = "Local durable tasks and messages for coding agents"
 platforms = ["macos", "linux"]
@@ -30,7 +30,7 @@ command = ["./target/release/agent-mail", "init", "default"]
 id = "status"
 title = "Mail status"
 contexts = ["workspace"]
-command = ["./target/release/agent-mail", "status"]
+command = ["./target/release/agent-mail", "status", "--all-groups"]
 
 [[actions]]
 id = "connect-herdr"

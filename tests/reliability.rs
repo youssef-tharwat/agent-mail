@@ -821,3 +821,25 @@ async fn work_only_changes_wake_without_separate_mail_and_keep_retry_budget() ->
     assert!(f.host.lock().await.prompts[0].contains("context"));
     Ok(())
 }
+
+#[tokio::test]
+async fn doctor_checks_plugin_even_when_bound_pane_matches() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.host.lock().await.enabled = false;
+    let report = agent_mail::doctor::inspect(f.store.root(), "g", Some("a"), None).await;
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|c| c.check == "herdr_plugin" && c.status == agent_mail::doctor::Level::Fail)
+    );
+    f.host.lock().await.enabled = true;
+    let report = agent_mail::doctor::inspect(f.store.root(), "g", Some("a"), None).await;
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|c| c.check == "herdr_plugin" && c.status == agent_mail::doctor::Level::Pass)
+    );
+    Ok(())
+}

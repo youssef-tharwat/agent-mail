@@ -191,3 +191,32 @@ not replaced. Homebrew was updated to v0.6.0 with all four published checksums.
 passed on macOS and Linux, ARM64 and x86-64.
 
 Typed resource attachments remain a proposal, not a shipped feature.
+
+## Agent registration lifecycle and concurrent fleet setup (v0.7.0)
+
+- Typed registered/retired states, separate from runtime liveness.
+- Show, version-checked updates and bounded history; exact retries are idempotent.
+- Atomic retirement checks owned/written tasks, snapshots and pending mail.
+- Retired-agent enforcement at authentication, launch, delivery and assignment boundaries.
+- Restore with fresh credentials and invalidated runtime attachments; preserve delivery pause.
+- Schema 15 imports existing registrations. No distributed lifecycle replication.
+- Add groups under the shared schema lock when already current; migrations remain exclusive.
+- Regression coverage: migration, retry conflicts, persistence, stale sessions, open obligations,
+  assignment/delivery races and live-service group enrollment.
+
+Fleet traces also show store-discovery confusion and disabled Herdr plugins. The skill now
+separates registration from verified delivery readiness and keeps campaigns in distinct groups.
+Do not delete existing state or change active fleet setup during isolated verification.
+
+Verification (2026-09-30): `cargo test --all-features` passed 83 tests;
+`cargo clippy --all-targets --all-features -- -D warnings`, formatting and diff checks passed.
+An isolated CLI run kept a real delivery service running while enrolling a second fleet,
+preserved the first fleet's pending request, exercised retirement/restore/retry/binding history,
+and confirmed the reported store path. The assignment → blocker → review → correction →
+acceptance → reply-resolution CLI flow also passed. No live fleet state was modified.
+Native integration regressions passed; this was not a new live Codex/Claude/Herdr acceptance run.
+Schema 15 requires v0.7.0; v0.6.0 cannot read the upgraded store.
+
+Final v0.7.0 validation: 85 tests and strict Clippy passed. Group-specific status,
+pre-limit filtering, explicit all-groups selection and disabled-plugin diagnostics
+are implemented and tested. Both isolated CLI acceptance flows passed.

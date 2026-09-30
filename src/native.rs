@@ -263,13 +263,13 @@ impl Store {
     /// Reading the persisted preference fails.
     pub async fn runtime_enabled(&self, actor: &Mailbox) -> Result<bool> {
         Ok(sqlx::query!(
-            "SELECT enabled FROM runtime_policy WHERE recipient=? AND binding_version=?",
+            "SELECT CASE WHEN m.agent_state='retired' THEN 0 ELSE COALESCE(p.enabled,1) END AS 'enabled!: i64' FROM mailboxes m LEFT JOIN runtime_policy p ON p.recipient=m.id AND p.binding_version=m.binding_version WHERE m.id=? AND m.binding_version=?",
             actor.id,
             actor.binding_version
         )
         .fetch_optional(self.pool())
         .await?
-        .is_none_or(|r| r.enabled != 0))
+        .context("agent binding changed; recover the current identity")?.enabled != 0)
     }
     /// Report explicit delivery preferences without exposing credentials.
     ///

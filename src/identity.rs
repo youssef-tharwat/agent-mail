@@ -75,6 +75,12 @@ pub struct Participant {
     pub pane: Option<String>,
     /// Observed availability; standalone registrations do not prove liveness.
     pub availability: Availability,
+    /// Durable registration lifecycle.
+    pub state: crate::states::AgentState,
+    /// Registration version.
+    pub version: i64,
+    /// Last registration change.
+    pub updated: i64,
 }
 
 impl Store {
@@ -152,6 +158,9 @@ impl Store {
                 if self.authenticate_herdr(&group.name).await.is_ok() {
                     matches.push(group.name.clone());
                 }
+            }
+            if matches.is_empty() && groups.len() == 1 {
+                return Ok(groups[0].name.clone());
             }
             anyhow::ensure!(
                 matches.len() == 1,

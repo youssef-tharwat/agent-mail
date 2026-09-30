@@ -42,6 +42,10 @@ pub(super) async fn launch(root: &Path, group: &str, name: &str, args: &[OsStrin
         .mailbox(group, name)
         .await
         .context("agent is not registered; run agent-mail agent add NAME")?;
+    anyhow::ensure!(
+        store.agent_record(group, name).await?.state == agent_mail::states::AgentState::Registered,
+        "agent is retired; restore it before launching"
+    );
     let Binding::Standalone { session } = &actor.binding else {
         bail!("run requires a standalone agent; Herdr owns launches for pane-bound agents")
     };

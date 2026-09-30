@@ -24,6 +24,21 @@ struct RunArgs {
 }
 
 enum Command {
+    AgentShow {
+        group: String,
+        name: String,
+    },
+    AgentUpdate {
+        group: String,
+        name: String,
+        version: i64,
+        state: agent_mail::states::AgentState,
+        reason: String,
+    },
+    AgentHistory {
+        group: String,
+        name: String,
+    },
     /// Native Claude streaming session bridge; stdin/stdout remain the client protocol.
     ClaudeBridge {
         socket: PathBuf,
@@ -173,7 +188,9 @@ enum Command {
         generation: Option<i64>,
     },
     /// Operator: show durable pending work and the latest service diagnostics.
-    Status,
+    Status {
+        group: Option<String>,
+    },
     /// Operator: stop automatic prompts for a group. Message operations still work.
     Pause {
         group: String,
@@ -330,7 +347,20 @@ async fn run(cli: RunArgs) -> Result<()> {
         _ => {}
     }
     let setup = matches!(cli.command, Command::Setup { .. });
-    let store = Store::open(&root, setup).await?;
+    // Enrolling another group only writes rows. Reserve the exclusive schema
+    // lock for first initialization or an actual schema upgrade.
+    let store = if setup {
+        match Store::open(&root, false).await {
+            Ok(store) => store,
+            Err(_) => Store::open(&root, true)
+                .await
+                .with_context(|| format!("open Agent Mail store {}", root.display()))?,
+        }
+    } else {
+        Store::open(&root, false)
+            .await
+            .with_context(|| format!("open Agent Mail store {}", root.display()))?
+    };
     let output: Value = match cli.command {
         Command::Setup {
             group,
@@ -373,6 +403,10 @@ async fn run(cli: RunArgs) -> Result<()> {
                 .socket
                 .as_deref()
                 .context("configure a Herdr socket before binding")?;
+            ensure!(
+                herdr::plugin_enabled(socket).await?,
+                "Mail plugin is disabled in this Herdr session; run herdr plugin enable youssef-tharwat.agent-mail, then bind again"
+            );
             let agent = herdr::agent(std::path::Path::new(socket), &target).await?;
             store.bind(&group, &name, &agent, replace).await?;
             json!({"bound":name,"group":group,"pane":agent.pane_id})
@@ -423,6 +457,23 @@ async fn run(cli: RunArgs) -> Result<()> {
             let actor = store.mailbox(&group, &name).await?;
             store.set_runtime_enabled(&actor, false).await?;
             json!({"detached":name,"group":group})
+        }
+        Command::AgentShow { group, name } => {
+            serde_json::to_value(store.agent_record(&group, &name).await?)?
+        }
+        Command::AgentUpdate {
+            group,
+            name,
+            version,
+            state,
+            reason,
+        } => serde_json::to_value(
+            store
+                .update_agent(&group, &name, version, state, &reason)
+                .await?,
+        )?,
+        Command::AgentHistory { group, name } => {
+            serde_json::to_value(store.agent_history(&group, &name).await?)?
         }
         Command::Participants { group } => serde_json::to_value(store.participants(&group).await?)?,
         Command::MachineId => json!({"machine_id":store.machine_id().await?}),
@@ -736,16 +787,7 @@ async fn run(cli: RunArgs) -> Result<()> {
                 );
             }
         }
-        Command::Status => {
-            let report = root.join("service-status.json");
-            let diagnostics = if report.exists() {
-                serde_json::from_slice::<Value>(&std::fs::read(report)?)?
-            } else {
-                Value::Null
-            };
-            let (outbox_pending, outbox_oldest) = store.outbox_status().await?;
-            json!({"service_running":service::running(&root),"now":now()?,"groups":store.groups().await?,"inboxes":store.pending().await?,"notifications":store.notification_status().await?,"runtime_policy":store.runtime_policy_status().await?,"native":store.native_status().await?,"codex":store.native_status().await?.as_array().context("native status must be an array")?.iter().filter(|endpoint| endpoint["runtime"] == "codex").collect::<Vec<_>>(),"attention":store.attention(now()?).await?,"peers":store.peers_status().await?,"outbox_pending":outbox_pending,"outbox_oldest":outbox_oldest,"last_scan":diagnostics})
-        }
+        Command::Status { group } => agent_mail::status::report(&store, group.as_deref()).await?,
         Command::Pause { group } => {
             store.pause(&group, true).await?;
             json!({"group":group,"paused":true})

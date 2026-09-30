@@ -323,7 +323,7 @@ impl Store {
         );
         ensure!(
             sqlx::query!(
-                "SELECT id FROM mailboxes WHERE group_name=? AND name=?",
+                "SELECT id FROM mailboxes WHERE group_name=? AND name=? AND agent_state='registered'",
                 item.group_name,
                 item.owner
             )
@@ -552,7 +552,7 @@ impl Store {
         validate_fields(&item)?;
         ensure!(
             sqlx::query!(
-                "SELECT id FROM mailboxes WHERE group_name=? AND name=?",
+                "SELECT id FROM mailboxes WHERE group_name=? AND name=? AND agent_state='registered'",
                 item.group_name,
                 item.owner
             )

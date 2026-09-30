@@ -60,8 +60,14 @@ impl Store {
     /// # Errors
     /// The database queries fail.
     pub async fn notification_status(&self) -> Result<serde_json::Value> {
-        let rows = sqlx::query!("SELECT b.group_name,b.name,b.binding_version,COUNT(e.id) AS count FROM mailboxes b JOIN coordination_events e ON e.recipient=b.id WHERE b.remote_machine IS NULL AND NOT EXISTS(SELECT 1 FROM event_receipts r WHERE r.recipient=b.id AND r.binding_version=b.binding_version AND r.event=e.id) GROUP BY b.id ORDER BY b.id").fetch_all(self.pool()).await?;
-        let emissions = sqlx::query!("SELECT b.group_name,b.name,h.attempts,h.next_attempt,h.stop_used FROM hook_emissions h JOIN mailboxes b ON b.id=h.recipient AND b.binding_version=h.binding_version ORDER BY h.next_attempt DESC LIMIT 20").fetch_all(self.pool()).await?;
+        self.notification_status_for(None).await
+    }
+    /// Inspect notification budgets within the selected group.
+    /// # Errors
+    /// Database queries fail.
+    pub async fn notification_status_for(&self, group: Option<&str>) -> Result<serde_json::Value> {
+        let rows = sqlx::query!("SELECT b.group_name,b.name,b.binding_version,COUNT(e.id) AS count FROM mailboxes b JOIN coordination_events e ON e.recipient=b.id WHERE (? IS NULL OR b.group_name=?) AND b.remote_machine IS NULL AND NOT EXISTS(SELECT 1 FROM event_receipts r WHERE r.recipient=b.id AND r.binding_version=b.binding_version AND r.event=e.id) GROUP BY b.id ORDER BY b.id",group,group).fetch_all(self.pool()).await?;
+        let emissions = sqlx::query!("SELECT b.group_name,b.name,h.attempts,h.next_attempt,h.stop_used FROM hook_emissions h JOIN mailboxes b ON b.id=h.recipient AND b.binding_version=h.binding_version WHERE (? IS NULL OR b.group_name=?) ORDER BY h.next_attempt DESC LIMIT 20",group,group).fetch_all(self.pool()).await?;
         Ok(
             serde_json::json!({"unacknowledged":rows.into_iter().map(|r|serde_json::json!({"group":r.group_name,"participant":r.name,"binding_version":r.binding_version,"count":r.count})).collect::<Vec<_>>(),"hook_attempts":emissions.into_iter().map(|r|serde_json::json!({"group":r.group_name,"participant":r.name,"attempts":r.attempts,"next_attempt":r.next_attempt,"stop_used":r.stop_used,"delivery_confirmed":false})).collect::<Vec<_>>()}),
         )

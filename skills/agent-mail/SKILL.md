@@ -1,7 +1,7 @@
 ---
 name: agent-mail
 description: >-
-  Use Agent Mail to coordinate durable tasks and messages: recover assignments after context resets, assign work, report blockers or results, request reviews, and record corrections or acceptance. Apply to Mail-based handoffs in Codex, Claude Code, Herdr or Fleet, including forgotten assignments and stalled requests. Also use when asked to set up or diagnose Agent Mail. Workflow and runtime integrations are optional; this skill teaches the tool's operating flows.
+  Use Agent Mail to coordinate durable tasks and messages: recover assignments after context resets, assign work, report blockers or results, request reviews, and record corrections or acceptance. Apply to Mail-based handoffs in Codex, Claude Code, Herdr or Fleet, including forgotten assignments and stalled requests. Also use when asked to set up or diagnose Agent Mail, or retire and restore its agent registrations. Workflow and runtime integrations are optional; this skill teaches the tool's operating flows.
 ---
 
 # Agent Mail
@@ -165,7 +165,31 @@ General supporting material can be referenced in the scope, next action or a
 linked message. A typed resource collection and attachment commands are not yet
 implemented; do not invent them or present supporting material as verified evidence.
 
+## Agent registration lifecycle
+
+For an authorized registration change, read `agent show NAME`, then use
+`agent update NAME --version VERSION --state retired --reason "WHY"`.
+`agent history NAME` shows the latest 20 changes. States are `registered` and
+`retired`; idle/busy/offline are runtime observations, never registration decisions.
+
+Retirement rejects open tasks where the agent is owner **or writer**, and pending
+incoming/outgoing mail. Reassign owned tasks or close them through the workflow;
+the task writer cannot be transferred. Do not close real work just to retire an agent.
+Restore explicitly with `--state registered` and the observed version, then launch
+again or reattach Herdr. Old standalone credentials and runtime connections stay
+invalid; explicit delivery pause remains. Binding replacement advances the version.
+Retry the exact same state/version/reason; changed retries conflict. Never substitute
+a fresh version automatically. These are operator actions, not per-turn bookkeeping.
+
 ## Setup and delivery problems
+
+A missing identity is not proof that Mail is uninitialized. Inspect `status --all-groups` and
+its state directory before creating a store. Normal `status` is group-scoped; `status --all-groups` is the explicit operator overview.
+Different fleets use separate groups
+in the same store; select the intended group explicitly with `--group GROUP`.
+Never join another campaign or delete its store to bypass a setup problem.
+On the current schema, `init GROUP` can add a group while delivery is running;
+an actual schema migration still requires exclusive access.
 
 When explicitly tasked with local setup, the operator flow is:
 
@@ -183,6 +207,13 @@ recovery hooks; `run` does not start the Mail service. Client trust/permission
 settings still apply. Herdr is optional; use `runtime herdr --help` and `agent bind
 --help` when configuring verified Herdr bindings. Custom commands receive identity
 but no automatic client hooks.
+
+After binding each Herdr pane, check `agent-mail --group GROUP status --check NAME`
+before moving assignments. `plugin_disabled` means the binding exists but automatic
+delivery is disabled. Enable it with `herdr plugin enable youssef-tharwat.agent-mail` in the intended session;
+do not call registration alone a working integration. Binding rejects a disabled plugin.
+Herdr prompt delivery defaults to notification-only. Only an explicit operator choice
+of `runtime herdr-policy unguarded` permits prompts; Herdr cannot verify an empty draft.
 
 For a stalled handoff, use `agent-mail status --check NAME`. Distinguish:
 

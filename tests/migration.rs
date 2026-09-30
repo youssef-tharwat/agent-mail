@@ -42,7 +42,7 @@ async fn existing_version_four_state_upgrades_to_opt_in_sync() -> Result<()> {
     let version = sqlx::query!("PRAGMA user_version")
         .fetch_one(&support::pool(&store).await?)
         .await?;
-    assert_eq!(version.user_version, Some(14));
+    assert_eq!(version.user_version, Some(15));
     let peer = uuid::Uuid::new_v4();
     store.add_peer(peer, "test-host").await?;
     assert!(!store.peers_status().await?[0].auto_sync);

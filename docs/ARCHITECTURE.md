@@ -463,3 +463,22 @@ kind, hook event, inbox activity, recovery evidence and delivery outcomes are
 typed enums. Delivery outcomes carry optional error detail separately. Unknown
 Herdr statuses are conservatively unavailable. Task input rejects unknown states
 and obsolete writable fields before committing any effects.
+
+## Durable agent lifecycle (schema 15, v0.7.0)
+
+Agent registration is versioned independently of runtime observations. The closed
+state vocabulary is `registered` / `retired`; history records registration, binding
+replacement and explicit lifecycle decisions. Compare-and-set updates require a
+reason, and persisted decision results make identical retries idempotent.
+
+Retirement and obligation creation serialize through SQLite transactions. Retirement
+rejects open owned/written tasks, open remote assignment snapshots and pending mail
+in either direction. Retired agents cannot authenticate, launch, receive assignments
+or new mail. Restore invalidates the previous binding generation, rotates standalone
+credentials and preserves the current explicit delivery preference. Existing records
+remain durable. The runtime continues to own activity and readiness observations.
+
+Multiple fleet groups share one store and delivery service. Enrolling another group
+uses normal shared schema access; schema upgrades alone require exclusive access.
+State selection remains explicit/plugin/saved/default precedence, and status exposes
+the resolved path. The tool does not silently merge stores or select another fleet.
