@@ -8,7 +8,7 @@ description: >-
 
 Use the skill bundled with the running binary: `agent-mail --skill`. Startup and
 recovery hooks supply it automatically; do not reload instructions already in
-context. This guide matches 0.10; use the installed binary's guide for older versions.
+context. This guide matches 0.11; use the installed binary's guide for older versions.
 Use `agent-mail COMMAND --help` for syntax. Task/mail/agent operations return JSON;
 `status` is a readable summary, `status --json` returns structured data, and
 `status --check NAME` returns detailed diagnostics. `run` preserves the child interface.
