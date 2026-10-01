@@ -320,7 +320,7 @@ struct PolicyChanges {
     /// Keep diagnostics without dispatching follow-ups.
     #[arg(long)]
     observe: bool,
-    /// Recovery reminder interval, e.g. 15m. Turn events are checked immediately.
+    /// Reminder interval for persisted task deadlines, e.g. 15m.
     #[arg(long, value_parser = parse_duration)]
     interval: Option<i64>,
     /// Maximum unattended time, at least four intervals, e.g. 1h.

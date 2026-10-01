@@ -80,3 +80,6 @@ Validation on this change: `cargo fmt --all --check`,
 `RUSTC_WRAPPER= cargo clippy --locked --all-targets --all-features -- -D warnings`,
 and `RUSTC_WRAPPER= cargo test --locked --all-features` passed on macOS. The full
 suite retains one previously ignored test.
+
+Live Codex acceptance subsequently passed, including restart, preserved approval
+holds, and actual coordinator receipt. See [Live acceptance](MINIMAL_CONTINUATION_LIVE_ACCEPTANCE.md).

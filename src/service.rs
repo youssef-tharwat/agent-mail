@@ -37,7 +37,7 @@ fn deadline_delay(deadline: Option<i64>, wall_time: Duration) -> Duration {
         })
 }
 
-/// Exclusive ownership of one installation’s delivery worker.
+/// Exclusive ownership of a delivery worker or one participant’s wake channel.
 #[derive(Debug)]
 pub struct WorkerLock(File);
 
