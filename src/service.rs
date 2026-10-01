@@ -66,6 +66,23 @@ impl Drop for WorkerLock {
     }
 }
 
+/// Serialize external wakes for one participant, including verification wakes.
+/// The OS releases this lock on cancellation, timeout, or process exit.
+pub(crate) fn wake_lock(root: &Path, recipient: i64) -> Result<Option<WorkerLock>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(root.join(format!("wake-{recipient}.lock")))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(WorkerLock(file))),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Check whether an existing worker lock is currently held.
 pub fn running(root: &Path) -> bool {
     let Ok(file) = OpenOptions::new()
@@ -219,6 +236,9 @@ async fn wake(
     binding: &crate::store::Mailbox,
     time: i64,
 ) -> Result<DeliveryState> {
+    let Some(_wake_lock) = wake_lock(store.root(), binding.id)? else {
+        return Ok(DeliveryState::Ineligible);
+    };
     let Some(target) = binding.binding.herdr() else {
         return Ok(DeliveryState::Unavailable);
     };
@@ -386,12 +406,8 @@ pub async fn run(store: &Store, once: bool) -> Result<()> {
     let mut relay_jobs = JoinSet::<Result<Vec<Value>>>::new();
     let mut relay_report = Vec::new();
     let mut verification_jobs = JoinSet::new();
-    let mut lifecycle = crate::lifecycle::Monitors::default();
     loop {
         let time = now()?;
-        if !once {
-            lifecycle.refresh(store).await?;
-        }
         while verification_jobs.try_join_next().is_some() {}
         if verification_jobs.is_empty() {
             let state = store.clone();

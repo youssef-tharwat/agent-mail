@@ -231,7 +231,7 @@ async fn lost_receipts_use_durable_bounded_retries_and_pause_is_respected() -> R
     service::tick(&store, 2000).await?;
     assert_eq!(server.received.load(Ordering::SeqCst), 4);
     assert!(store.notifications(&actor, 0).await?.is_empty());
-    // A new revision bypasses an older uncertain attempt's cooldown.
+    // A new revision preserves an older uncertain attempt's cooldown.
     server.lose.store(true, Ordering::SeqCst);
     store
         .update_work(
@@ -269,6 +269,8 @@ async fn lost_receipts_use_durable_bounded_retries_and_pause_is_respected() -> R
         .await?;
     server.lose.store(false, Ordering::SeqCst);
     service::tick(&store, 2002).await?;
+    assert_eq!(server.received.load(Ordering::SeqCst), 5);
+    service::tick(&store, 2301).await?;
     assert_eq!(server.received.load(Ordering::SeqCst), 6);
     store.set_runtime_enabled(&actor, false).await?;
     service::tick(&store, 2400).await?;
@@ -432,5 +434,198 @@ async fn discovery_never_guesses_between_loaded_threads() -> Result<()> {
         *server.loaded.lock().unwrap() = result;
         assert_eq!(agent_mail::codex::sole_loaded_thread(&socket).await?, None);
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn partial_progress_resumes_after_turn_end_and_worker_restart_without_new_messages()
+-> Result<()> {
+    use agent_mail::{
+        followup::{Checkpoint, Source},
+        states::TaskState,
+    };
+    use std::{process::Stdio, time::Duration};
+    let dir = tempfile::Builder::new()
+        .prefix("am-continue-")
+        .tempdir_in("/tmp")?;
+    let socket = dir.path().join("codex.sock");
+    let thread = Uuid::new_v4();
+    let server = server(UnixListener::bind(&socket)?, thread);
+    let store = Store::open(dir.path(), true).await?;
+    store.enroll("g", None).await?;
+    store.register("g", "coordinator", false).await?;
+    store.register("g", "worker", false).await?;
+    let writer = store.mailbox("g", "coordinator").await?;
+    let actor = store.mailbox("g", "worker").await?;
+    store.attach_codex(&actor, &socket, thread).await?;
+    let time = agent_mail::now()?;
+    store
+        .work_create(
+            &writer,
+            WorkDraft {
+                id: "partial".into(),
+                scope: "Finish remaining work".into(),
+                owner: "worker".into(),
+                state: TaskState::Active,
+                next_action: "Inspect evidence".into(),
+                deadline: None,
+                evidence: vec![],
+            },
+            time,
+        )
+        .await?;
+    service::tick(&store, time).await?;
+    assert_eq!(server.received.load(Ordering::SeqCst), 1);
+    server.active.store(true, Ordering::SeqCst);
+    store
+        .checkpoint(
+            &actor,
+            Source::Task {
+                id: "partial".into(),
+                version: 1,
+            },
+            "progress",
+            Checkpoint {
+                version: 0,
+                next_step: "Finish remaining work".into(),
+                next_check_at: time + 2,
+                waiting: None,
+                evidence: vec![],
+                extend_until: None,
+                reason: None,
+            },
+            time,
+        )
+        .await?;
+    store
+        .hook(
+            &actor,
+            serde_json::from_value(
+                json!({"hook_event_name":"Stop","session_id":thread.to_string()}),
+            )?,
+            time,
+        )
+        .await?;
+    server.active.store(false, Ordering::SeqCst);
+    store.close().await;
+    // A fresh worker process recovers the deadline; no incoming message or completion subscription.
+    let mut worker = tokio::process::Command::new(env!("CARGO_BIN_EXE_agent-mail"))
+        .arg("--state-dir")
+        .arg(dir.path())
+        .args(["service", "run"])
+        .env_remove("AGENT_MAIL_SESSION")
+        .env_remove("AGENT_MAIL_GROUP")
+        .env_remove("HERDR_ENV")
+        .env_remove("HERDR_SOCKET_PATH")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()?;
+    let resumed = tokio::time::timeout(Duration::from_secs(7), async {
+        while server.received.load(Ordering::SeqCst) < 2 {
+            anyhow::ensure!(
+                worker.try_wait()?.is_none(),
+                "worker exited before continuation"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+    worker.kill().await?;
+    worker.wait().await?;
+    resumed??;
+    assert_eq!(server.received.load(Ordering::SeqCst), 2);
+    let recovered = Store::open(dir.path(), false).await?;
+    let task = recovered.work_show(&actor, "partial").await?;
+    assert_eq!((task.state, task.version), (TaskState::Active, 1));
+    assert!(
+        server.loaded.lock().unwrap()["challenge"]
+            .as_str()
+            .unwrap()
+            .contains("followups")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn duplicate_and_fresh_wakes_preserve_uncertainty_and_escalate_to_coordinator() -> Result<()>
+{
+    use agent_mail::states::TaskState;
+    let dir = tempfile::Builder::new()
+        .prefix("am-uncertain-")
+        .tempdir_in("/tmp")?;
+    let socket = dir.path().join("codex.sock");
+    let thread = Uuid::new_v4();
+    let server = server(UnixListener::bind(&socket)?, thread);
+    let store = Store::open(dir.path(), true).await?;
+    store.enroll("g", None).await?;
+    store.register("g", "coordinator", false).await?;
+    store.register("g", "worker", false).await?;
+    let writer = store.mailbox("g", "coordinator").await?;
+    let actor = store.mailbox("g", "worker").await?;
+    store.attach_codex(&actor, &socket, thread).await?;
+    for (id, time) in [("first", 1000), ("fresh", 1001)] {
+        store
+            .work_create(
+                &writer,
+                WorkDraft {
+                    id: id.into(),
+                    scope: "Review".into(),
+                    owner: "worker".into(),
+                    state: TaskState::Active,
+                    next_action: "Inspect evidence".into(),
+                    deadline: None,
+                    evidence: vec![],
+                },
+                time,
+            )
+            .await?;
+        if id == "first" {
+            server.lose.store(true, Ordering::SeqCst);
+            let (one, two) = tokio::join!(service::tick(&store, time), service::tick(&store, time));
+            let one = one?;
+            let two = two?;
+            assert!(
+                one.iter()
+                    .chain(&two)
+                    .any(|o| o.state == agent_mail::states::DeliveryState::Uncertain)
+            );
+            assert_eq!(server.received.load(Ordering::SeqCst), 1);
+        }
+    }
+    service::tick(&store, 1001).await?;
+    assert_eq!(
+        server.received.load(Ordering::SeqCst),
+        1,
+        "fresh work cannot bypass an ambiguous reservation"
+    );
+    assert_eq!(
+        store.native_status().await?[0]["delivery_unconfirmed"],
+        true
+    );
+    store.close().await;
+    let store = Store::open(dir.path(), false).await?;
+    assert_eq!(
+        store.native_status().await?[0]["delivery_unconfirmed"],
+        true
+    );
+    service::tick(&store, 1299).await?;
+    assert_eq!(server.received.load(Ordering::SeqCst), 1);
+    for time in [1300, 1600, 1900, 1901] {
+        service::tick(&store, time).await?;
+    }
+    // The fresh event starts a new bounded budget after the original reservation expires.
+    assert_eq!(server.received.load(Ordering::SeqCst), 4);
+    let escalations = store.attention_list(&writer, 0).await?;
+    assert_eq!(escalations["items"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        store.work_show(&actor, "first").await?.state,
+        TaskState::Active
+    );
+    assert_eq!(
+        store.work_show(&actor, "fresh").await?.state,
+        TaskState::Active
+    );
     Ok(())
 }
