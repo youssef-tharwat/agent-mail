@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "suite": "failure-acceptance-public-controls-v1",
+  "design_basis": {
+    "source_profile": "composition-r18",
+    "source_manifest_sha256": "e4cbd5d336ac583347781654bd6544433e66ae30b3bb8751b0908bc52303d4bd",
+    "source_archive_sha256": "9a7cee784ef18245a9a1edc6b41fe2716c4c77d09c95b769b2877a0656d31de5",
+    "meaning": "historical API/design basis only; executed source identity comes from the verified run envelope"
+  },
+  "accepted_design_sha256": "e6d81097e85659625023d4628180fa91ccb4b35eb578999b6be597c4ed475e07",
+  "publication_rider": {
+    "mail": 1158,
+    "protocol_sha256": "b1673d091dbc613b640b2a3bd9d14984c43b05046b7e22180d780311c7420b65",
+    "commit": "SQL destination selection and immutable receipt in one guarded transaction",
+    "artifact_storage": "sealed immutable protected objects, durable retention pins, no automatic GC",
+    "historical_replay": "receipt lookup confers no current authority; closure releases only original old slot",
+    "unknown_member": "one unknown member prevents complete effect-set closure"
+  },
+  "timing": {
+    "accepted_design_targets": {
+      "core_active_tasks": 20, "service_tick_seconds": 5, "full_pass_seconds": 10,
+      "runtime_rpc_seconds": 5, "continuation_due_seconds": 30, "segment_seconds": 60,
+      "consumer_attempts": 3, "consumer_lifetime_seconds": 240,
+      "progress_after_due_seconds": 15, "cause_after_hard_due_seconds": 10,
+      "operator_after_hard_due_seconds": 15, "large_inventory_records": 201,
+      "large_inventory_full_pass_seconds": 25,
+      "status": "preserved proposed targets; no elapsed-time acceptance measurement yet"
+    },
+    "mail1622_actual_controller_r4": {
+      "source_sha256": "8e99c11026d5b1c1394b8c463b3a6bd4e6cec22e58e9c72ba4150c2c910a9ea4",
+      "tick_seconds": 5, "transaction_timeout_seconds": 10,
+      "runtime_timeout_seconds": 15, "pass_timeout_seconds": 120,
+      "groups_per_pass": 1, "reconciliations_per_pass": 2, "offers_per_pass": 2,
+      "claim_candidates_per_offer": 20, "repair_union_maximum": 200,
+      "status": "actual source constants, no permission to widen accepted design windows"
+    },
+    "required_profile_measurements": [
+      "1 and5 groups with20 total active tasks", "201 records with all pages witnessed",
+      "0,2,20 held attempts and due reconciliations", "first20 claim candidates held with eligible later task",
+      "one failed endpoint and concurrent new arrivals", "slow storage and15s runtime timeouts",
+      "restart with persisted task/group/model-event/recovery cursors",
+      "backward and forward clock discontinuity during cleanup"
+    ],
+    "proposal_status": "root must approve a concrete measured profile before any changed time window"
+  },
+  "silence_contract": {
+    "start": "genuine persisted partial checkpoint",
+    "driver_forbidden": ["mail", "task mutation", "manual prompt", "retry", "acknowledgment", "context/task/inbox reads"],
+    "allowed": ["predeclared fault", "external process logs", "post-window consistent SQL snapshot"],
+    "healthy_requirement": "actual linked managed successor and final artifact; bounded hold alone does not pass healthy continuation"
+  },
+  "scenarios": [
+    {"id":"A01","name":"partial report then silence","checks":["model_dependency","recovery_restart"],"remaining":["genuine healthy segment/checkpoint/successor/final artifact","writer unavailable variant under standing policy","independent service and silence boundary"]},
+    {"id":"A02","name":"absent hooks and lost/duplicate hints","checks":["tracking_fair_repair"],"remaining":["instrumented hook absence","duplicate/reordered real hints","native charges and cause unchanged"]},
+    {"id":"A03","name":"service crash with independent supervision","checks":["recovery_restart"],"remaining":["kill real service after native checkpoint","independent supervisor remains live","held attempts survive without driver wake"]},
+    {"id":"A04","name":"twelve crash cuts","checks":["oracle_sensitivity"],"remaining":["owner-supported witnessed barriers at all12 cuts","uninstrumented final product rerun"]},
+    {"id":"A05","name":"disconnect and late runtime request","checks":[],"remaining":["real uncertain send response","delayed old request after eligibility","tombstone and actual admission refusal"]},
+    {"id":"A06","name":"claims aliases and unmanaged wake race","checks":["oracle_sensitivity"],"remaining":["three bounded real admission races","canonical shared endpoint arbitration","one slot and one aggregate charge"]},
+    {"id":"A07","name":"cancellation and historical cleanup","checks":["model_predicates","oracle_sensitivity"],"remaining":["before-exposure and after-admission cancellation","both SQL publication/cancellation orderings","late result and original-only closure after rebind"]},
+    {"id":"A08","name":"approval pause and revocation","checks":["authority_budget","publication_model_guards"],"remaining":["task/group pause and parent revocation on actual runtime","tool permission remains unanswered","authorized stop and escalation remain available"]},
+    {"id":"A09","name":"dependency predicates and required children","checks":["model_dependency","model_predicates"],"remaining":["optional revision mismatch variants","automatic actual worker start without consumer edit","negative predicate variants with runtime cleanup"]},
+    {"id":"A10","name":"same revision replacement races","checks":["model_dependency","publication_model_guards"],"remaining":["both replacement/admission orderings","both replacement/report and acceptance orderings","downstream accepted result returns to review with causal history"]},
+    {"id":"A11","name":"expired source correction without occurrence","checks":["source_correction"],"remaining":["explicit multi-recipient selector","missing-plan and observe-mode CLI variants","existing case versions and authority retirement"]},
+    {"id":"A12","name":"unavailable decision authority","checks":["recovery_restart"],"remaining":["live independent supervisor with unavailable coordinator","revoked/expired standing policy","R18 actual selector and bounded reopen episode"]},
+    {"id":"A13","name":"mixed typed blocking cycles","checks":["graph_opposite_edges"],"remaining":["mixed parent/continuation/action graph","WholeTask aliases and missing projection","bound overflow and independent nonblocking investigation"]},
+    {"id":"A14","name":"aggregate lifetime and cost budget","checks":["authority_budget","model_dependency"],"remaining":["three sibling claim races for parent allocation","child-first ancestor anchor","unknown native cost retained","reparent/rebind/reopen cannot reset spending"]},
+    {"id":"A15","name":"unknown effects and atomic publication","checks":["publication_model_guards","oracle_sensitivity"],"remaining":["real descendant containment and quiescence","complete sealed effect set","SQL selection/receipt crash recovery","changed-effect retry and retained/corrupt objects","historical receipt cannot release newer slot"]},
+    {"id":"A16","name":"fair pages and clock discontinuity","checks":["tracking_fair_repair"],"remaining":["201 records within accepted25s measured bound","failing endpoint with arrivals","backward/forward clock holds admission while cleanup continues","new measured scheduler profile if root approves"]},
+    {"id":"A17","name":"genuine verification starvation","checks":[],"remaining":["current native verification with unfinished retrieved task","busy beyond180s then idle","stale/wrong-session acknowledgment rejection","no retry reset or fabricated challenge response"]},
+    {"id":"A18","name":"operator transport failure and route repair","checks":["recovery_restart"],"remaining":["actual failing/missing/uncertain sink","immutable in-flight batch with newer facts","route repair audit and notice budget preservation"]},
+    {"id":"A19","name":"migration legacy and remote compatibility","checks":["public_cli","tracking_fair_repair","managed_capability_read"],"remaining":["full old migration chains","observe/paused policy preservation","old binary refuses newer schema","read-only open and contracted remote refusal"]},
+    {"id":"A20","name":"progress strategy and product views","checks":["public_cli","authority_budget"],"remaining":["two real closed segments without progress","report replay and healthy long segment","actual ContinueStrategy staged transaction and closed decision attempt","action-scoped independence","final help/status/config and optional digest behavior"]}
+  ],
+  "crash_cuts": [
+    {"id":"C01","cut":"before claim commit","verdict":"capability_gap","need":"owner witnessed transaction barrier"},
+    {"id":"C02","cut":"atomic claim/exposure committed before adapter preparation","original":"claim committed before exposure","original_disposition":"unreachable/not_run in R18","ruling":1912,"verdict":"capability_gap","need":"exact owner barrier and real post-commit/pre-preparation witness"},
+    {"id":"C03","cut":"exposed before send","verdict":"capability_gap","need":"real adapter send barrier"},
+    {"id":"C04","cut":"admitted before receipt","verdict":"capability_gap","need":"actual admission with lost receipt"},
+    {"id":"C05","cut":"containment created before gate release","verdict":"capability_gap","need":"native protected start gate"},
+    {"id":"C06","cut":"native start before observation persistence","verdict":"capability_gap","need":"independent native start witness"},
+    {"id":"C07","cut":"Store::checkpoint committed before stream::hint; future combined managed-Yield commit/hint","original":"checkpoint committed before hook","ruling":1912,"verdict":"capability_gap","need":"real owner operation and barrier; native completion-hook evidence stays separate"},
+    {"id":"C08","cut":"authorized task_candidate immutable commit before stream::hint","ruling":1912,"verdict":"capability_gap","need":"actual writer/reviewer candidate and Accept inputs; raw report is insufficient"},
+    {"id":"C09","cut":"before SQL selection and receipt commit","original":"publication intent before pointer swap","rider":1158,"verdict":"capability_gap","need":"owner transaction barrier after sealed immutable artifact"},
+    {"id":"C10","cut":"SQL selection and receipt committed before response","original":"pointer swap before receipt","rider":1158,"verdict":"capability_gap","need":"lost post-commit response; historical exact replay"},
+    {"id":"C11","cut":"quiescent before closure commit","verdict":"capability_gap","need":"real sealed effect set and containment proof"},
+    {"id":"C12","cut":"closure/charges/exact-slot/due/receipt committed before actual return","original":"closure and successor schedule committed before acknowledgment","ruling":1912,"verdict":"capability_gap","need":"authentic closure boundary and replay; successor claim is a later transaction"}
+  ],
+  "native_rows": [
+    {"id":"N01","runtime":"managed native Codex","scenarios":["A01","A02","A03","A05","A08"],"verdict":"environment_blocked","need":"named root allocation, actual runtime bootstrap and genuine credential"},
+    {"id":"N02","runtime":"managed native Claude","scenarios":["A01","A02","A03","A05","A08"],"verdict":"environment_blocked","need":"named root allocation, actual runtime bootstrap and genuine credential"},
+    {"id":"N03","runtime":"managed native client hosted in Herdr","scenarios":["A01","A07"],"verdict":"environment_blocked","need":"allocated real managed target and Herdr presentation identity"},
+    {"id":"N04","runtime":"direct Herdr Codex","scenarios":["A01 bounded accounting variant","A17"],"verdict":"environment_blocked","need":"allocated native direct session and actual current challenge response"},
+    {"id":"N05","runtime":"direct Herdr Claude","scenarios":["A01 bounded accounting variant","A17"],"verdict":"environment_blocked","need":"allocated native direct session and actual current challenge response"}
+  ],
+  "baseline_status": "not_run; new APIs require honest capability comparison; preserved owner baseline regressions are separate evidence",
+  "separate_identity_gate": "supported same original native-session recovery witness from identity owner",
+  "final_gate": "all20 complete scenario verdicts, all12 real cuts, all5 native rows, exact final reviewed source and retained original failures"
+}

@@ -29,14 +29,30 @@
 
 /// Versioned agent registration lifecycle.
 pub mod agents;
+pub mod decision_recovery;
+pub mod decision_supervisor;
+pub mod execution;
+mod execution_driver;
 pub mod herdr;
 pub mod identity;
+pub mod managed_runtime;
+pub mod operator_notices;
+pub mod progress;
 pub mod relay;
+pub mod runtime_adapter;
+/// Protected original capture custody and physical recovery.
+pub mod runtime_capture;
+pub mod runtime_effects;
+/// Authenticated target lifecycle, original artifact bindings and atomic native Yield.
+pub mod runtime_lifecycle;
 pub mod service;
 /// Group-scoped diagnostics and explicit installation overview.
 pub mod status;
 pub mod store;
 pub mod supervision;
+mod supervisor_failures;
+/// Finite local task contracts, immutable inputs and guarded dependency graphs.
+pub mod task_graph;
 /// End-to-end delivery verification, separate from business decisions.
 pub mod verification;
 pub mod work;

@@ -227,7 +227,7 @@ fn validate_evidence(evidence: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn validate_fields(item: &WorkItem) -> Result<()> {
+pub(crate) fn validate_fields(item: &WorkItem) -> Result<()> {
     name(&item.id)?;
     name(&item.owner)?;
     name(&item.writer)?;
@@ -249,12 +249,62 @@ fn validate_fields(item: &WorkItem) -> Result<()> {
 }
 
 impl Store {
+    pub(crate) async fn work_load_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        group: &str,
+        id: &str,
+    ) -> Result<WorkItem> {
+        let row = sqlx::query_as!(WorkRow,
+            "SELECT group_name,id,scope,owner,writer,state AS 'state: TaskState',next_action,deadline,accepted_revision,evidence,version,updated FROM work_items WHERE group_name=? AND id=?",
+            group, id)
+            .fetch_optional(&mut **tx).await?.context("local work item not found")?;
+        row.try_into()
+    }
+
+    pub(crate) async fn work_write_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        before: &WorkItem,
+        item: &WorkItem,
+        actor: &str,
+        reason: &str,
+    ) -> Result<()> {
+        validate_fields(item)?;
+        let evidence = serde_json::to_string(&item.evidence)?;
+        let snapshot = serde_json::to_string(item)?;
+        let state = item.state.as_str();
+        let open = item.state.is_open();
+        let result = sqlx::query!("UPDATE work_items SET scope=?,owner=?,state=?,open=?,next_action=?,deadline=?,accepted_revision=?,evidence=?,version=?,updated=? WHERE group_name=? AND id=? AND version=?",
+            item.scope, item.owner, state, open, item.next_action, item.deadline,
+            item.accepted_revision, evidence, item.version, item.updated, item.group_name, item.id,
+            before.version).execute(&mut **tx).await?;
+        ensure!(result.rows_affected() == 1, "task_version_conflict");
+        sqlx::query!("INSERT INTO work_changes(group_name,work_id,version,actor,reason,snapshot,changed) VALUES (?,?,?,?,?,?,?)",
+            item.group_name, item.id, item.version, actor, reason, snapshot, item.updated)
+            .execute(&mut **tx).await?;
+        relay::enqueue_snapshot(tx, item, Some(&before.owner), item.updated).await?;
+        Ok(())
+    }
+
     /// Create a versioned work record and notify its owner atomically.
     ///
     /// # Errors
     /// The actor or fields are invalid, this is not the home machine, the owner is missing, or persistence fails.
     pub async fn work_create(
         &self,
+        actor: &Mailbox,
+        draft: WorkDraft,
+        now: i64,
+    ) -> Result<WorkItem> {
+        let mut tx = self.pool().begin().await?;
+        Self::lock_actor(&mut tx, actor).await?;
+        let item = Self::work_create_tx(&mut tx, actor, draft, now).await?;
+        tx.commit().await?;
+        crate::stream::hint(self.root()).await;
+        Ok(item)
+    }
+
+    pub(crate) async fn work_create_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         actor: &Mailbox,
         draft: WorkDraft,
         now: i64,
@@ -279,17 +329,15 @@ impl Store {
         validate_fields(&item)?;
         let evidence = serde_json::to_string(&item.evidence)?;
         let snapshot = serde_json::to_string(&item)?;
-        let mut tx = self.pool().begin().await?;
-        Self::lock_actor(&mut tx, actor).await?;
         let home = sqlx::query!(
             "SELECT home_machine FROM groups WHERE name=?",
             actor.group_name
         )
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?
         .home_machine;
         let local = sqlx::query!("SELECT id FROM node LIMIT 1")
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?
             .id;
         ensure!(
@@ -301,7 +349,7 @@ impl Store {
             actor.group_name,
             item.id
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?
         {
             ensure!(
@@ -316,7 +364,7 @@ impl Store {
                 actor.group_name,
                 item.id
             )
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?
             .is_none(),
             "work ID already exists without creation provenance; inspect it with work show"
@@ -327,7 +375,7 @@ impl Store {
                 item.group_name,
                 item.owner
             )
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?
             .is_some(),
             "work owner is not bound in this group"
@@ -337,14 +385,12 @@ impl Store {
         sqlx::query!("INSERT INTO work_items(group_name,id,scope,owner,writer,state,open,next_action,deadline,accepted_revision,evidence,version,updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             item.group_name, item.id, item.scope, item.owner, item.writer, state,
             open, item.next_action, item.deadline, item.accepted_revision, evidence,
-            item.version, item.updated).execute(&mut *tx).await?;
+            item.version, item.updated).execute(&mut **tx).await?;
         sqlx::query!("INSERT INTO work_changes(group_name,work_id,version,actor,reason,snapshot,changed) VALUES (?,?,?,?,?,?,?)",
             item.group_name, item.id, item.version, actor.name, "created", snapshot, now)
-            .execute(&mut *tx).await?;
-        sqlx::query!("INSERT INTO work_creations(group_name,work_id,actor,canonical,result) VALUES(?,?,?,?,?)",actor.group_name,item.id,actor.id,canonical,snapshot).execute(&mut *tx).await?;
-        relay::enqueue_snapshot(&mut tx, &item, None, now).await?;
-        tx.commit().await?;
-        crate::stream::hint(self.root()).await;
+            .execute(&mut **tx).await?;
+        sqlx::query!("INSERT INTO work_creations(group_name,work_id,actor,canonical,result) VALUES(?,?,?,?,?)",actor.group_name,item.id,actor.id,canonical,snapshot).execute(&mut **tx).await?;
+        relay::enqueue_snapshot(tx, &item, None, now).await?;
         Ok(item)
     }
 
@@ -508,6 +554,7 @@ impl Store {
             actor.group_name, id)
             .fetch_optional(&mut *tx).await?.context("work item not found in this group")?;
         let mut item: WorkItem = row.try_into()?;
+        let previous = item.clone();
         let previous_owner = item.owner.clone();
         ensure!(
             item.writer == actor.name,
@@ -530,6 +577,9 @@ impl Store {
             }
         }
 
+        // Historical legacy retries above retain their original receipt. Fresh
+        // mutations cannot bypass the contract through the legacy wire shape.
+        crate::task_graph::guard_legacy_update_tx(&mut tx, &actor.group_name, id).await?;
         ensure!(
             item.version == expected,
             "work version conflict; read current record before retrying"
@@ -552,6 +602,27 @@ impl Store {
         if let Some(evidence) = patch.evidence {
             item.evidence = evidence;
         }
+        // An audit-only legacy revision still consumes writer CAS and records
+        // its reason, but it must not erase attention to unchanged input. The
+        // contracted-task guard above prevents this path from ignoring model
+        // contract/authority changes that are not represented in WorkItem.
+        let unchanged = item.scope == previous.scope
+            && item.owner == previous.owner
+            && item.writer == previous.writer
+            && item.state == previous.state
+            && item.next_action == previous.next_action
+            && item.deadline == previous.deadline
+            && item.accepted_revision == previous.accepted_revision
+            && item.evidence == previous.evidence;
+        let retained = if unchanged {
+            sqlx::query_as::<_, RetainedLegacyAttention>(
+                "SELECT id,version,checkpoint,stage,retrieved_at,retrieved_binding,dependency_ready_at,next_check,scanned FROM followups WHERE group_name=? AND task=? AND task_version=?",
+            )
+            .bind(&actor.group_name).bind(id).bind(expected)
+            .fetch_optional(&mut *tx).await?
+        } else {
+            None
+        };
         item.version = item
             .version
             .checked_add(1)
@@ -581,6 +652,27 @@ impl Store {
             result.rows_affected() == 1,
             "work version conflict; read current record before retrying"
         );
+        if let Some(retained) = retained {
+            // The version trigger has rebased the source reference. Restore
+            // only the original unchanged-input attention metadata, under the
+            // same write reservation; its opening and hard boundary stay intact.
+            let rebased = sqlx::query("UPDATE followups SET version=?,checkpoint=?,stage=?,retrieved_at=?,retrieved_binding=?,dependency_ready_at=?,next_check=?,scanned=? WHERE id=? AND task_version=? AND version=?")
+                .bind(retained.version).bind(retained.checkpoint).bind(retained.stage)
+                .bind(retained.retrieved_at).bind(retained.retrieved_binding).bind(retained.dependency_ready_at)
+                .bind(retained.next_check).bind(retained.scanned).bind(retained.id).bind(item.version)
+                .bind(retained.version.checked_add(1).context("followup version overflow")?)
+                .execute(&mut *tx).await?;
+            ensure!(
+                rebased.rows_affected() == 1,
+                "unchanged work attention conflict"
+            );
+        }
+        if unchanged {
+            // Keep the durable revision/audit event without a fresh execution
+            // wake for identical business input. Changed inputs use the trigger.
+            sqlx::query("UPDATE coordination_events SET wake=0 WHERE kind='work_changed' AND subject=? AND version=? AND recipient IN (SELECT id FROM mailboxes WHERE group_name=?)")
+                .bind(id).bind(item.version).bind(&actor.group_name).execute(&mut *tx).await?;
+        }
         sqlx::query!("INSERT INTO work_changes(group_name,work_id,version,actor,reason,snapshot,changed) VALUES (?,?,?,?,?,?,?)",
             item.group_name, item.id, item.version, actor.name, reason, snapshot, now)
             .execute(&mut *tx).await?;
@@ -645,4 +737,17 @@ impl Store {
             })
             .collect()
     }
+}
+
+#[derive(sqlx::FromRow)]
+struct RetainedLegacyAttention {
+    id: i64,
+    version: i64,
+    checkpoint: Option<String>,
+    stage: i64,
+    retrieved_at: Option<i64>,
+    retrieved_binding: Option<i64>,
+    dependency_ready_at: Option<i64>,
+    next_check: i64,
+    scanned: i64,
 }

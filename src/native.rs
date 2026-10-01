@@ -406,10 +406,13 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
         .execute(&mut *tx)
         .await?;
     }
-    tx.commit().await?;
     if reserved == 0 {
+        tx.commit().await?;
         return Ok(DeliveryState::Ineligible);
     }
+    let route_key = Store::delivery_route_key_tx(&mut tx, actor)
+        .await?
+        .context("notification route unavailable")?;
     let immutable = !inbox && kind == NativeRuntime::Codex && !active;
     let prior = if immutable {
         store
@@ -419,24 +422,13 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
         None
     };
     let (text, challenge) = if let Some(snapshot) = prior {
+        // Exact transport retry retains its first immutable payload and nonce.
         (snapshot.text, snapshot.nonce)
     } else {
-        let challenge = match store.reserve_delivery_challenge(actor, time).await {
-            Ok(challenge) => challenge,
-            Err(error) => {
-                eprintln!(
-                    "agent-mail: could not attach delivery check to {}/{} notification: {error:#}",
-                    actor.group_name, actor.name
-                );
-                None
-            }
-        };
-        let delivery = store
-            .delivery(actor, challenge.as_deref(), endpoint.scanned)
-            .await?;
+        let challenge = Store::reserve_delivery_challenge_tx(&mut tx, actor, time).await?;
+        let delivery =
+            Store::delivery_tx(&mut tx, actor, challenge.as_deref(), endpoint.scanned).await?;
         if immutable {
-            let mut tx = store.pool().begin().await?;
-            Store::lock_actor(&mut tx, actor).await?;
             let snapshot = crate::turns::reserve_native_tx(
                 &mut tx,
                 actor,
@@ -447,32 +439,42 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
                 time,
             )
             .await?;
-            tx.commit().await?;
             (snapshot.text, snapshot.nonce)
         } else {
             (delivery.text, challenge)
         }
     };
+    // Wake reservation, first challenge and first snapshot commit together before I/O.
+    tx.commit().await?;
     // Hold the binding lock during the bounded send: replacement/detachment cannot race it.
     let mut tx = store.pool().begin().await?;
     Store::lock_actor(&mut tx, actor).await?;
     let still_attached = sqlx::query!("SELECT recipient FROM runtime_wakes WHERE recipient=? AND binding_version=? AND socket=? AND thread=? AND EXISTS(SELECT 1 FROM groups WHERE name=? AND paused=0) AND NOT EXISTS(SELECT 1 FROM coordination_events WHERE recipient=? AND id>?)",actor.id,actor.binding_version,endpoint.socket,endpoint.thread,actor.group_name,actor.id,latest).fetch_optional(&mut *tx).await?.is_some();
     ensure!(still_attached, "Runtime endpoint changed before delivery");
+    ensure!(
+        Store::delivery_route_key_tx(&mut tx, actor)
+            .await?
+            .as_deref()
+            == Some(route_key.as_str()),
+        "Runtime route changed before delivery"
+    );
     if let Peer::ClaudeInbox { socket, endpoint } = &peer {
         crate::claude_inbox::verify(store, socket, endpoint)?;
     }
     peer.send(thread, text, active, message_id).await?;
+    ensure!(
+        Store::delivery_route_key_tx(&mut tx, actor)
+            .await?
+            .as_deref()
+            == Some(route_key.as_str()),
+        "Runtime route changed after delivery"
+    );
     if let Some(nonce) = challenge.as_deref() {
-        sqlx::query!(
-            "UPDATE delivery_probes SET transport_accepted_at=COALESCE(transport_accepted_at,?),healthy_at=?,failed=0 WHERE recipient=? AND binding_version=? AND nonce=?",
-            time,
-            time,
-            actor.id,
-            actor.binding_version,
-            nonce
-        )
-        .execute(&mut *tx)
-        .await?;
+        // A historical immutable retry may carry its original already-expired nonce.
+        // Delivery remains valid, but it cannot refresh verification or create a new challenge.
+        if Store::probe_current(&mut tx, actor, nonce, time).await? {
+            Store::record_delivery_challenge_tx(&mut tx, actor, nonce, time).await?;
+        }
     }
     if inbox {
         tx.commit().await?;
@@ -543,7 +545,7 @@ pub(crate) async fn send_verification(
         nonce.into(),
     )
     .await?;
-    sqlx::query!("UPDATE delivery_probes SET transport_accepted_at=COALESCE(transport_accepted_at,?),healthy_at=?,failed=0 WHERE recipient=? AND binding_version=? AND nonce=?",time,time,actor.id,actor.binding_version,nonce).execute(&mut *tx).await?;
+    Store::record_delivery_challenge_tx(&mut tx, actor, nonce, time).await?;
     tx.commit().await?;
     Ok(())
 }

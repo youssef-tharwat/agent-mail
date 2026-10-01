@@ -159,6 +159,7 @@ fn standalone_mail_work_and_session_replacement() -> Result<()> {
             "worker",
             "--next-action",
             "Review abc123",
+            "--untracked",
         ],
     )?;
     let sent = d.ok(
@@ -288,7 +289,15 @@ fn natural_retries_and_short_replies_preserve_one_logical_change() -> Result<()>
     d.ok(None, &["init", "project"])?;
     let writer = d.register("writer")?;
     let worker = d.register("worker")?;
-    let create = ["task", "create", "api", "Review API", "--owner", "worker"];
+    let create = [
+        "task",
+        "create",
+        "api",
+        "Review API",
+        "--owner",
+        "worker",
+        "--untracked",
+    ];
     let first = d.ok(Some(&writer), &create)?;
     assert_eq!(first["next_action"], "Review API");
     assert_eq!(first, d.ok(Some(&writer), &create)?);

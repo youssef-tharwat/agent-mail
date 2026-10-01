@@ -45,7 +45,7 @@ async fn existing_version_four_state_upgrades_to_opt_in_sync() -> Result<()> {
     let version = sqlx::query!("PRAGMA user_version")
         .fetch_one(&support::pool(&store).await?)
         .await?;
-    assert_eq!(version.user_version, Some(20));
+    assert_eq!(version.user_version, Some(32));
     let peer = uuid::Uuid::new_v4();
     store.add_peer(peer, "test-host").await?;
     assert!(!store.peers_status().await?[0].auto_sync);
@@ -384,7 +384,7 @@ async fn version_sixteen_upgrades_without_changing_business_or_legacy_budgets() 
             .fetch_one(&pool)
             .await?
             .user_version,
-        Some(20)
+        Some(32)
     );
     Ok(())
 }
@@ -503,7 +503,7 @@ async fn version_eighteen_preserves_saved_policies_and_all_existing_records() ->
         sqlx::query_scalar::<_, i64>("PRAGMA user_version")
             .fetch_one(&pool)
             .await?,
-        20
+        32
     );
     assert!(
         sqlx::query("PRAGMA foreign_key_check")
@@ -556,7 +556,7 @@ async fn automatic_open_never_initializes_missing_state_or_downgrades() -> Resul
     let pool = SqlitePoolOptions::new()
         .connect_with(SqliteConnectOptions::new().filename(root.join("mail.db")))
         .await?;
-    sqlx::query!("PRAGMA user_version=21")
+    sqlx::query!("PRAGMA user_version=33")
         .execute(&pool)
         .await?;
     pool.close().await;

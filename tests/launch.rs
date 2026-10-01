@@ -48,6 +48,7 @@ impl Demo {
                 "Review API",
                 "--owner",
                 owner,
+                "--untracked",
             ])?;
         }
         Ok(d)
@@ -301,6 +302,7 @@ fn committed_mutations_report_unavailable_recipients_without_duplicate_writes() 
         "Review",
         "--owner",
         "alice",
+        "--untracked",
     ])?;
     assert!(
         task["delivery"]

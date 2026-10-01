@@ -303,6 +303,8 @@ impl Store {
 }
 
 impl Store {
+    // Transaction-owning fixture helper; production composes delivery_tx atomically.
+    #[cfg(test)]
     pub(crate) async fn delivery(
         &self,
         actor: &Mailbox,

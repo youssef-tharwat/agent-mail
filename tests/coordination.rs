@@ -93,6 +93,7 @@ impl Demo {
                 "worker",
                 "--next-action",
                 "Inspect revision",
+                "--untracked",
             ],
             None,
             false,

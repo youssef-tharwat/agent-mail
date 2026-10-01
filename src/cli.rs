@@ -10,6 +10,11 @@ use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use std::{io::Write, path::PathBuf};
 use uuid::Uuid;
 
+pub(crate) mod decisions;
+pub(crate) mod execution;
+pub(crate) mod progress;
+pub(crate) mod task_contract;
+
 #[derive(Parser)]
 #[command(
     version,
@@ -41,6 +46,18 @@ pub(super) struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
+    #[command(name = "__managed-worker-v1", hide = true)]
+    ManagedWorker {
+        /// Exact existing private state root; never inferred from environment or a locator.
+        #[arg(long)]
+        root: PathBuf,
+    },
+    #[command(name = "__managed-contained-v1", hide = true)]
+    ManagedContainedWorker {
+        /// Exact existing private state root supplied by the original custodian.
+        #[arg(long)]
+        root: PathBuf,
+    },
     /// Create or verify a local coordination group. Never starts an agent.
     Init {
         /// Explicit group name to initialize.
@@ -70,9 +87,12 @@ enum Action {
     /// Send, read and resolve durable requests.
     #[command(subcommand)]
     Mail(Mail),
+    /// Inspect cases and configure finite original-source decision policies.
+    #[command(subcommand)]
+    Decision(decisions::Decision),
     /// Create, inspect and update versioned assignments.
     #[command(subcommand)]
-    Task(Task),
+    Task(Box<Task>),
     /// Inspect scheduled attention and configure follow-through.
     #[command(subcommand)]
     Attention(Attention),
@@ -86,7 +106,7 @@ enum Action {
         #[arg(required = true, last = true, num_args = 1..)]
         command: Vec<std::ffi::OsString>,
     },
-    /// Configure recovery and automatic delivery (operator).
+    /// Inspect managed capabilities and configure targets, artifacts or delivery.
     #[command(subcommand)]
     Runtime(Runtime),
     /// Run or supervise the local delivery worker (operator).
@@ -103,6 +123,13 @@ enum Action {
         /// Probe setup, optionally for a named agent; never repairs or prompts.
         #[arg(long,num_args=0..=1,default_missing_value="")]
         check: Option<String>,
+        /// Include this authenticated agent's bounded task/cleanup page.
+        #[arg(long,conflicts_with_all=["check","all_groups"])]
+        tasks: bool,
+        #[arg(long, requires = "tasks")]
+        after: Option<String>,
+        #[arg(long,requires="tasks",value_parser=clap::value_parser!(u32).range(1..=50))]
+        limit: Option<u32>,
     },
     #[command(subcommand, hide = true)]
     Remote(Remote),
@@ -111,13 +138,15 @@ enum Action {
 }
 #[derive(Subcommand)]
 enum Mail {
+    #[command(subcommand)]
+    Followup(decisions::MailFollowup),
     /// Record a next step or waiting condition without resolving work.
     Checkpoint {
         id: i64,
         #[arg(long)]
         key: String,
-        #[arg(long)]
-        file: PathBuf,
+        #[command(flatten)]
+        report: progress::CheckpointArgs,
     },
 
     /// Send a new request. Reuse the key only for an identical retry.
@@ -177,6 +206,35 @@ enum Mail {
 }
 #[derive(Subcommand)]
 enum Task {
+    #[command(subcommand)]
+    Execution(execution::Execution),
+    #[command(subcommand)]
+    Followup(decisions::TaskFollowup),
+    #[command(subcommand)]
+    Progress(progress::Progress),
+    /// Inspect contracted task and execution holds without changing them.
+    Inspect { id: String },
+    /// Explicitly adopt legacy work with a finite contract.
+    Adopt(task_contract::Adopt),
+    /// Apply one atomic contracted decision, including outcome/correction.
+    #[command(alias = "outcome")]
+    Decide(task_contract::Decide),
+    /// Capture inputs before producing a candidate; stdout can be saved verbatim.
+    Inputs {
+        id: String,
+        #[arg(long)]
+        version: i64,
+        #[arg(long, value_enum, default_value = "execute")]
+        phase: task_contract::Phase,
+    },
+    /// Submit immutable output with the input snapshot used to produce it.
+    Candidate(task_contract::Candidate),
+    /// Read immutable candidates and outcomes, including withdrawn history.
+    Results {
+        id: String,
+        #[arg(long)]
+        after: Option<i64>,
+    },
     /// Report progress for the observed task revision without changing task state.
     Checkpoint {
         id: String,
@@ -184,8 +242,8 @@ enum Task {
         version: i64,
         #[arg(long)]
         key: String,
-        #[arg(long)]
-        file: PathBuf,
+        #[command(flatten)]
+        report: progress::CheckpointArgs,
     },
     /// Assign a task. Identical creation retries return the original result.
     Create {
@@ -207,13 +265,20 @@ enum Task {
         /// Evidence references, repeated as needed.
         #[arg(long)]
         evidence: Vec<String>,
+        #[command(flatten)]
+        contract: task_contract::CreateFlags,
     },
     /// Read the current task, including version and linked messages.
     Show { id: String },
-    /// List open tasks owned or maintained by this agent.
+    /// List open tasks, or inspect a bounded all-state tracking page with --details.
     List {
         #[arg(long, default_value = "")]
         after: String,
+        /// Authenticated home-task model/execution views; includes terminal cleanup.
+        #[arg(long)]
+        details: bool,
+        #[arg(long,requires="details",value_parser=clap::value_parser!(u32).range(1..=50))]
+        limit: Option<u32>,
     },
     /// Apply one authorized change and optionally resolve a linked request.
     Update {
@@ -234,8 +299,8 @@ enum Attention {
         id: i64,
         #[arg(long)]
         key: String,
-        #[arg(long)]
-        file: PathBuf,
+        #[command(flatten)]
+        report: progress::CheckpointArgs,
     },
     /// Read my current attention occurrences; fetching details records retrieval.
     List {
@@ -399,6 +464,14 @@ enum HerdrPolicy {
 }
 #[derive(Subcommand)]
 enum Runtime {
+    /// Authenticated managed target configuration and lifecycle.
+    #[command(subcommand)]
+    Target(execution::Target),
+    /// Writer bindings and original-producer controlled text publication.
+    #[command(subcommand)]
+    Artifact(execution::Artifact),
+    /// Read protected evidence for an exact registered target identity; never enables it.
+    Capabilities { target: String },
     /// Generate a separate hook settings file without changing global settings.
     Configure {
         #[arg(value_enum)]
@@ -571,6 +644,7 @@ impl Cli {
                             "Native clients",
                             &["configure", "attach", "detach", "enable"],
                         ),
+                        ("Managed evidence", &["capabilities"]),
                         ("Group delivery", &["pause", "resume"]),
                         ("Herdr", &["herdr", "herdr-policy"]),
                     ],
@@ -580,7 +654,10 @@ impl Cli {
             command,
             &[
                 ("Start", &["init", "run"]),
-                ("Coordinate", &["context", "task", "mail", "watch"]),
+                (
+                    "Coordinate",
+                    &["context", "task", "mail", "decision", "watch"],
+                ),
                 ("Manage", &["status", "agent", "attention"]),
                 ("Integrations", &["runtime", "service"]),
             ],
@@ -599,6 +676,29 @@ impl Cli {
             return Ok(None);
         }
         let command = self.command.context("provide a command or --skill")?;
+        if let Action::ManagedWorker { root } | Action::ManagedContainedWorker { root } = &command {
+            ensure!(
+                root.is_absolute(),
+                "managed worker requires an absolute --root"
+            );
+            ensure!(
+                self.group.is_none() && self.session.is_none(),
+                "managed worker does not accept Mail group/session credentials"
+            );
+            ensure!(
+                self.state_dir.as_ref().is_none_or(|path| path == root),
+                "managed worker state binding conflicts with --root"
+            );
+            return Ok(Some(RunArgs {
+                state_dir: Some(root.clone()),
+                session: None,
+                command: if matches!(&command, Action::ManagedContainedWorker { .. }) {
+                    Command::ManagedContainedWorker
+                } else {
+                    Command::ManagedWorker
+                },
+            }));
+        }
         ensure!(
             !matches!(
                 &command,
@@ -644,6 +744,10 @@ impl Cli {
                     | Action::Agent(Agent::Ack { .. })
                     | Action::Mail(_)
                     | Action::Task(_)
+                    | Action::Decision(_)
+                    | Action::Runtime(
+                        Runtime::Capabilities { .. } | Runtime::Target(_) | Runtime::Artifact(_)
+                    )
                     | Action::Attention(
                         Attention::List { .. }
                             | Attention::Show { .. }
@@ -666,6 +770,9 @@ impl Cli {
             return Ok(None);
         }
         let command = match command {
+            Action::ManagedWorker { .. } | Action::ManagedContainedWorker { .. } => {
+                unreachable!("handled before group/state discovery")
+            }
             Action::Run { .. } => unreachable!("handled before dispatch"),
             Action::Init {
                 name,
@@ -708,17 +815,21 @@ impl Cli {
                 all_groups,
                 check: None,
                 json,
+                tasks,
+                after,
+                limit,
             } => Command::Status {
                 group: if all_groups { None } else { Some(group) },
                 json,
+                tracking: tasks.then(|| (after.unwrap_or_default(), limit.unwrap_or(20))),
             },
             Action::Service(s) => Command::Service(s),
             Action::Attention(attention) => match attention {
-                Attention::Checkpoint { id, key, file } => Command::Checkpoint {
+                Attention::Checkpoint { id, key, report } => Command::Checkpoint {
                     group,
                     source: agent_mail::followup::Source::Attention { id },
                     key,
-                    report: serde_json::from_str(&read_body(&file)?)?,
+                    report: report.prepare()?,
                 },
                 Attention::List { after } => Command::AttentionList { group, after },
                 Attention::Show { id } => Command::AttentionShow { group, id },
@@ -778,12 +889,20 @@ impl Cli {
                 },
             },
             Action::Watch { after } => Command::WatchChanges { group, after },
+            Action::Decision(args) => Command::Work(Box::new(WorkCommand::Decision {
+                group,
+                request: args.prepare()?,
+            })),
             Action::Mail(mail) => match mail {
-                Mail::Checkpoint { id, key, file } => Command::Checkpoint {
+                Mail::Followup(args) => Command::Work(Box::new(WorkCommand::Decision {
+                    group,
+                    request: args.prepare()?,
+                })),
+                Mail::Checkpoint { id, key, report } => Command::Checkpoint {
                     group,
                     source: agent_mail::followup::Source::Mail { id },
                     key,
-                    report: serde_json::from_str(&read_body(&file)?)?,
+                    report: report.prepare()?,
                 },
                 Mail::Wait { id, timeout } => Command::WaitMail { group, id, timeout },
                 Mail::Send {
@@ -856,18 +975,58 @@ impl Cli {
                 },
             },
             Action::Task(task) => {
-                Command::Work(match task {
+                Command::Work(Box::new(match *task {
+                    Task::Execution(args) => WorkCommand::Execution {
+                        request: args.prepare(&group),
+                        group,
+                    },
+                    Task::Followup(args) => WorkCommand::Decision {
+                        group,
+                        request: args.prepare()?,
+                    },
+                    Task::Progress(args) => WorkCommand::Progress {
+                        group,
+                        request: args.prepare()?,
+                    },
+                    Task::Inspect { id } => WorkCommand::Contract {
+                        group,
+                        request: task_contract::Operation::Inspect(id),
+                    },
+                    Task::Adopt(args) => WorkCommand::Contract {
+                        group,
+                        request: args.prepare()?,
+                    },
+                    Task::Decide(args) => WorkCommand::Contract {
+                        group,
+                        request: args.prepare()?,
+                    },
+                    Task::Candidate(args) => WorkCommand::Contract {
+                        request: args.prepare(&group)?,
+                        group,
+                    },
+                    Task::Inputs { id, version, phase } => WorkCommand::Contract {
+                        group,
+                        request: task_contract::Operation::Inputs {
+                            id,
+                            version,
+                            phase: phase.into(),
+                        },
+                    },
+                    Task::Results { id, after } => WorkCommand::Contract {
+                        group,
+                        request: task_contract::Operation::Results { id, after },
+                    },
                     Task::Checkpoint {
                         id,
                         version,
                         key,
-                        file,
+                        report,
                     } => WorkCommand::Checkpoint {
                         group,
                         id,
                         version,
                         key,
-                        report: serde_json::from_str(&read_body(&file)?)?,
+                        report: report.prepare()?,
                     },
                     Task::Create {
                         id,
@@ -877,18 +1036,53 @@ impl Cli {
                         state,
                         deadline,
                         evidence,
-                    } => WorkCommand::Create {
-                        group,
-                        id,
-                        next_action: next_action.unwrap_or_else(|| task.clone()),
-                        scope: task,
-                        owner,
-                        state,
-                        deadline,
-                        evidence,
-                    },
+                        contract,
+                    } => {
+                        let next_action = next_action.unwrap_or_else(|| task.clone());
+                        if contract.untracked {
+                            WorkCommand::Create {
+                                group,
+                                id,
+                                scope: task,
+                                owner,
+                                state,
+                                next_action,
+                                deadline,
+                                evidence,
+                            }
+                        } else {
+                            WorkCommand::Contract {
+                                group,
+                                request: contract.prepare(agent_mail::work::WorkDraft {
+                                    id,
+                                    scope: task,
+                                    owner,
+                                    state,
+                                    next_action,
+                                    deadline,
+                                    evidence,
+                                })?,
+                            }
+                        }
+                    }
                     Task::Show { id } => WorkCommand::Show { group, id },
-                    Task::List { after } => WorkCommand::List { group, after },
+                    Task::List {
+                        after,
+                        details,
+                        limit,
+                    } => {
+                        if details {
+                            WorkCommand::Contract {
+                                group,
+                                request: task_contract::Operation::Tracking {
+                                    after,
+                                    limit: limit.unwrap_or(20),
+                                },
+                            }
+                        } else {
+                            WorkCommand::List { group, after }
+                        }
+                    }
                     Task::History { id } => WorkCommand::History { group, id },
                     Task::Update {
                         id,
@@ -903,9 +1097,23 @@ impl Cli {
                         };
                         WorkCommand::Decide { group, id, update }
                     }
-                })
+                }))
             }
             Action::Runtime(runtime) => match runtime {
+                Runtime::Target(args) => Command::Work(Box::new(WorkCommand::Execution {
+                    group,
+                    request: args.prepare()?,
+                })),
+                Runtime::Artifact(args) => Command::Work(Box::new(WorkCommand::Execution {
+                    request: args.prepare(&group)?,
+                    group,
+                })),
+                Runtime::Capabilities { target } => {
+                    Command::Work(Box::new(WorkCommand::Execution {
+                        group,
+                        request: execution::Operation::Capabilities(target),
+                    }))
+                }
                 Runtime::Attach { name, endpoint } => match endpoint {
                     Endpoint::Codex { socket, thread } => Command::AttachCodex {
                         group,

@@ -48,10 +48,24 @@ attention state without sending follow-up reminders or escalations. Running plai
 
 ## Assign work and get a result
 
-Ask the coordinator to use Agent Mail, or run this inside its session:
+The following compatibility walkthrough uses an explicitly untracked task.
+Contracted creation requires finite contract and authority flags; see
+[contracted tasks](docs/usage.md#contracted-tasks-development-surface).
+That development surface also provides bounded `status --tasks`, authenticated
+execution reports, and [managed target and artifact commands](docs/usage.md#managed-targets-and-controlled-text-artifacts).
+The new runtime commands await composed validation; native qualification and
+lifecycle enablement remain held.
+
+In that development surface, a finite task defaults to `open` and can be scheduled
+automatically once its authorization, dependencies, runtime capability, pause,
+budget and active-attempt guards permit. No separate `ready` or `active` update is
+required. The `open` state alone grants no execution authority, including for
+untracked legacy tasks. Original deadlines and execution accounting still apply.
+
+Run this inside the coordinator session:
 
 ```sh
-agent-mail task create api-review "Review the API changes" --owner worker
+agent-mail task create api-review "Review the API changes" --owner worker --untracked
 ```
 
 The worker receives the assignment and reports its result:

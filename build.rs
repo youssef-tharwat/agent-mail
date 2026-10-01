@@ -22,6 +22,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=migrations/0018_followups.sql");
     println!("cargo:rerun-if-changed=migrations/0019_turn_followthrough.sql");
     println!("cargo:rerun-if-changed=migrations/0020_native_offer_snapshots.sql");
+    println!("cargo:rerun-if-changed=migrations/0021_task_contracts.sql");
+    println!("cargo:rerun-if-changed=migrations/0022_execution_scheduler.sql");
+    println!("cargo:rerun-if-changed=migrations/0023_runtime_adapters.sql");
+    println!("cargo:rerun-if-changed=migrations/0024_decision_recovery.sql");
+    println!("cargo:rerun-if-changed=migrations/0025_progress_notifications.sql");
+    println!("cargo:rerun-if-changed=migrations/0026_execution_driver_cursors.sql");
+    println!("cargo:rerun-if-changed=migrations/0027_managed_artifact_lifecycle.sql");
+    println!("cargo:rerun-if-changed=migrations/0028_execution_yield_reviews.sql");
+    println!("cargo:rerun-if-changed=migrations/0029_supervisor_failure_visits.sql");
+    println!("cargo:rerun-if-changed=migrations/0030_supervisor_failure_notices.sql");
+    println!("cargo:rerun-if-changed=migrations/0031_runtime_capture_custody.sql");
+    println!("cargo:rerun-if-changed=migrations/0032_reclamation_fairness.sql");
     let path = PathBuf::from(env::var("OUT_DIR")?).join("compile-schema.db");
     if path.exists() {
         std::fs::remove_file(&path)?;
@@ -93,6 +105,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .execute(&mut connection)
                 .await?;
             sqlx::raw_sql(include_str!("migrations/0020_native_offer_snapshots.sql"))
+                .execute(&mut connection)
+                .await?;
+            sqlx::raw_sql(include_str!("migrations/0021_task_contracts.sql"))
+                .execute(&mut connection)
+                .await?;
+            sqlx::raw_sql(include_str!("migrations/0022_execution_scheduler.sql"))
+                .execute(&mut connection)
+                .await?;
+            sqlx::raw_sql(include_str!("migrations/0023_runtime_adapters.sql"))
+                .execute(&mut connection)
+                .await?;
+            sqlx::raw_sql(include_str!("migrations/0024_decision_recovery.sql"))
+                .execute(&mut connection)
+                .await?;
+            sqlx::raw_sql(include_str!("migrations/0025_progress_notifications.sql"))
+                .execute(&mut connection)
+                .await?;
+            sqlx::raw_sql(include_str!("migrations/0026_execution_driver_cursors.sql"))
+                .execute(&mut connection)
+                .await?;
+            sqlx::raw_sql(include_str!(
+                "migrations/0027_managed_artifact_lifecycle.sql"
+            ))
+            .execute(&mut connection)
+            .await?;
+            sqlx::raw_sql(include_str!("migrations/0028_execution_yield_reviews.sql"))
+                .execute(&mut connection)
+                .await?;
+            sqlx::raw_sql(include_str!(
+                "migrations/0029_supervisor_failure_visits.sql"
+            ))
+            .execute(&mut connection)
+            .await?;
+            sqlx::raw_sql(include_str!(
+                "migrations/0030_supervisor_failure_notices.sql"
+            ))
+            .execute(&mut connection)
+            .await?;
+            sqlx::raw_sql(include_str!("migrations/0031_runtime_capture_custody.sql"))
+                .execute(&mut connection)
+                .await?;
+            sqlx::raw_sql(include_str!("migrations/0032_reclamation_fairness.sql"))
                 .execute(&mut connection)
                 .await?;
             connection.close().await

@@ -281,7 +281,7 @@ pub struct Pending {
 }
 
 /// Schema understood by this binary.
-pub(crate) const SCHEMA_VERSION: i64 = 20;
+pub(crate) const SCHEMA_VERSION: i64 = 32;
 
 impl Store {
     /// Open a database, optionally creating and migrating its schema.
@@ -986,9 +986,20 @@ impl Store {
     /// # Errors
     /// The database update fails; an ineligible reservation returns false.
     pub async fn reserve(&self, actor: &Mailbox, now: i64) -> Result<bool> {
+        let mut tx = self.pool().begin().await?;
+        let reserved = Self::reserve_tx(&mut tx, actor, now).await?;
+        tx.commit().await?;
+        Ok(reserved)
+    }
+
+    pub(crate) async fn reserve_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        actor: &Mailbox,
+        now: i64,
+    ) -> Result<bool> {
         let next = now.checked_add(300).context("clock overflow")?;
         let result = sqlx::query!("UPDATE mailboxes SET attempts=CASE WHEN wake_attempted<(SELECT MAX(id) FROM herdr_wake_events WHERE recipient=mailboxes.id) THEN 1 ELSE attempts+1 END,wake_attempted=MAX(wake_attempted,(SELECT MAX(id) FROM herdr_wake_events WHERE recipient=mailboxes.id)),next_wake=?,alerted=CASE WHEN wake_attempted=(SELECT MAX(id) FROM herdr_wake_events WHERE recipient=mailboxes.id) THEN alerted ELSE 0 END WHERE id=? AND binding_version=? AND agent_state='registered' AND pane IS NOT NULL AND (attempts<3 OR wake_attempted<(SELECT MAX(id) FROM herdr_wake_events WHERE recipient=mailboxes.id)) AND next_wake<=? AND EXISTS(SELECT 1 FROM groups WHERE name=mailboxes.group_name AND paused=0 AND auto_prompt=1) AND EXISTS(SELECT 1 FROM herdr_wake_events WHERE recipient=mailboxes.id)",
-            next, actor.id, actor.binding_version, now).execute(self.pool()).await?;
+            next, actor.id, actor.binding_version, now).execute(&mut **tx).await?;
         Ok(result.rows_affected() == 1)
     }
 

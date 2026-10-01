@@ -127,10 +127,14 @@ bounded recovery state.
 
 ## Assignment → result → decision
 
+This is the explicit untracked compatibility flow. Contracted work uses the
+finite contract and typed candidate/outcome flow described below. Do not add
+`--untracked` merely to bypass a missing contract or an execution hold.
+
 **Writer assigns:**
 
 ```sh
-agent-mail task create api "Review API changes at abc123" --owner worker
+agent-mail task create api "Review API changes at abc123" --owner worker --untracked
 ```
 
 The scope supplies the initial next action unless `--next-action` overrides it.
@@ -180,7 +184,7 @@ to this task. Owner work, a successful test command or a reply alone is not acce
 - **Reopen:** writer selects an actionable state and a fresh next action using
   the current version. Clear an obsolete accepted revision explicitly if needed.
 
-## Task lifecycle and update contract
+## Legacy task lifecycle and update contract
 
 | State | Meaning |
 |---|---|
@@ -377,10 +381,12 @@ acknowledgment does not substitute for these reads or the authorized next action
 
 Finish with an ordinary reply/resolve/task decision when appropriate. If work is
 unfinished when yielding, record its next step and review time using
-`task checkpoint ID --version TASK_VERSION --key KEY --file PATH` or
-`mail checkpoint ID --key KEY --file PATH`. The JSON contains the observed
-`followup.version`, `next_step`, a future UTC Unix `next_check_at`, and optionally
-`waiting` and `evidence`. See `docs/usage.md` or command help for the format.
+`task checkpoint ID --version TASK_VERSION --plan-version PLAN_VERSION --key KEY
+--next-step TEXT --check-at UTC` or the corresponding `mail checkpoint ID` command
+without the task version. `PLAN_VERSION` is the observed `followup.version`. Add
+`--wait-mail ID`, `--wait-task ID --wait-state STATE`, or
+`--wait-for ROLE --wait-reason TEXT` as appropriate. Repeat `--evidence REF` for
+references. `--file PATH` remains an optional advanced alternative to these flags.
 This records intent without changing task authority or resolving mail. Do not
 create a checkpoint after every tool call or repeat unchanged reports each turn.
 
@@ -411,3 +417,85 @@ an outcome or valid checkpoint triggers one corrective notification, then escala
 if its next covered turn still ignores it. Later arrivals and explicit holds are
 not treated as neglected work. Timers recover missed events and overdue commitments.
 Status identifies the policy and whether an independent operator route exists.
+
+## Contracted work in the development product surface
+
+This source increment awaits composed validation. Use the installed binary's help
+for released capabilities. Normal new creation requires an explicit finite contract:
+`--key`, `--reason`, repeated `--criterion ID=TEXT`, repeated `--allow UNIT`, actual
+`--authorize REF`, `--max-attempts`, `--max-elapsed` and explicit
+`--allow-input-invalidation` consent. That consent permits invalidating dependent
+inputs when their basis changes and is required for creation, adoption and full
+contract replacement. The CLI never supplies it automatically. `--untracked`
+deliberately selects the legacy flow above; missing fields must never silently select it.
+
+A finite task defaults to `open` and can be scheduled automatically once its
+authorization, dependencies, runtime capability, pause, budget and active-attempt
+guards permit. A separate `ready` or `active` update is not required to start
+eligible work. The `open` state alone grants no execution authority; untracked
+legacy records gain none from their state. Keep the original deadlines and
+execution accounting; automatic eligibility does not reset either.
+
+Use `task inspect ID` for model and execution holds. Use `task decide` for contracted
+changes and typed outcomes, with the observed version/key/reason. Successful
+outcomes select an immutable candidate; reports and message replies are evidence,
+not acceptance. Capture phase inputs before producing output; preserve them when
+submitting `task candidate`. Never refresh inputs over stale output or relabel an
+Execute snapshot as Accept. `task results` preserves outcome/candidate history.
+
+`--after TASK` means ALL-of accepted prerequisites, with optional explicit outcome
+or revision overrides. A parent link requires observed parent versions and original
+scope/delegation checks. A satisfied prerequisite does not grant permission.
+Checkpoint task and attention versions independently. Source writers/senders may
+inspect and correct finite followup metadata even after expiry; Mail corrections
+must select the original recipient. No checkpoint or correction resets execution
+spending, frees uncertain effects, or settles source work.
+
+Explicit decision policies and progress grants are narrow original-source consent.
+The separate policy operation is not an atomic create option. Reviewer fallback
+uses actual task/case/policy guards. `decision continue-strategy` consumes the
+explicit standing continuation policy and exact source execution/case/candidate
+versions in one owner transaction; its Held result rolls back the entire operation.
+No report substitutes for that authority. Native qualification remains unavailable
+and lifecycle enablement remains held. The new managed target and artifact CLI
+consumers await composed validation. See the
+[development command reference](usage.md#contracted-tasks-development-surface).
+
+For bounded tracking, use `task list --details` or `status --tasks` with the actual
+agent identity; terminal cleanup stays visible. Follow `next_cursor` when
+`has_more` is true. Model and execution observations are separate and never grant
+permission. `runtime capabilities TARGET_ID` reads protected evidence for the exact
+registered identity. `task execution report` requires the full original attempt,
+fence and dispatch key; a yield requests continuation as evidence and neither
+closes nor restarts execution. These development consumers await composed validation.
+
+
+Use `runtime target configure` with an actual protected policy reference, then
+`runtime target show TARGET_ID` to observe current generation, revision and holds.
+Correction, disable, retire and enable require exact observed target versions.
+Supplying a qualification ID does not remove the current enablement hold. Keep
+these commands separate from hook configuration and delivery enablement.
+
+The genuine task writer uses `runtime artifact bind` with explicit task CAS,
+registered target/generation, destination, allowed scope and virtual paths. An
+original admitted producer uses `runtime artifact publish` with its full attempt,
+fence, dispatch key, effect, task version, destination generation and explicit
+prior-manifest expectation. Supply actual bounded UTF-8 files with repeated
+`--text-file VIRTUAL_PATH=INPUT_FILE`. Preserve request identity and bytes for retry;
+never refresh a version or switch identities to force publication. Inspect actual
+Ready/Held output. `runtime artifact receipt` authenticates the original producer;
+it does not give arbitrary writers or rebound owners retained-content access.
+
+Publication is evidence, not a business decision. Ordinary business candidate
+submission requires the genuine writer and Accept inputs captured before review
+or revalidation against criteria and required children. A policy-selected reviewer
+has authority only for its actual materialized decision task. A fresh Accept
+snapshot by itself does not make stale output valid. An unattended writer consumer
+and its protected artifact access remain future work.
+
+Raw `task execution report --kind yield` stays append-only. Native combined Yield
+uses the runtime's private original admitted checkpoint basis, with a bounded
+1..3600-second review interval. It does not let the CLI choose a newer basis or
+pretend a checkpoint proves physical closure. See
+[managed targets and controlled text artifacts](usage.md#managed-targets-and-controlled-text-artifacts)
+for the exact flags and limits.

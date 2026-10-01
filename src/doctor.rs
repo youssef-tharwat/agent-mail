@@ -131,6 +131,23 @@ pub async fn inspect(
         json!({"name":group,"auto_prompt":config.auto_prompt}),
         None,
     );
+    match store.followup_policy(group).await {
+        Ok(policy) => {
+            report.add("followup_policy", Level::Pass,
+                json!({"mode":policy.mode,"paused":config.paused != 0,"interval_seconds":policy.interval_seconds,"max_seconds":policy.max_seconds}), None);
+            let configured = policy.notifier.is_some() || config.socket.is_some();
+            report.add("operator_route", if configured { Level::Unknown } else { Level::Warning },
+                json!({"notifier_configured":policy.notifier.is_some(),"herdr_route_configured":config.socket.is_some(),"handling_verified":false}),
+                if configured { Some("Inspect status --json operator notifications; configuration does not prove receipt or handling") }
+                else { Some("Configure an independent operator notifier with attention configure --notifier /absolute/program") });
+        }
+        Err(_) => report.add(
+            "followup_policy",
+            Level::Unknown,
+            "Follow-through policy could not be read",
+            Some("Inspect group configuration and database health"),
+        ),
+    }
     if crate::service::running(root) {
         report.add("worker", Level::Pass, "Worker lock is held", None);
     } else {

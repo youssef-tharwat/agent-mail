@@ -23,6 +23,10 @@ struct RunArgs {
 }
 
 enum Command {
+    /// Dedicated managed execution worker; excluded from Mail enrollment and service startup.
+    ManagedWorker,
+    /// Internal contained launch role; stdin remains its original duplex control socket.
+    ManagedContainedWorker,
     Checkpoint {
         group: String,
         source: agent_mail::followup::Source,
@@ -216,7 +220,7 @@ enum Command {
         event: i64,
     },
     /// Maintain small versioned work records in the same store as mail.
-    Work(WorkCommand),
+    Work(Box<WorkCommand>),
     /// Stream committed events. Resume cursors must include their binding generation.
     Watch {
         group: String,
@@ -227,6 +231,7 @@ enum Command {
     Status {
         group: Option<String>,
         json: bool,
+        tracking: Option<(String, u32)>,
     },
     /// Operator: stop automatic prompts for a group. Message operations still work.
     Pause {
@@ -275,6 +280,22 @@ enum Bridge {
 }
 
 enum WorkCommand {
+    Execution {
+        group: String,
+        request: cli::execution::Operation,
+    },
+    Decision {
+        group: String,
+        request: cli::decisions::Operation,
+    },
+    Progress {
+        group: String,
+        request: cli::progress::Operation,
+    },
+    Contract {
+        group: String,
+        request: cli::task_contract::Operation,
+    },
     Checkpoint {
         group: String,
         id: String,
@@ -345,6 +366,42 @@ async fn execute() -> Result<()> {
 }
 
 async fn run(cli: RunArgs) -> Result<()> {
+    if matches!(
+        cli.command,
+        Command::ManagedWorker | Command::ManagedContainedWorker
+    ) {
+        let result = async {
+            let root = cli
+                .state_dir
+                .as_deref()
+                .context("managed worker requires an explicit root")?;
+            // Borrow the handle: fd0 is also the contained role's trusted return channel.
+            // Reading its EOF must not close or replace the original duplex socket.
+            let mut input = tokio::io::stdin();
+            let request = agent_mail::managed_runtime::read_worker_input(&mut input).await?;
+            let store = agent_mail::managed_runtime::open_worker_store(root).await?;
+            let result = match &cli.command {
+                Command::ManagedWorker => {
+                    agent_mail::managed_runtime::run_managed_worker(&store, &request).await
+                }
+                Command::ManagedContainedWorker => {
+                    agent_mail::managed_runtime::run_managed_contained_worker(&store, &request)
+                        .await
+                }
+                _ => unreachable!("dedicated managed role"),
+            };
+            store.close().await;
+            result
+        }
+        .await;
+        if result.is_err() {
+            // Native diagnostics and credential/configuration values never enter this CLI error.
+            eprintln!("agent-mail: managed worker failed; inspect its protected runtime records");
+        }
+        // A timed-out Tokio stdin read may leave a blocking reader. This dedicated process
+        // must exit finitely after closing its Store; it never joins the ordinary service path.
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
     if let Command::ClaudeBridge { socket, args } = cli.command {
         let result = agent_mail::claude::run(&socket, args).await;
         if let Err(error) = &result {
@@ -831,7 +888,23 @@ async fn run(cli: RunArgs) -> Result<()> {
             store.acknowledge(&actor, event).await?;
             json!({"event":event,"acknowledged":true,"resolved":false})
         }
-        Command::Work(command) => match command {
+        Command::Work(command) => match *command {
+            WorkCommand::Execution { group, request } => {
+                let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+                request.run(&store, &actor, now()?).await?
+            }
+            WorkCommand::Decision { group, request } => {
+                let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+                request.run(&store, &actor, now()?).await?
+            }
+            WorkCommand::Progress { group, request } => {
+                let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+                request.run(&store, &actor, now()?).await?
+            }
+            WorkCommand::Contract { group, request } => {
+                let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+                request.run(&store, &actor, now()?).await?
+            }
             WorkCommand::Checkpoint {
                 group,
                 id,
@@ -969,15 +1042,33 @@ async fn run(cli: RunArgs) -> Result<()> {
                 );
             }
         }
-        Command::Status { group, json } => {
+        Command::Status {
+            group,
+            json,
+            tracking,
+        } => {
+            let tasks = if let Some((after, limit)) = tracking {
+                let selected = group
+                    .as_deref()
+                    .context("task tracking requires one group")?;
+                let actor = store.authenticate(selected, cli.session.as_ref()).await?;
+                Some(agent_mail::status::task_tracking(&store, &actor, &after, limit).await?)
+            } else {
+                None
+            };
             if !json {
-                println!(
-                    "{}",
-                    agent_mail::status::summary(&store, group.as_deref()).await?
-                );
+                let mut summary = agent_mail::status::summary(&store, group.as_deref()).await?;
+                if let Some(tasks) = tasks {
+                    summary.push_str(&agent_mail::status::task_tracking_summary(&tasks)?);
+                }
+                println!("{summary}");
                 return Ok(());
             }
-            agent_mail::status::report(&store, group.as_deref()).await?
+            let mut report = agent_mail::status::report(&store, group.as_deref()).await?;
+            if let Some(tasks) = tasks {
+                report["task_tracking"] = tasks;
+            }
+            report
         }
         Command::Pause { group } => {
             store.pause(&group, true).await?;
@@ -1006,7 +1097,9 @@ async fn run(cli: RunArgs) -> Result<()> {
             service::run(&store, once).await?;
             return Ok(());
         }
-        Command::ClaudeBridge { .. }
+        Command::ManagedWorker
+        | Command::ManagedContainedWorker
+        | Command::ClaudeBridge { .. }
         | Command::Doctor { .. }
         | Command::Service(_)
         | Command::Restore => {

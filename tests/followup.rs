@@ -1049,74 +1049,195 @@ async fn foundation_head_control_turn_recovery() -> Result<()> {
 }
 // END FOUNDATION HEAD CONTROL
 
+// Read only the original business source; transport changes must not receipt it.
+async fn notifier_business_snapshot(store: &Store, message: i64) -> Result<String> {
+    let pool = support::pool(store).await?;
+    let snapshot = sqlx::query_scalar("SELECT json_object('followup',f.id,'authority',f.authority,'recipient',f.recipient,'opened',f.opened,'escalate_at',f.escalate_at,'next_check',f.next_check,'checkpoint',f.checkpoint,'dependency_ready_at',f.dependency_ready_at,'version',f.version,'stage',f.stage,'retrieved_at',f.retrieved_at,'retrieved_binding',f.retrieved_binding,'delivery_state',d.state,'resolution',d.resolution,'message_due',m.due,'mailbox_attempts',b.attempts,'mailbox_next_wake',b.next_wake) FROM followups f JOIN deliveries d ON d.message=f.message AND d.recipient=f.recipient JOIN messages m ON m.id=f.message JOIN mailboxes b ON b.id=f.recipient WHERE f.group_name='g' AND f.message=?")
+        .bind(message).fetch_one(&pool).await?;
+    pool.close().await;
+    Ok(snapshot)
+}
+
+async fn notifier_spending_snapshot(store: &Store, account: i64) -> Result<Vec<(i64, i64, i64)>> {
+    let pool = support::pool(store).await?;
+    let spending = sqlx::query_as("SELECT generation,exposures,next_at FROM operator_notice_spending WHERE account=? ORDER BY generation")
+        .bind(account).fetch_all(&pool).await?;
+    let legacy: i64 =
+        sqlx::query_scalar("SELECT coalesce(sum(operator_attempts),0) FROM attention_occurrences")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        legacy, 0,
+        "the shared dispatcher must not write a second counter"
+    );
+    pool.close().await;
+    Ok(spending)
+}
+
 #[tokio::test]
 async fn clearing_notifier_rearms_failed_alerts_without_resetting_business_budgets() -> Result<()> {
     use agent_mail::followup::PolicyPatch;
     let f = Fixture::new().await?;
+    // No process exists after a failure to spawn, so bounded retries are valid.
+    let missing = f.temp.path().join("missing-notifier");
     f.store
         .patch_followups(
             "g",
             &PolicyPatch {
-                notifier: Some(Some(vec!["/usr/bin/false".into()])),
+                notifier: Some(Some(vec![missing.display().to_string()])),
                 ..Default::default()
             },
             f.time,
         )
         .await?;
-    f.mail("unhandled").await?;
+    let message = f.mail("unhandled").await?;
     followup::reconcile(&f.store, f.time + 241).await?;
+    let mut next_attempt = f.time + 542;
     for attempt in 0..3 {
-        followup::notify_operators(&f.store, f.time + 542 + attempt * 300).await?;
+        followup::notify_operators(&f.store, next_attempt).await?;
+        let notice = f.store.operator_notices("g", 0, 100).await?.remove(0);
+        assert_eq!(notice.state, "failed");
+        assert_eq!(notice.exposures, attempt + 1);
+        assert!(notice.outstanding_batch.is_none());
+        next_attempt = notice.next_attempt;
     }
-    let before = f.store.followup_status(Some("g"), f.time + 2000).await?;
-    assert_eq!(before["operator_notifications"][0]["state"], "failed");
-    assert_eq!(before["operator_notifications"][0]["attempts"], 3);
+    let before = f.store.operator_notices("g", 0, 100).await?.remove(0);
+    let spent = notifier_spending_snapshot(&f.store, before.account).await?;
+    assert_eq!(spent.len(), 1);
+    assert_eq!(spent[0].1, 3);
+    followup::notify_operators(&f.store, next_attempt).await?;
+    assert_eq!(f.store.operator_notices("g", 0, 100).await?[0].exposures, 3);
+    assert_eq!(
+        notifier_spending_snapshot(&f.store, before.account).await?,
+        spent,
+        "a fourth attempt on the same route cannot exceed the finite budget"
+    );
     let pool = support::pool(&f.store).await?;
     sqlx::query("UPDATE mailboxes SET attempts=3,next_wake=12345 WHERE id=?")
         .bind(f.owner.id)
         .execute(&pool)
         .await?;
+    pool.close().await;
+    let business = notifier_business_snapshot(&f.store, message).await?;
     let clear = PolicyPatch {
         notifier: Some(None),
         ..Default::default()
     };
     f.store.patch_followups("g", &clear, f.time + 2001).await?;
-    let repaired = f.store.followup_status(Some("g"), f.time + 2001).await?;
-    assert_eq!(repaired["operator_notifications"][0]["attempts"], 0);
-    assert_eq!(repaired["operator_notifications"][0]["state"], "pending");
-    // No Herdr route exists in this fixture: the fallback must be visible.
+    let repaired = f.store.operator_notices("g", 0, 100).await?.remove(0);
+    assert_eq!(repaired.account, before.account);
+    assert_eq!(repaired.route_generation, before.route_generation + 1);
+    assert_eq!(repaired.state, "pending");
+    assert_eq!(repaired.exposures, 0);
+    assert!(!repaired.route_configured);
     followup::notify_operators(&f.store, f.time + 2001).await?;
     let fallback = f.store.followup_status(Some("g"), f.time + 2001).await?;
     assert_eq!(
         fallback["operator_notifications"][0]["state"],
         "unconfigured"
     );
-    assert_eq!(fallback["operator_notifications"][0]["attempts"], 1);
+    assert_eq!(
+        fallback["operator_notifications"][0]["attempts"], 0,
+        "an unconfigured route performs no I/O and spends no exposure"
+    );
+    let fallback_spending = notifier_spending_snapshot(&f.store, before.account).await?;
+    assert_eq!(fallback_spending.len(), 2);
+    assert_eq!(
+        fallback_spending[0], spent[0],
+        "retain exhausted old-route spending/cooldown"
+    );
+    assert_eq!(fallback_spending[1], (repaired.route_generation, 0, 0));
     f.store.patch_followups("g", &clear, f.time + 2002).await?;
     assert_eq!(
         f.store.followup_status(Some("g"), f.time + 2002).await?["operator_notifications"],
         fallback["operator_notifications"]
     );
-    let mailbox = f.store.mailbox("g", "owner").await?;
-    assert_eq!((mailbox.attempts, mailbox.next_wake), (3, 12345));
-    assert_eq!(f.store.inbox(&f.owner, 0).await?.len(), 1);
+    assert_eq!(
+        notifier_spending_snapshot(&f.store, before.account).await?,
+        fallback_spending
+    );
+
+    // Real positive acceptance is separate from arbitrary-process closure.
+    let delivered = f.temp.path().join("accepted-notice.json");
     f.store
         .patch_followups(
             "g",
             &PolicyPatch {
-                notifier: Some(Some(vec!["/usr/bin/tee".into()])),
+                notifier: Some(Some(vec![
+                    "/usr/bin/tee".into(),
+                    delivered.display().to_string(),
+                ])),
                 ..Default::default()
             },
             f.time + 2003,
         )
         .await?;
     followup::notify_operators(&f.store, f.time + 2003).await?;
-    let accepted = f.store.followup_status(Some("g"), f.time + 2003).await?;
-    assert_eq!(accepted["operator_notifications"][0]["state"], "accepted");
-    f.store.patch_followups("g", &clear, f.time + 2004).await?;
+    let accepted = f.store.operator_notices("g", 0, 100).await?.remove(0);
+    let payload: Value = serde_json::from_slice(&std::fs::read(&delivered)?)?;
+    assert_eq!(payload["items"][0]["notice"], accepted.id);
+    assert_eq!(accepted.account, before.account);
+    assert_eq!(accepted.state, "uncertain");
+    assert_eq!(accepted.exposures, 1);
+    assert_eq!(accepted.accepted_revision, accepted.revision);
     assert_eq!(
-        f.store.followup_status(Some("g"), f.time + 2004).await?["operator_notifications"],
-        accepted["operator_notifications"]
+        accepted.accepted_generation,
+        Some(accepted.route_generation)
+    );
+    assert!(accepted.outstanding_batch.is_some());
+    assert!(accepted.unresolved);
+    assert_eq!(
+        f.store.followup_status(Some("g"), f.time + 2003).await?["operator_notifications"][0]["transport_accepted_current"],
+        true
+    );
+    let accepted_spending = notifier_spending_snapshot(&f.store, accepted.account).await?;
+    assert_eq!(accepted_spending.iter().map(|row| row.1).sum::<i64>(), 4);
+    assert_eq!(accepted_spending[0], spent[0]);
+
+    f.store.patch_followups("g", &clear, f.time + 2004).await?;
+    followup::notify_operators(&f.store, f.time + 2004).await?;
+    let held = f.store.operator_notices("g", 0, 100).await?.remove(0);
+    assert_eq!(held.state, "uncertain");
+    assert_eq!(held.outstanding_batch, accepted.outstanding_batch);
+    assert_eq!(held.accepted_generation, accepted.accepted_generation);
+    assert_eq!(held.exposures, 0);
+    assert_eq!(
+        f.store.followup_status(Some("g"), f.time + 2004).await?["operator_notifications"][0]["transport_accepted_current"],
+        false
+    );
+    let duplicate = f.temp.path().join("forbidden-replacement.json");
+    f.store
+        .patch_followups(
+            "g",
+            &PolicyPatch {
+                notifier: Some(Some(vec![
+                    "/usr/bin/tee".into(),
+                    duplicate.display().to_string(),
+                ])),
+                ..Default::default()
+            },
+            f.time + 2005,
+        )
+        .await?;
+    followup::notify_operators(&f.store, f.time + 3000).await?;
+    assert!(
+        !duplicate.exists(),
+        "clearing/repair cannot close an uncertain old sender"
+    );
+    assert_eq!(
+        notifier_spending_snapshot(&f.store, before.account).await?,
+        accepted_spending
+    );
+    assert_eq!(
+        notifier_business_snapshot(&f.store, message).await?,
+        business
+    );
+    let mailbox = f.store.mailbox("g", "owner").await?;
+    assert_eq!((mailbox.attempts, mailbox.next_wake), (3, 12345));
+    assert_eq!(f.store.inbox(&f.owner, 0).await?.len(), 1);
+    assert_eq!(
+        f.store.followup_status(Some("g"), f.time + 3000).await?["totals"]["escalated"],
+        1
     );
     Ok(())
 }
@@ -1131,53 +1252,220 @@ async fn operator_retry_budget_survives_restart_and_route_repair() -> Result<()>
         notifier: Some(vec!["/usr/bin/false".into()]),
     };
     f.store.configure_followups("g", &policy, f.time).await?;
-    f.mail("unhandled").await?;
+    let message = f.mail("unhandled").await?;
     followup::reconcile(&f.store, f.time + 241).await?;
-    let store = Store::open(f.temp.path(), false).await?;
-    for attempt in 0..3 {
-        let time = f.time + 542 + attempt * 300;
-        followup::notify_operators(&store, time).await?;
-        followup::notify_operators(&store, time).await?;
-        let status = store.followup_status(Some("g"), time).await?;
-        assert_eq!(status["operator_notifications"][0]["attempts"], attempt + 1);
-        assert_eq!(status["operator_notifications"][0]["state"], "failed");
-    }
-    followup::notify_operators(&store, f.time + 2000).await?;
+    let business = notifier_business_snapshot(&f.store, message).await?;
+    followup::notify_operators(&f.store, f.time + 542).await?;
+    let original = f.store.operator_notices("g", 0, 100).await?.remove(0);
+    assert_eq!(original.exposures, 1);
     assert_eq!(
-        store.followup_status(Some("g"), f.time + 2000).await?["operator_notifications"][0]["attempts"],
-        3
+        original.state, "uncertain",
+        "nonzero parent exit is not sender/effect closure"
     );
+    assert_eq!(original.accepted_revision, 0);
+    assert!(original.outstanding_batch.is_some());
+    let spent = notifier_spending_snapshot(&f.store, original.account).await?;
+    assert_eq!(spent.len(), 1);
+    assert_eq!(spent[0].1, 1);
+    f.store.close().await;
+    let store = Store::open(f.temp.path(), false).await?;
+    for offset in [542, 842, 1142, 2000] {
+        followup::notify_operators(&store, f.time + offset).await?;
+        followup::notify_operators(&store, f.time + offset).await?;
+        let held = store.operator_notices("g", 0, 100).await?.remove(0);
+        assert_eq!(held.account, original.account);
+        assert_eq!(held.route_generation, original.route_generation);
+        assert_eq!(held.exposures, 1);
+        assert_eq!(held.state, "uncertain");
+        assert_eq!(held.outstanding_batch, original.outstanding_batch);
+        assert_eq!(held.next_attempt, original.next_attempt);
+        assert_eq!(
+            notifier_spending_snapshot(&store, original.account).await?,
+            spent
+        );
+    }
+    store
+        .configure_followups("g", &policy, f.time + 2001)
+        .await?;
+    let same = store.operator_notices("g", 0, 100).await?.remove(0);
+    assert_eq!(same.route_generation, original.route_generation);
+    assert_eq!(same.outstanding_batch, original.outstanding_batch);
+    let replacement = f.temp.path().join("forbidden-replacement.json");
     store
         .configure_followups(
             "g",
             &Policy {
-                notifier: Some(vec!["/usr/bin/tee".into()]),
+                notifier: Some(vec![
+                    "/usr/bin/tee".into(),
+                    replacement.display().to_string(),
+                ]),
                 ..policy
             },
-            f.time + 2001,
+            f.time + 2002,
         )
         .await?;
-    followup::notify_operators(&store, f.time + 2001).await?;
-    let status = store.followup_status(Some("g"), f.time + 2001).await?;
-    assert_eq!(status["operator_notifications"][0]["attempts"], 1);
-    assert_eq!(status["operator_notifications"][0]["state"], "accepted");
-    assert_eq!(status["totals"]["escalated"], 1);
+    for offset in [2002, 3000] {
+        followup::notify_operators(&store, f.time + offset).await?;
+    }
+    let repaired = store.operator_notices("g", 0, 100).await?.remove(0);
+    assert_eq!(repaired.account, original.account);
+    assert_eq!(repaired.route_generation, original.route_generation + 1);
+    assert_eq!(repaired.exposures, 0);
+    assert_eq!(repaired.state, "uncertain");
+    assert_eq!(repaired.outstanding_batch, original.outstanding_batch);
+    assert_eq!(repaired.accepted_revision, 0);
+    assert!(
+        !replacement.exists(),
+        "a fresh route cannot overlap an unknown sender"
+    );
+    assert_eq!(
+        notifier_spending_snapshot(&store, original.account).await?,
+        spent
+    );
+    assert_eq!(notifier_business_snapshot(&store, message).await?, business);
+    assert_eq!(
+        store.followup_status(Some("g"), f.time + 3000).await?["totals"]["escalated"],
+        1
+    );
     assert_eq!(store.inbox(&f.owner, 0).await?.len(), 1);
+    store.close().await;
     Ok(())
 }
 
 #[tokio::test]
 async fn interrupted_final_operator_attempt_is_uncertain_and_stays_bounded() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new().await?;
-    f.mail("unhandled").await?;
+    let notifier = f.temp.path().join("late-notifier");
+    let exposed = f.temp.path().join("third-exposure");
+    f.store
+        .configure_followups(
+            "g",
+            &Policy {
+                mode: Mode::Enabled,
+                interval_seconds: 60,
+                max_seconds: 240,
+                notifier: Some(vec![
+                    notifier.display().to_string(),
+                    exposed.display().to_string(),
+                ]),
+            },
+            f.time,
+        )
+        .await?;
+    let message = f.mail("unhandled").await?;
     followup::reconcile(&f.store, f.time + 241).await?;
+    let business = notifier_business_snapshot(&f.store, message).await?;
+    let mut at = f.time + 542;
+    for attempt in 0..2 {
+        followup::notify_operators(&f.store, at).await?;
+        let failed = f.store.operator_notices("g", 0, 100).await?.remove(0);
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.exposures, attempt + 1);
+        assert!(failed.outstanding_batch.is_none());
+        at = failed.next_attempt;
+    }
+    // Keep the exact configured route and original account. Only the fixture
+    // executable becomes available; it drains input, marks exposure and waits.
+    std::fs::write(
+        &notifier,
+        b"#!/bin/sh\ncat >/dev/null\n: > \"$1\"\nexec /bin/sleep 10\n",
+    )?;
+    std::fs::set_permissions(&notifier, std::fs::Permissions::from_mode(0o700))?;
+    let sender = f.store.clone();
+    let sending = tokio::spawn(async move { followup::notify_operators(&sender, at).await });
+    let barrier = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !exposed.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    // Always cancel/join the dispatcher, including a failed barrier. Its owned
+    // child's kill-on-drop is cleanup, never a durable sender closure receipt.
+    sending.abort();
+    let cancelled = sending.await;
+    barrier?;
+    assert!(
+        cancelled.is_err_and(|error| error.is_cancelled()),
+        "fixture must interrupt a live dispatcher"
+    );
+    let interrupted = f.store.operator_notices("g", 0, 100).await?.remove(0);
+    assert_eq!(interrupted.exposures, 3);
+    assert_eq!(interrupted.state, "exposed");
+    assert_eq!(interrupted.accepted_revision, 0);
+    let batch = interrupted
+        .outstanding_batch
+        .as_ref()
+        .expect("committed third exposure");
+    let spent = notifier_spending_snapshot(&f.store, interrupted.account).await?;
+    assert_eq!(spent.len(), 1);
+    assert_eq!(spent[0].1, 3);
     let pool = support::pool(&f.store).await?;
-    sqlx::query("UPDATE attention_occurrences SET operator_attempts=3,operator_next=?,operator_state='attempting' WHERE stage=3").bind(f.time + 542).execute(&pool).await?;
+    let state: (String, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT state,exposed_at,finished_at FROM operator_notice_batches WHERE id=?",
+    )
+    .bind(batch)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(state.0, "exposed");
+    assert!(state.1.is_some());
+    assert!(state.2.is_none());
+    let results: i64 = sqlx::query_scalar("SELECT count(*) FROM operator_notice_events WHERE batch=? AND kind IN ('transport_result','transport_result_unprojected')")
+        .bind(batch).fetch_one(&pool).await?;
+    assert_eq!(
+        results, 0,
+        "interruption leaves no invented transport result"
+    );
+    pool.close().await;
+    f.store.close().await;
     let store = Store::open(f.temp.path(), false).await?;
-    followup::notify_operators(&store, f.time + 542).await?;
-    let status = store.followup_status(Some("g"), f.time + 542).await?;
-    assert_eq!(status["operator_notifications"][0]["attempts"], 3);
-    assert_eq!(status["operator_notifications"][0]["state"], "uncertain");
+    for time in [at + 6, at + 1000] {
+        followup::notify_operators(&store, time).await?;
+        let held = store.operator_notices("g", 0, 100).await?.remove(0);
+        assert_eq!(held.account, interrupted.account);
+        assert_eq!(held.route_generation, interrupted.route_generation);
+        assert_eq!(held.exposures, 3);
+        assert_eq!(held.state, "uncertain");
+        assert_eq!(held.outstanding_batch, interrupted.outstanding_batch);
+        assert_eq!(held.accepted_revision, 0);
+        assert_eq!(
+            notifier_spending_snapshot(&store, held.account).await?,
+            spent
+        );
+    }
+    let replacement = f.temp.path().join("forbidden-after-interruption.json");
+    store
+        .patch_followups(
+            "g",
+            &followup::PolicyPatch {
+                notifier: Some(Some(vec![
+                    "/usr/bin/tee".into(),
+                    replacement.display().to_string(),
+                ])),
+                ..Default::default()
+            },
+            at + 1001,
+        )
+        .await?;
+    followup::notify_operators(&store, at + 2000).await?;
+    let repaired = store.operator_notices("g", 0, 100).await?.remove(0);
+    assert_eq!(repaired.account, interrupted.account);
+    assert_eq!(repaired.route_generation, interrupted.route_generation + 1);
+    assert_eq!(repaired.state, "uncertain");
+    assert_eq!(repaired.exposures, 0);
+    assert_eq!(repaired.outstanding_batch, interrupted.outstanding_batch);
+    assert_eq!(repaired.accepted_revision, 0);
+    assert!(
+        !replacement.exists(),
+        "route repair cannot retry an interrupted final exposure"
+    );
+    assert_eq!(
+        notifier_spending_snapshot(&store, repaired.account).await?,
+        spent
+    );
+    assert_eq!(notifier_business_snapshot(&store, message).await?, business);
+    assert_eq!(store.inbox(&f.owner, 0).await?.len(), 1);
+    store.close().await;
     Ok(())
 }
 

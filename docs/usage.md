@@ -81,16 +81,18 @@ replace the launcher process. Managed native launches establish the Mail service
 For one operator command, the same identity handling works with any executable:
 
 ```sh
-agent-mail run coordinator -- agent-mail task create api-review "Review API" --owner worker
+agent-mail run coordinator -- agent-mail task create api-review "Review API" --owner worker --untracked
 ```
 
 Custom commands receive identity but no runtime-specific hooks. Hooks are configured
 for executables named `claude` or `codex` (including absolute paths).
 
+The following assignment is an explicitly untracked compatibility example.
+For contracted work use the [contracted task flow](#contracted-tasks-development-surface).
 Inside the coordinator’s session:
 
 ```sh
-agent-mail task create api-review "Review API changes at abc123" --owner worker
+agent-mail task create api-review "Review API changes at abc123" --owner worker --untracked
 ```
 
 Inside the worker’s session:
@@ -539,7 +541,7 @@ ensures the worker is connected and resets notification and verification budgets
 atomically. It preserves identity, pause/prompt policy and business state. Never execute
 an acknowledgment for another agent or obtain its challenge from storage.
 
-Send/reply and task create/update responses include `delivery` per affected
+Send/reply and legacy task create/update responses include `delivery` per affected
 recipient. These diagnostics cannot turn a committed write into an error. A
 missing route means work is stored and awaiting delivery, not lost; do not resend
 under a different key. Notifications and business obligations remain separate.
@@ -732,3 +734,332 @@ backs up the database. Follow-up dispatch covers local tasks and local deliverie
 on Herdr, managed Codex and managed Claude. Remote task snapshots and cross-machine
 waits remain explicitly unsupported for follow-through; existing relay payloads
 retain their original contract.
+
+## Contracted tasks (development surface)
+
+This source increment is awaiting composed remote validation. The installed
+0.10.1 release used for campaign coordination does not provide these commands.
+Managed target lifecycle and controlled text publication now have CLI consumers
+of the runtime owner APIs. These additions await composed validation. Native
+qualification is unavailable and enablement remains held. Task creation, a
+publication receipt or a delivery check does not establish native qualification
+or business acceptance.
+
+Ordinary new `task create` requires a finite contract and explicit authority.
+Incomplete inputs fail without falling back to a legacy task. `--untracked` is the
+intentional compatibility escape for existing scripts and simple record keeping;
+it creates no contract or execution accounting. Existing records are not adopted
+on read. Existing observe and paused policies are preserved.
+
+Finite tasks default to `open`. They can be examined and scheduled automatically
+as soon as their authorization, dependencies, runtime capability, pause, budget
+and active-attempt guards permit; no separate `ready` or `active` update is
+required. The `open` state itself grants no execution authority, and untracked
+legacy records gain none from their state. All eligibility checks, original
+deadlines and execution accounting continue to apply.
+
+Example input (replace the authorization reference with real prior consent):
+
+```sh
+agent-mail task create report 'Produce the review report' --owner worker \
+  --key create-report-1 --reason 'Approved review assignment' \
+  --criterion readable='Report covers the requested revision' \
+  --allow 'read approved repository' --authorize approval/review-42 \
+  --max-attempts 3 --max-elapsed 15m --allow-input-invalidation
+agent-mail task inspect report
+agent-mail task execution show report
+```
+
+The model creates the work, contract, graph, authority, finite execution accounting
+and canonical receipt in one transaction. Readiness is independent of runtime
+capability. `--held` stores an approval hold. `--completion-allowed` explicitly
+permits completed outcomes; writer acceptance is the default. Exact integer cost
+limits use `--max-cost N --cost-unit UNIT`; runtime support must enforce that unit.
+
+Every contract requires `--allow-input-invalidation`: explicit consent to
+invalidate dependent inputs when their basis changes. Creation, adoption and full
+contract replacement reject its omission with `input_invalidation_consent_required`.
+The CLI never adds this consent automatically.
+
+Dependencies are ALL-of: repeat `--after TASK`. The default predicate is an accepted
+outcome without a revision pin. Use `--after-outcome TASK=completed` or
+`--after-revision TASK=REVISION` to change that declared predicate. A parent uses
+`--parent ID --parent-version ID=VERSION`; children are required unless
+`--optional-child` is explicit. `--inherit-authority` requires the declared parent
+and the owner's delegation checks. Satisfied dependencies never grant new scope.
+
+`task adopt ID --version N` takes the same contract, authority, graph, key and
+reason flags, plus an explicit `--deliverable`. Adoption is atomic and preserves
+old history. A contracted record cannot be adopted again to reset spending.
+
+`task decide ID` (alias `task outcome`) uses `--version`, `--key`, and `--reason`.
+It supports ordinary owner/state/next-action changes, `--clear-deadline`,
+`--clear-evidence`, `--resolve MESSAGE_ID`, complete `--replace-contract`,
+`--replace-requirements`, parent set/detach, explicit authorization replacement,
+and `--clear-invalidation`. An authorization-only change requires explicit
+`--approved-scope` units. A version conflict requires inspection and reconsideration;
+the CLI never retries with an automatically refreshed version.
+
+A successful typed outcome uses `--kind accepted|completed --candidate ID` and the
+candidate's immutable revision. Negative outcomes use
+`--kind cancelled|failed --revision REVISION`. `--withdraw-outcome` retains history.
+Business cancellation does not assert that a running process or uncertain effects
+have closed. Legacy `task update`, show/list/history wire shapes remain available;
+the model rejects attempts to bypass a contracted decision through a legacy update.
+
+### Candidates and exact inputs
+
+Capture the exact phase inputs before producing the candidate:
+
+```sh
+agent-mail task inputs report --version VERSION --phase accept > report-inputs.json
+agent-mail task candidate report --version VERSION --key candidate-1 \
+  --revision artifact/review-1 --summary 'Review evidence assembled' \
+  --inputs report-inputs.json --criterion-evidence readable=artifact/review-1
+agent-mail task results report
+```
+
+Instead of `--inputs`, supply the original snapshot with explicit flags:
+`--input-task-version`, `--input-epoch`, `--input-owner-generation`, `--input-phase`,
+and repeated `--prerequisite-outcome TASK=ID`, `--required-child-outcome TASK=ID`,
+and `--ancestor-authority TASK=DIGEST`. Omitted maps are empty, not inferred from
+current state. File and flag snapshots cannot be mixed.
+
+These are input examples, not passing transcripts. Ordinary business candidates
+require the genuine task writer and an Accept snapshot. An exact policy-selected
+reviewer may act only on its actual materialized decision task; that does not
+grant review authority over an ordinary business task. An Execute snapshot cannot be relabeled
+Accept. Preserve the snapshot used to produce the artifact; a fresh snapshot over
+stale output is not revalidation. `task results --after CURSOR` pages immutable
+history. A reported result, idle runtime, or accepted transport is not acceptance.
+
+### Checkpoints, corrections and finite decisions
+
+No JSON file is required to record attention intent:
+
+```sh
+agent-mail task checkpoint report --version VERSION --plan-version PLAN_VERSION \
+  --key next-review-1 --next-step 'Inspect the review evidence' \
+  --check-at 2026-10-02T12:00:00Z --evidence artifact/review-1
+```
+
+Use a future UTC timestamp appropriate to the actual task. `--plan-version` and
+`--version` are distinct. Mail and attention checkpoints accept the same report
+flags. A writer-only `--extend-until UTC --reason TEXT` changes attention timing;
+it does not replenish task attempts, elapsed allowance or cost.
+
+Original-source correction works without an addressed escalation:
+
+```sh
+agent-mail task followup show report --version VERSION
+agent-mail task followup correct report --version VERSION \
+  --plan-id PLAN_ID --plan-version PLAN_VERSION --key correction-1 \
+  --reason 'Correct an obsolete review time' --next-step 'Review current evidence' \
+  --check-at 2026-10-02T12:00:00Z --escalate-at 2026-10-02T12:15:00Z
+```
+
+Use `--plan-absent` only for an inspected missing plan. Supply every unresolved
+`--case-version ID=VERSION`. Mail correction is `mail followup correct MESSAGE`
+with explicit `--recipient NAME`, as original sender. It never resolves delivery.
+`decision show CASE` shows original/effective times, authority and capability holds.
+Advanced `decision correct` accepts a saved exact source guard; the owner's current
+implementation limits this operation to an unmaterialized legacy case.
+
+`decision policy POLICY` is an explicit separate operation, not an atomic option
+on task creation. It requires original `--task ID --version N` or
+`--mail ID --recipient NAME`, exact `--input-epoch`, `--candidate` and `--outcome`
+where present, and finite contract, `--action`, deadline, authority-reference,
+key and reason flags. `--policy-version` selects an existing policy revision;
+omission deliberately selects initial adoption. A reviewer may recommend but
+cannot acquire source-writer authority. `decision writer-fallback TASK` requires
+observed task/case/policy versions and uses the owner's single authorized transition.
+For a materialized strategy decision, `decision continue-strategy TASK` invokes
+the actual atomic source continuation plus ordinary decision outcome. The
+original policy must explicitly include `--action continue-strategy`. Supply the
+observed decision `--version`, `--case-version`, `--policy-version`, original source
+`--execution-version`, immutable `--candidate`, finite `--additional-segments` and
+`--expires-at UTC`, plus `--reason`, `--key`, `--decision-key` and
+`--continuation-key`. The outer key and ordinary decision key must differ.
+`--kind accepted|completed` selects only the successful decision outcome; this
+command permits no unrelated task edits. `Checked::Held` rolls back the whole
+staged operation. Exact successful replay returns the historical receipt. This
+narrow strategy operation does not provide arbitrary source finalization.
+
+### Execution and progress
+
+Record an actual admitted attempt's yield/result/failure without a JSON file:
+
+```sh
+agent-mail task execution report TASK --attempt ATTEMPT --fence FENCE \
+  --dispatch-key DISPATCH_KEY --key REPORT_KEY --kind yield \
+  --summary 'Partial output retained; continuation requested' --evidence artifact/partial
+```
+
+Substitute the complete original correlation. The authenticated runtime owner
+returns its actual `Checked` result under `result`; Ready contains the append
+record ID and Held contains responsible blocking causes. The CLI infers no latest
+attempt and performs no outer current-capability preflight that would reject
+historical replay. Report/yield does not close an attempt, release its slot, accept
+business work, authorize a wait, or schedule a new segment. Physical capture and
+actual predecessor closure remain runtime responsibilities. An attention checkpoint
+is a separate intent report, not execution evidence. The native worker has a
+separate combined Yield transaction using its private original admission basis;
+the raw report command does not imitate it or substitute a latest checkpoint.
+The native review interval is bounded to 1..3600 seconds; the 30-second acceptance
+fixture is one explicit setting.
+
+`task execution schedule ID --version N --execution-version E --key K
+--reason TEXT --check-at UTC` changes only the due time within existing hard limits.
+`task execution stop` additionally requires the exact attempt, fence and dispatch
+key. Its receipt is stop intent, not proof of quiescence. `resolve-clock` requires
+the observed discontinuity generation; no command here resets lifetime budgets.
+
+`task progress policy` takes task/progress versions, a key/reason, `--max-segments`,
+optional `--max-elapsed`, repeated `--milestone ID`, `--milestone-criterion ID=CRITERION`
+and `--milestone-scope ID=UNIT`. `task progress judge` explicitly qualifies or rejects
+an immutable `--report`, or revokes `--revoke-judgment`; it requires the task and
+progress versions. A nonwriter also supplies the exact narrow grant and revision.
+`task progress grant` records/revokes that original-writer consent.
+`task progress history --after CURSOR` pages immutable policy and judgment records.
+Judgments do not create source success or reset attempt/cost allowances.
+
+### Managed targets and controlled text artifacts
+
+These commands require the authenticated home-local actor. Configuration uses a
+group-scoped name; subsequent commands require the exact returned target ID.
+The input examples below require actual provisioned paths, policy references,
+observed versions and original admitted correlation. They are not passing native
+execution transcripts.
+
+```sh
+agent-mail runtime target configure review-target --key configure-1 \
+  --reason 'Approved bounded review' --owner worker --client codex \
+  --cwd /absolute/approved-input --profile staged-files \
+  --artifact-root /absolute/protected-artifacts --configuration approved-policy
+agent-mail runtime target show TARGET_ID
+agent-mail runtime target disable TARGET_ID --generation GENERATION \
+  --revision REVISION --key disable-1 --reason 'Stop new admissions'
+agent-mail runtime target retire TARGET_ID --generation GENERATION \
+  --revision REVISION --key retire-1 --reason 'All work has genuinely closed'
+agent-mail runtime target enable TARGET_ID --generation GENERATION \
+  --revision REVISION --key enable-1 --reason 'Request qualified admission' \
+  --qualification QUALIFICATION_ID
+```
+
+`--client` accepts `codex|claude`; `--profile` accepts `read-only|staged-files`.
+The configuration owner must be the authenticated actor. `--configuration` names
+an existing protected policy; the command does not create policy, isolation or
+qualification evidence. The staged artifact root must already meet the runtime's
+protected-storage rules. Configuration creates a disabled target. Correction
+requires both observed `--generation` and `--revision`; omit both only for initial
+configuration. An exact keyed retry returns its historical receipt; inspect the
+target to learn current enabled/revision/retired state.
+
+Disable prevents new admission while retaining unresolved work. Retire requires
+actual closure of attempts and effects. For an otherwise valid current target,
+enable returns the owner's Held cause `managed_native_qualification_unavailable`.
+A supplied qualification ID cannot enable it. There is no qualification collector
+or qualification command in this increment. The existing `runtime configure
+CLIENT --output PATH` hook generator and `runtime enable NAME` delivery command
+have separate purposes.
+
+The genuine task writer binds an exact task revision to its allowed destination:
+
+```sh
+agent-mail runtime artifact bind BINDING_ID --key binding-1 \
+  --reason 'Approved review output' --task TASK --task-version VERSION \
+  --target TARGET_ID --target-generation TARGET_GENERATION \
+  --destination DESTINATION --scope 'write approved review' \
+  --allowed-path review.txt
+agent-mail runtime artifact show BINDING_ID
+```
+
+Repeat `--allowed-path` for the complete virtual path set. Correction additionally
+requires the observed `--binding-revision`; binding identity and task stay fixed.
+The runtime validates current contract, writer authority, target and destination.
+A binding does not admit an attempt or establish runtime capability.
+
+The original authenticated producer can publish actual bounded UTF-8 input:
+
+```sh
+agent-mail runtime artifact publish TASK --attempt ATTEMPT --fence FENCE \
+  --dispatch-key DISPATCH_KEY --effect EFFECT --destination DESTINATION \
+  --scope 'write approved review' --generation DESTINATION_GENERATION \
+  --task-version VERSION --empty-destination --text-file review.txt=./review.txt
+agent-mail runtime artifact receipt TASK --attempt ATTEMPT --fence FENCE \
+  --dispatch-key DISPATCH_KEY --effect EFFECT
+```
+
+Use `--empty-destination` only when the original expected selection is empty.
+Otherwise supply its exact `--previous-manifest DIGEST`. One is mandatory; the
+CLI never reads a newer generation, task version, attempt or selection to refresh
+a request. Keep the original effect and bytes for retries. Changed retry input
+conflicts. `--generation` here is the destination generation, distinct from target
+configuration generation. All guards still pass through the owner transaction.
+
+Each repeated `--text-file VIRTUAL_PATH=INPUT_FILE` reads a real regular local file.
+The CLI bounds reads before publication: at most 16 files, 4 KiB per file, 12 KiB
+of total UTF-8 content, and an 8 KiB manifest. Virtual paths are canonical relative
+paths, at most 256 bytes, with no duplicate or file/directory collision. The CLI
+computes content digests and validates the manifest and content objects. The owner
+alone opens protected artifact storage and commits selection and receipt; a
+successful file read does not imply publication.
+
+Configure, disable, retire, enable, bind and publish also accept `--file PATH`
+(or `--file -` for stdin), mutually exclusive with mutation flags. The JSON envelope
+is bounded to 128 KiB before parsing and must match the positional identity and
+selected command. Configure/change/bind use their actual owner request DTOs.
+Publish uses `{"request": PublicationRequest, "contents": ManagedArtifactContents}`;
+its request must explicitly include `expected_manifest` (null for empty) and a
+non-null `expected_task_version`, plus the same group/task identity as the command.
+This is an advanced form of the same guarded operation.
+
+Mutations emit schema-1 envelopes: configuration under `receipt`, binding under
+`binding`, and lifecycle/publication under `result` with the owner's actual Ready
+or Held value. Inspect the result; Held does not mean the requested enablement or
+publication succeeded. The owner may still retain blocking causes and accounting.
+Target show aliases capability inspection, preserving the owner's nested schema-2
+view. Target/binding reads preserve `present:false` versus errors. Receipt reads
+require the original producer binding and correlation, even after publication;
+an ordinary writer or rebound owner cannot use them as a general review API.
+A genuine unattended writer review consumer and its protected retained-content
+access remain future work. Publication alone creates no business candidate or
+accepted outcome.
+
+### Honest status and publication boundaries
+
+Human status displays policy and follow-up totals even with no registered agents.
+JSON retains legacy fields and adds `schema_version` and `followup_policy`.
+Notifier or Herdr route configuration is distinct from actual receipt and handling.
+
+`task list --details [--after ID] [--limit 1..50]` reads one authenticated home-task
+page visible to the current owner or writer. It includes terminal work and labels
+legacy records untracked. `status --tasks` adds the same bounded page to human
+status; add `--json` for full model, execution, cost and cause fields. These options
+require the actual agent credential and cannot be combined with `--all-groups`.
+The page returns `has_more` and `next_cursor`; follow that cursor rather than
+assuming omitted work is absent. Model and per-task execution reads have separate
+observation times and `atomic_snapshot:false`. Storage/authority/graph errors are
+errors, not empty successful pages. Ordinary legacy `task list` remains unchanged.
+
+`runtime capabilities TARGET_ID` uses the exact identity returned by registration,
+not an agent alias. It reports absent targets as `present:false`, distinguishes
+storage/authentication errors from absence, and returns the runtime owner's twelve
+capability dimensions with actual optional witness times. A qualified profile at
+observation time still grants no task admission. Delivery Ready, stored enablement
+or a configuration value does not establish qualification. Staged native execution,
+native session recovery and cost enforcement remain unsupported by the current
+runtime implementation. Inspection does not enable, repair, renew or launch a target.
+
+Inspect task/execution details for model holds, due times, inclusive ancestor
+budgets and terminal cleanup. Unknown cost remains unknown; do not add parent and
+child inclusive totals together. Delivery Ready does not qualify a managed profile.
+
+The accepted future controlled-artifact protocol seals protected immutable bytes
+before the SQL transaction. Publication occurs only when the transaction validates
+current original phase/scope/action/input and admitted execution/destination guards,
+CAS-selects the manifest and commits its receipt. Missing bytes retain history plus
+uncertainty. Replay after rebind is historical. Arbitrary mutable exports and atomic
+filesystem-pointer-plus-SQL claims are unsupported; unknown effects retain their
+execution slot. This paragraph describes the protocol boundary, not a shipped
+publication command.
