@@ -293,8 +293,8 @@ impl Store {
     /// # Errors
     /// The database query fails.
     pub async fn native_status(&self) -> Result<Value> {
-        let rows = sqlx::query!("SELECT m.group_name,m.name,c.runtime,c.binding_version,m.binding_version AS current_version,c.socket,c.thread,c.delivered,c.attempted,c.attempts,c.next_attempt,i.activity AS inbox_activity FROM runtime_wakes c JOIN mailboxes m ON m.id=c.recipient LEFT JOIN claude_inboxes i ON i.recipient=c.recipient").fetch_all(self.pool()).await?;
-        Ok(Value::Array(rows.into_iter().map(|r| json!({"group":r.group_name,"participant":r.name,"runtime":r.runtime,"transport":if r.inbox_activity.is_some(){"inbox"}else{"native"},"activity":r.inbox_activity,"socket":r.socket,"thread":r.thread,"binding_current":r.binding_version==r.current_version,"delivered_through":r.delivered,"attempted_through":r.attempted,"attempts":r.attempts,"next_attempt":r.next_attempt})).collect()))
+        let rows = sqlx::query!("SELECT m.group_name,m.name,c.runtime,c.binding_version,m.binding_version AS current_version,c.socket,c.thread,c.scanned,c.delivered,c.attempted,c.attempts,c.next_attempt,i.activity AS inbox_activity FROM runtime_wakes c JOIN mailboxes m ON m.id=c.recipient LEFT JOIN claude_inboxes i ON i.recipient=c.recipient").fetch_all(self.pool()).await?;
+        Ok(Value::Array(rows.into_iter().map(|r| json!({"group":r.group_name,"participant":r.name,"runtime":r.runtime,"transport":if r.inbox_activity.is_some(){"inbox"}else{"native"},"activity":r.inbox_activity,"socket":r.socket,"thread":r.thread,"binding_current":r.binding_version==r.current_version,"delivered_through":r.delivered,"attempted_through":r.attempted,"attempts":r.attempts,"next_attempt":r.next_attempt,"delivery_unconfirmed":r.attempted>r.scanned && r.attempts>0,"delivery_detail":if r.attempted>r.scanned && r.attempts>0 {Some("Reserved wake has no confirmed receipt; execution may have started")}else{None}})).collect()))
     }
     pub(crate) async fn has_native(&self, actor: &Mailbox) -> Result<bool> {
         Ok(sqlx::query!(
@@ -334,6 +334,9 @@ pub(crate) async fn tick(store: &Store, time: i64) -> Result<Vec<Observation>> {
 }
 
 async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliveryState> {
+    let Some(_wake_lock) = crate::service::wake_lock(store.root(), actor.id)? else {
+        return Ok(DeliveryState::Ineligible);
+    };
     let group = store.group(&actor.group_name).await?;
     if group.paused != 0 {
         return Ok(DeliveryState::Paused);
@@ -358,7 +361,8 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
     if latest == endpoint.attempted && endpoint.attempts >= 3 {
         return Ok(DeliveryState::Exhausted);
     }
-    if latest == endpoint.attempted && endpoint.next_attempt > time {
+    // A new event must not bypass a reserved or ambiguous attempt.
+    if endpoint.attempted > endpoint.scanned && endpoint.next_attempt > time {
         return Ok(DeliveryState::Waiting);
     }
     let thread = Uuid::parse_str(&endpoint.thread)?;
@@ -395,7 +399,7 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
     let mut tx = store.pool().begin().await?;
     Store::lock_actor(&mut tx, actor).await?;
     let next = time + 300;
-    let reserved = sqlx::query!("UPDATE runtime_wakes SET attempts=CASE WHEN attempted=? THEN attempts+1 ELSE 1 END, attempted=?,next_attempt=? WHERE recipient=? AND binding_version=? AND socket=? AND thread=? AND scanned<? AND (attempted<>? OR next_attempt<=?) AND (attempted<>? OR attempts<3) AND EXISTS(SELECT 1 FROM groups WHERE name=? AND paused=0)",latest,latest,next,actor.id,actor.binding_version,endpoint.socket,endpoint.thread,latest,latest,time,latest,actor.group_name).execute(&mut *tx).await?.rows_affected();
+    let reserved = sqlx::query!("UPDATE runtime_wakes SET attempts=CASE WHEN attempted=? THEN attempts+1 ELSE 1 END, attempted=?,next_attempt=? WHERE recipient=? AND binding_version=? AND socket=? AND thread=? AND scanned<? AND (attempted<=scanned OR next_attempt<=?) AND (attempted<>? OR attempts<3) AND EXISTS(SELECT 1 FROM groups WHERE name=? AND paused=0)",latest,latest,next,actor.id,actor.binding_version,endpoint.socket,endpoint.thread,latest,time,latest,actor.group_name).execute(&mut *tx).await?.rows_affected();
     if reserved != 0 && inbox {
         sqlx::query!(
             "UPDATE claude_inboxes SET pending_id=?,pending_event=? WHERE recipient=?",
@@ -423,23 +427,6 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
     let delivery = store
         .delivery(actor, challenge.as_deref(), endpoint.scanned)
         .await?;
-    // Reserve exact visible versions before external I/O. If the response is lost,
-    // only a persisted runtime user-input/turn receipt can complete this offer.
-    if !inbox && kind == NativeRuntime::Codex && !active {
-        let mut tx = store.pool().begin().await?;
-        Store::lock_actor(&mut tx, actor).await?;
-        crate::turns::offer_tx(
-            &mut tx,
-            actor,
-            &message_id,
-            "codex",
-            &endpoint.thread,
-            &delivery.events,
-            time,
-        )
-        .await?;
-        tx.commit().await?;
-    }
     // Hold the binding lock during the bounded send: replacement/detachment cannot race it.
     let mut tx = store.pool().begin().await?;
     Store::lock_actor(&mut tx, actor).await?;
@@ -486,6 +473,9 @@ pub(crate) async fn send_verification(
     nonce: &str,
     time: i64,
 ) -> Result<()> {
+    let Some(_wake_lock) = crate::service::wake_lock(store.root(), actor.id)? else {
+        return Ok(());
+    };
     let endpoint = sqlx::query!(
         "SELECT runtime,socket,thread FROM runtime_wakes WHERE recipient=? AND binding_version=?",
         actor.id,

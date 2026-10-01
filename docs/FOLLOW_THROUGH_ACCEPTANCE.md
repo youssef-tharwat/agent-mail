@@ -1,5 +1,8 @@
 # Follow-through implementation evidence
 
+This records the earlier rollout. For the reduced continuation implementation and
+its current executable acceptance evidence, see [Minimal continuation](MINIMAL_CONTINUATION.md).
+
 Implementation and live acceptance date: 2026-09-30. Baseline: `378f58b` plus the
 checkout's existing automatic-upgrade changes. The authorized live rollout migrated
 an existing campaign from schema 17 to 18 with a verified backup and worker handoff,

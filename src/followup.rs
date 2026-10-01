@@ -749,43 +749,6 @@ async fn publish_dependency_ready(
     Ok(())
 }
 
-/// A successful runtime turn ended with a specific offered plan still outstanding.
-/// Version/stage guards coalesce duplicate receipts and overlapping hook/queue offers.
-pub(crate) async fn turn_completed(
-    tx: &mut Transaction<'_, Sqlite>,
-    actor: &Mailbox,
-    id: i64,
-    version: i64,
-    offered_stage: i64,
-    time: i64,
-) -> Result<()> {
-    let Some(p) = sqlx::query_as::<_, Plan>("SELECT f.* FROM active_followups f JOIN followup_policy p ON p.group_name=f.group_name JOIN groups g ON g.name=f.group_name WHERE f.id=? AND f.version=? AND f.stage=? AND p.mode='enabled' AND g.paused=0")
-        .bind(id).bind(version).bind(offered_stage).fetch_optional(&mut **tx).await? else {return Ok(());};
-    let report = p.report()?;
-    if report.as_ref().is_some_and(|r| r.next_check_at > time) && !waiting_satisfied(tx, &p).await?
-    {
-        return Ok(());
-    }
-    // Approval and review holds do not authorize implementation or corrective wakes.
-    let held: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_items WHERE group_name=? AND id=? AND state IN ('blocked','review'))")
-        .bind(&p.group_name).bind(&p.task).fetch_one(&mut **tx).await?;
-    if held {
-        return Ok(());
-    }
-    if p.stage == 3 {
-        if actor.id == p.authority {
-            sqlx::query("UPDATE attention_occurrences SET operator_after=MIN(operator_after,?) WHERE followup=? AND plan_version=? AND stage=3")
-                .bind(time).bind(p.id).bind(p.version).execute(&mut **tx).await?;
-        }
-        return Ok(());
-    }
-    if actor.id != p.recipient {
-        return Ok(());
-    }
-    let stage = if p.stage == 0 { 1 } else { 3 };
-    advance_attention(tx, &p, stage, time).await
-}
-
 async fn advance_attention(
     tx: &mut Transaction<'_, Sqlite>,
     p: &Plan,
@@ -884,10 +847,11 @@ pub async fn reconcile(store: &Store, time: i64) -> Result<()> {
                 .execute(&mut *tx)
                 .await?;
         }
+        let held:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_items WHERE group_name=? AND id=? AND state IN ('blocked','review'))").bind(&p.group_name).bind(&p.task).fetch_one(&mut *tx).await?;
         if p.stage == 3 {
-            if newly_satisfied {
-                // A hold may become ready after escalation. Wake its owner once while
-                // retaining the authority's escalation and the original hard boundary.
+            if newly_satisfied && !held {
+                // A dependency may become ready after escalation. Wake an unheld owner
+                // while retaining the authority's escalation and hard boundary.
                 publish_dependency_ready(&mut tx, &p, time).await?;
             }
             continue;
@@ -900,20 +864,16 @@ pub async fn reconcile(store: &Store, time: i64) -> Result<()> {
         if unread && !exhausted && !hard_due && !satisfied {
             continue;
         }
-        let held:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_items WHERE group_name=? AND id=? AND state IN ('blocked','review'))").bind(&p.group_name).bind(&p.task).fetch_one(&mut *tx).await?;
-        let stage = if hard_due
-            || (unread && exhausted)
-            || (waiting && !satisfied)
-            || (held && report.is_none())
-            || p.stage >= 2
-        {
-            3
-        } else {
-            p.stage + 1
-        };
+        let stage =
+            if hard_due || (unread && exhausted) || (waiting && !satisfied) || held || p.stage >= 2
+            {
+                3
+            } else {
+                p.stage + 1
+            };
         // Escalation is attention metadata, never a recursive mail obligation.
         advance_attention(&mut tx, &p, stage, time).await?;
-        if stage == 3 && newly_satisfied {
+        if stage == 3 && newly_satisfied && !held {
             publish_dependency_ready(&mut tx, &p, time).await?;
         }
     }
@@ -953,11 +913,8 @@ impl Store {
         }
         let notifications=sqlx::query("SELECT o.id,f.group_name,o.operator_state,o.operator_detail,o.operator_attempts,o.operator_next FROM active_attention o JOIN followups f ON f.id=o.followup WHERE o.stage=3 AND (? IS NULL OR f.group_name=?) AND (? IS NULL OR f.recipient=? OR f.authority=?) ORDER BY o.id DESC LIMIT 101").bind(group).bind(group).bind(actor).bind(actor).bind(actor).fetch_all(self.pool()).await?;
         let alerts:Vec<Value>=notifications.iter().take(100).map(|r|json!({"id":r.get::<i64,_>("id"),"group":r.get::<String,_>("group_name"),"state":r.get::<String,_>("operator_state"),"detail":r.get::<Option<String>,_>("operator_detail"),"attempts":r.get::<i64,_>("operator_attempts"),"next_attempt":r.get::<i64,_>("operator_next")})).collect();
-        let turns = sqlx::query("SELECT o.id,b.name,o.runtime,o.session,o.turn,o.state,o.created,o.completed_at,(SELECT COUNT(*) FROM turn_offer_items i WHERE i.offer=o.id) AS records FROM turn_offers o JOIN mailboxes b ON b.id=o.recipient WHERE (? IS NULL OR b.group_name=?) AND (? IS NULL OR o.recipient=?) AND o.binding_version=b.binding_version ORDER BY o.created DESC,o.id LIMIT 51")
-            .bind(group).bind(group).bind(actor).bind(actor).fetch_all(self.pool()).await?;
-        let turn_receipts: Vec<Value> = turns.iter().take(50).map(|r| json!({"offer":r.get::<String,_>("id"),"agent":r.get::<String,_>("name"),"runtime":r.get::<String,_>("runtime"),"session":r.get::<String,_>("session"),"turn":r.get::<Option<String>,_>("turn"),"state":r.get::<String,_>("state"),"records":r.get::<i64,_>("records"),"created":r.get::<i64,_>("created"),"completed_at":r.get::<Option<i64>,_>("completed_at")})).collect();
         Ok(
-            json!({"totals":{"pending":totals.get::<i64,_>("pending"),"due":totals.get::<i64,_>("due"),"escalated":totals.get::<i64,_>("escalated")},"items":items,"more":more || notifications.len()>100,"operator_notifications":alerts,"turn_receipts":turn_receipts,"turn_receipts_more":turns.len()>50,"remote_followup":"unsupported"}),
+            json!({"totals":{"pending":totals.get::<i64,_>("pending"),"due":totals.get::<i64,_>("due"),"escalated":totals.get::<i64,_>("escalated")},"items":items,"more":more || notifications.len()>100,"operator_notifications":alerts,"remote_followup":"unsupported"}),
         )
     }
 }

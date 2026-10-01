@@ -261,86 +261,96 @@ async fn running_worker_wakes_for_a_new_checkpoint_before_its_recovery_scan() ->
 }
 
 #[tokio::test]
-async fn completed_turns_cover_only_offered_versions_and_escalate_once() -> Result<()> {
+async fn turn_boundaries_leave_task_deadlines_pending_and_restart_recovers_them() -> Result<()> {
     let f = Fixture::new().await?;
-    f.task("offered").await?;
-    f.hook("SessionStart", f.time).await?;
-    f.task("later").await?;
-    f.hook("Stop", f.time + 1).await?;
-    let pool = support::pool(&f.store).await?;
-    let stages: Vec<(String, i64)> =
-        sqlx::query_as("SELECT task,stage FROM followups ORDER BY task")
-            .fetch_all(&pool)
-            .await?;
-    assert_eq!(stages, vec![("later".into(), 0), ("offered".into(), 1)]);
-    f.hook("Stop", f.time + 2).await?;
-    assert_eq!(
-        f.events(&f.owner).await?.len(),
-        1,
-        "duplicate Stop is idempotent"
-    );
-    // The corrective attention is actually supplied to a subsequent turn.
-    f.hook("UserPromptSubmit", f.time + 3).await?;
-    f.hook("Stop", f.time + 4).await?;
-    assert_eq!(f.events(&f.writer).await?.len(), 1);
-    let stage: i64 = sqlx::query_scalar("SELECT stage FROM followups WHERE task='offered'")
-        .fetch_one(&pool)
-        .await?;
-    assert_eq!(stage, 3);
-    assert!(f.store.work_show(&f.owner, "offered").await?.state != TaskState::Done);
-    // History survives reopening; replaying Stop cannot create more attention.
-    pool.close().await;
-    f.store.close().await;
-    let store = Store::open(f.temp.path(), false).await?;
-    store
-        .hook(
-            &f.owner,
-            serde_json::from_value(
-                json!({"hook_event_name":"Stop","session_id":"followup-test-session"}),
-            )?,
-            f.time + 5,
-        )
-        .await?;
-    assert_eq!(
-        store.attention_list(&f.writer, 0).await?["items"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn completed_turns_respect_checkpoints_holds_and_changed_versions() -> Result<()> {
-    let f = Fixture::new().await?;
-    f.task("checkpoint").await?;
-    f.task("held").await?;
-    f.task("revised").await?;
+    f.task("partial").await?;
     f.hook("SessionStart", f.time).await?;
     f.store
         .checkpoint(
             &f.owner,
             Source::Task {
-                id: "checkpoint".into(),
+                id: "partial".into(),
                 version: 1,
             },
-            "planned",
+            "partial-progress",
             f.checkpoint(),
             f.time + 1,
         )
         .await?;
-    for (id, state) in [("held", Some(TaskState::Blocked)), ("revised", None)] {
+    // Neither status reads, a status reply, nor a successful or failed turn settles work.
+    f.store.followup_status(Some("g"), f.time + 2).await?;
+    f.store
+        .publish(
+            &f.owner,
+            Publish {
+                recipients: vec!["writer".into()],
+                key: "status".into(),
+                summary: "Partial progress".into(),
+                body: "Remaining evidence still needs inspection".into(),
+                due_after: None,
+                reply_to: None,
+                work_id: Some("partial".into()),
+            },
+            f.time + 2,
+        )
+        .await?;
+    for event in ["Stop", "Stop", "StopFailure", "SessionEnd"] {
+        assert_eq!(f.hook(event, f.time + 3).await?, json!({}));
+    }
+    assert!(f.events(&f.owner).await?.is_empty());
+    f.store.close().await;
+    let store = Store::open(f.temp.path(), false).await?;
+    // No new messages or turn receipts: only the persisted deadline drives this scan.
+    agent_mail::service::tick(&store, f.time + 90).await?;
+    let items = store.attention_list(&f.owner, 0).await?;
+    assert_eq!(items["items"].as_array().unwrap().len(), 1);
+    agent_mail::service::tick(&store, f.time + 90).await?;
+    assert_eq!(
+        store.attention_list(&f.owner, 0).await?["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let task = store.work_show(&f.owner, "partial").await?;
+    assert_eq!(task.state, TaskState::Active);
+    assert_eq!(task.version, 1);
+    // Continued silence reaches the named writer, exactly once.
+    agent_mail::service::tick(&store, f.time + 150).await?;
+    agent_mail::service::tick(&store, f.time + 210).await?;
+    agent_mail::service::tick(&store, f.time + 240).await?;
+    let writer = store.attention_list(&f.writer, 0).await?;
+    assert!(
+        writer["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["reason"] == "escalation")
+    );
+    assert_eq!(
+        store.work_show(&f.owner, "partial").await?.state,
+        TaskState::Active
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn holds_with_active_checkpoints_escalate_to_writer_without_worker_reminders() -> Result<()> {
+    let f = Fixture::new().await?;
+    for (id, state) in [
+        ("approval", TaskState::Blocked),
+        ("review", TaskState::Review),
+    ] {
+        f.task(id).await?;
         f.store
             .update_work(
                 &f.writer,
                 id,
                 WorkUpdate {
                     version: 1,
-                    reason: "Record current decision".into(),
+                    reason: "Await coordinator decision".into(),
                     patch: WorkPatch {
-                        state,
-                        next_action: Some("Wait for the recorded decision".into()),
+                        state: Some(state),
                         ..Default::default()
                     },
                     resolve_message: None,
@@ -348,71 +358,34 @@ async fn completed_turns_respect_checkpoints_holds_and_changed_versions() -> Res
                 f.time + 1,
             )
             .await?;
-    }
-    f.hook("Stop", f.time + 2).await?;
-    assert!(f.events(&f.owner).await?.is_empty());
-    // Offering the current held task still does not authorize implementation.
-    f.hook("SessionStart", f.time + 3).await?;
-    f.hook("Stop", f.time + 4).await?;
-    let pool = support::pool(&f.store).await?;
-    let held: i64 = sqlx::query_scalar("SELECT stage FROM followups WHERE task='held'")
-        .fetch_one(&pool)
-        .await?;
-    let planned: i64 = sqlx::query_scalar("SELECT stage FROM followups WHERE task='checkpoint'")
-        .fetch_one(&pool)
-        .await?;
-    assert_eq!((held, planned), (0, 0));
-    Ok(())
-}
-
-#[tokio::test]
-async fn failed_turn_and_wrong_session_do_not_invent_completion() -> Result<()> {
-    let f = Fixture::new().await?;
-    f.task("work").await?;
-    f.hook("SessionStart", f.time).await?;
-    f.store
-        .hook(
-            &f.owner,
-            serde_json::from_value(json!({"hook_event_name":"Stop","session_id":"other"}))?,
-            f.time + 1,
-        )
-        .await?;
-    assert!(f.events(&f.owner).await?.is_empty());
-    f.hook("StopFailure", f.time + 2).await?;
-    f.hook("Stop", f.time + 3).await?;
-    assert!(f.events(&f.owner).await?.is_empty());
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_new_revision_offered_during_the_same_turn_is_not_hidden_by_the_old_one() -> Result<()> {
-    let f = Fixture::new().await?;
-    f.task("review").await?;
-    f.hook("SessionStart", f.time).await?;
-    f.store
-        .update_work(
-            &f.writer,
-            "review",
-            WorkUpdate {
-                version: 1,
-                reason: "New review scope".into(),
-                patch: WorkPatch {
-                    next_action: Some("Check the new revision".into()),
-                    ..Default::default()
+        // A checkpoint describes a next step; it cannot release an approval hold.
+        f.store
+            .checkpoint(
+                &f.owner,
+                Source::Task {
+                    id: id.into(),
+                    version: 2,
                 },
-                resolve_message: None,
-            },
-            f.time + 1,
-        )
-        .await?;
-    f.hook("PostToolUse", f.time + 2).await?;
-    f.hook("Stop", f.time + 3).await?;
-    let pool = support::pool(&f.store).await?;
-    let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM turn_offer_items")
-        .fetch_one(&pool)
-        .await?;
-    assert_eq!(versions, 2);
-    assert_eq!(f.events(&f.owner).await?.len(), 1);
+                &format!("checkpoint-{id}"),
+                Checkpoint {
+                    version: 1,
+                    ..f.checkpoint()
+                },
+                f.time + 2,
+            )
+            .await?;
+    }
+    agent_mail::service::tick(&f.store, f.time + 90).await?;
+    assert!(f.events(&f.owner).await?.is_empty());
+    assert_eq!(f.events(&f.writer).await?.len(), 2);
+    assert_eq!(
+        f.store.work_show(&f.owner, "approval").await?.state,
+        TaskState::Blocked
+    );
+    assert_eq!(
+        f.store.work_show(&f.owner, "review").await?.state,
+        TaskState::Review
+    );
     Ok(())
 }
 

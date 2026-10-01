@@ -581,27 +581,25 @@ Calling `attention configure` without flags reads the effective policy. Optional
 {"mode":"enabled","interval_seconds":900,"max_seconds":3600,"notifier":null}
 ```
 
-Native Codex delivery correlates its client message ID with persisted user input
-and completed-turn notifications. Trusted Claude/Codex hooks record the bounded
-context they supply and reconcile it at Stop. Only versions offered to that turn
-are considered; later arrivals, superseded records, valid checkpoints, and explicit
-blocked/review holds are excluded. One unhandled completed turn creates corrective
-attention; ignoring that offered correction in a later completed turn escalates
-to the task writer or mail sender. Duplicate receipts are idempotent, including
-after worker restart. A queue receipt or idle runtime state is never a completion.
+Follow-through uses persisted task and checkpoint deadlines. Turn endings, idle
+runtime state, delivery receipts, and status replies never settle a task. The
+existing service scans those deadlines and recovers them after restart; no runtime
+completion subscription is required. Record the next action and check time when
+yielding with unfinished work.
 
-Dependency changes prioritize reconciliation immediately through service hints.
-The interval and maximum remain recovery bounds for missed lifecycle events,
-unavailable runtimes, and overdue checkpoints. The timer path retains two reminder
-opportunities before escalation. `max` must be at least four intervals and at most
-seven days. Existing pause and Herdr prompt policies still apply. These times are
-independent of business deadlines.
+The timer path provides two reminder opportunities before escalation to the task
+writer or mail sender. Blocked and review tasks receive no worker reminders,
+even with an active checkpoint; due holds go to their decision owner. Dependency
+changes prioritize reconciliation through service hints. `max` must be at least
+four intervals and at most seven days. Existing pause and Herdr prompt policies
+still apply. These times are independent of business deadlines. No adapter answers
+approval requests.
 
-Native Codex subscriptions rejoin only already loaded threads and replay a bounded
-recent history page after reconnect. Older clients without correlated input IDs,
-Claude bridge sessions without trusted hooks, and Herdr sessions without lifecycle
-hooks retain timer recovery. Failed/interrupted turns and missing history never
-count as successful completion. No adapter answers approval requests.
+External wakes, including verification prompts, are serialized per participant.
+Native status reports `delivery_unconfirmed` when a persisted reservation has no
+confirmed receipt. This survives a worker restart and means execution may have
+started. A fresh event cannot bypass that reservation's retry delay. Runtime
+errors and timeouts appear in the worker's service observations.
 
 ### Record a next step when yielding
 
@@ -707,14 +705,12 @@ with a new bounded operator budget. It does not reset business delivery attempts
 on process supervision to restart before it can send anything.
 
 Status totals cover all active sources, even when its detail list is truncated.
-`turn_receipts` distinguishes reserved offers from correlated completed turns;
-these receipts never imply a business outcome.
 Agent checks filter before pagination. Recovery responses stay within 4 KiB and
 mark only returned records retrieved; `checkpoints_more` directs agents to fetch
 full metadata through `task show` or `mail show`.
 
-Schema 19 adds durable turn offers and preserves existing attention metadata,
-business records, and receipts. Event subscriptions use protocol 2; an old subscriber gets an explicit
+Existing migration history, including the unused schema 19 turn-offer tables, is
+preserved for upgrade compatibility. This simplification adds no schema migration. Event subscriptions use protocol 2; an old subscriber gets an explicit
 upgrade error. The existing automatic upgrade path drains the old worker and
 backs up the database. Follow-up dispatch covers local tasks and local deliveries
 on Herdr, managed Codex and managed Claude. Remote task snapshots and cross-machine

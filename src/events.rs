@@ -28,7 +28,6 @@ pub struct Notification {
 
 pub(crate) struct Delivery {
     pub text: String,
-    pub events: Vec<Notification>,
 }
 
 impl Store {
@@ -335,10 +334,7 @@ impl Store {
                 text.push_str(&crate::verification::challenge(actor, nonce));
             }
             if text.len() <= limit {
-                return Ok(Delivery {
-                    text,
-                    events: visible,
-                });
+                return Ok(Delivery { text });
             }
             if visible.is_empty() {
                 let mut recovery = String::from(
@@ -351,10 +347,7 @@ impl Store {
                     recovery.len() <= limit,
                     "notification recovery instruction exceeds transport limit"
                 );
-                return Ok(Delivery {
-                    text: recovery,
-                    events: vec![],
-                });
+                return Ok(Delivery { text: recovery });
             }
             visible.remove(0);
             more = true;

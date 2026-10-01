@@ -406,10 +406,10 @@ does not process events or wake the model. Do not keep a polling loop or reset
 transport budgets to simulate progress. New groups enable follow-through by default. Operators can opt out with
 `init GROUP --no-follow-through` or `attention configure --observe`; existing saved
 policies survive upgrades. Direct configuration flags preserve omitted settings.
-Where the runtime provides correlated completion receipts, ending a turn without
-an outcome or valid checkpoint triggers one corrective notification, then escalation
-if its next covered turn still ignores it. Later arrivals and explicit holds are
-not treated as neglected work. Timers recover missed events and overdue commitments.
+The service reconciles persisted task and checkpoint deadlines after turn endings
+and worker restarts. Two unattended reminder opportunities lead to escalation to
+the task writer or mail sender. A status reply leaves unfinished work pending.
+Blocked and review holds receive decision escalation without worker reminders.
 Status identifies the policy and whether an independent operator route exists.
 
 ## Shared contracts and evidence

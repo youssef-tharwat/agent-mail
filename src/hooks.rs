@@ -35,15 +35,7 @@ impl Store {
             input.hook_event_name,
             HookEvent::Stop | HookEvent::StopFailure | HookEvent::SessionEnd
         ) {
-            self.finish_hook(
-                actor,
-                &input.session_id,
-                input.hook_event_name == HookEvent::Stop,
-                now,
-            )
-            .await?;
-            // A completed turn only reconciles previously offered records. In
-            // particular, never discover fresh work at Stop and blame that turn.
+            // Task deadlines survive every turn boundary; hooks do not settle work.
             if follow_through {
                 return Ok(json!({}));
             }
@@ -97,47 +89,6 @@ impl Store {
         if instructions {
             payload.push_str("\n\n");
             payload.push_str(crate::SKILL);
-        }
-        if follow_through {
-            use crate::{events::Notification, states::EventKind};
-            let mut offered = events;
-            for (field, kind) in [
-                ("work", EventKind::WorkChanged),
-                ("mail", EventKind::MailPending),
-            ] {
-                if let Some(items) = context[field].as_array() {
-                    for item in items {
-                        let subject = item["id"]
-                            .as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| item["id"].to_string());
-                        offered.push(Notification {
-                            id: 0,
-                            kind,
-                            subject,
-                            version: item["version"].as_i64().unwrap_or(0),
-                        });
-                    }
-                }
-            }
-            if let Some(items) = context["followups"]["items"].as_array() {
-                for item in items {
-                    offered.push(Notification {
-                        id: 0,
-                        kind: EventKind::AttentionDue,
-                        subject: item["id"].to_string(),
-                        version: 0,
-                    });
-                }
-            }
-            self.hook_offer(
-                actor,
-                &input.session_id,
-                reset || input.hook_event_name == HookEvent::UserPromptSubmit,
-                &offered,
-                now,
-            )
-            .await?;
         }
         if stop {
             if actionable {

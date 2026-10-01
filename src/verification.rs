@@ -502,6 +502,9 @@ async fn send_herdr(
     socket: &Path,
     now: i64,
 ) -> Result<()> {
+    let Some(_wake_lock) = crate::service::wake_lock(store.root(), actor.id)? else {
+        return Ok(());
+    };
     let binding = actor.binding.herdr().context("missing binding")?;
     let live = crate::herdr::agent(socket, &binding.pane).await?;
     if !live.matches(actor) || !live.ready() {

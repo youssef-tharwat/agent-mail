@@ -85,15 +85,15 @@ does not count as handling the work. Agents can checkpoint unfinished work with
 its next action, a dependency or approval hold, and a review time. The work remains
 pending until an ordinary task decision or mail outcome settles it.
 
-Where the configured runtime provides a correlated completion receipt, Agent Mail
-checks the exact record versions offered to that turn when it ends. Later arrivals
-are excluded; valid checkpoints and blocked or review holds are respected. Ignored
-work gets one corrective notification, then escalates if the next covered turn
-still leaves it unhandled.
+The existing service schedules the next check from durable task and checkpoint
+state. Ending a turn or replying with status leaves unfinished work pending.
+After a restart, the service reconciles the same deadlines. It sends bounded
+reminders, then escalates unresolved work to the task writer or request sender.
+Blocked and review tasks escalate for a decision without worker reminders.
 
-Dependency changes also trigger reconciliation. Timers remain for overdue
-commitments, disconnected clients, and missing lifecycle signals; an idle agent
-alone is not proof that a turn handled its work.
+Wake attempts are serialized per participant. Reserved native wakes without a
+confirmed receipt remain visible in status, including after restart; fresh events
+cannot bypass their retry delay. Delivery acceptance never completes work.
 
 Configure a group's policy directly from the CLI:
 
@@ -117,6 +117,8 @@ Replace the path with an executable that accepts an alert as JSON on stdin. Add
 arguments with repeated `--notifier-arg VALUE` options; use `--clear-notifier` to
 remove the override. Without an operator route, status reports `unconfigured`.
 An approval hold remains a hold until the responsible person authorizes the action.
+
+See [minimal continuation and acceptance evidence](docs/MINIMAL_CONTINUATION.md).
 
 See [follow-through configuration and checkpoints](docs/usage.md#follow-through-after-delivery)
 for policy options, wait conditions, and operator notifications.
