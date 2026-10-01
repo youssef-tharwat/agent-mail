@@ -22,25 +22,29 @@ needed. [Other installation options](docs/usage.md#install).
 
 ## Start a project
 
-Create a group for your project or fleet:
+Create a group for your project or fleet. Follow-through is enabled by default:
 
 ```sh
-agent-mail init my-project
+agent-mail init my-fleet
 ```
 
 Launch each agent in its own terminal, using that same group:
 
 ```sh
 # Terminal 1
-agent-mail --group my-project run coordinator -- codex
+agent-mail --group my-fleet run coordinator -- codex
 
 # Terminal 2
-agent-mail --group my-project run worker -- claude
+agent-mail --group my-fleet run worker -- claude
 ```
 
 `run` registers the agent, supplies the skill and recovery hooks, and starts the
 local delivery worker when needed. Follow the client's normal trust prompts.
 Groups keep their agents, tasks and inboxes separate while sharing the local store.
+Use the same group and store for every agent in the fleet. To create a group in
+observation mode, use `agent-mail init my-fleet --no-follow-through`: it records
+attention state without sending follow-up reminders or escalations. Running plain
+`init` for an existing group preserves its policy.
 
 ## Assign work and get a result
 
@@ -73,6 +77,50 @@ agent-mail mail wait 42 --timeout 5m # Wait for a request's reply or settlement
 `agent-mail watch --after CURSOR`. `mail wait` uses the event stream; it does not
 poll or resolve the request. [Streaming and waiting](docs/agent-guide.md#follow-changes-and-wait-for-a-reply).
 
+## Keep unfinished work visible
+
+Follow-through tracks pending tasks and requests and asks agents to record an
+outcome or a concrete next step. Reading a notification or acknowledging delivery
+does not count as handling the work. Agents can checkpoint unfinished work with
+its next action, a dependency or approval hold, and a review time. The work remains
+pending until an ordinary task decision or mail outcome settles it.
+
+Where the configured runtime provides a correlated completion receipt, Agent Mail
+checks the exact record versions offered to that turn when it ends. Later arrivals
+are excluded; valid checkpoints and blocked or review holds are respected. Ignored
+work gets one corrective notification, then escalates if the next covered turn
+still leaves it unhandled.
+
+Dependency changes also trigger reconciliation. Timers remain for overdue
+commitments, disconnected clients, and missing lifecycle signals; an idle agent
+alone is not proof that a turn handled its work.
+
+Configure a group's policy directly from the CLI:
+
+```sh
+agent-mail --group my-fleet attention configure --enable --interval 15m --max 1h
+```
+
+Options update only the settings you specify. Use `--observe` to stop follow-up
+dispatch while retaining its history. JSON remains an optional import format via
+`attention configure --file policy.json`.
+
+Escalations go to the task writer or request sender, then to the operator if they
+remain unhandled. Herdr provides an operator notification route. For a standalone
+fleet, point Agent Mail at your notification program:
+
+```sh
+agent-mail --group my-fleet attention configure --notifier /absolute/path/notify-operator
+```
+
+Replace the path with an executable that accepts an alert as JSON on stdin. Add
+arguments with repeated `--notifier-arg VALUE` options; use `--clear-notifier` to
+remove the override. Without an operator route, status reports `unconfigured`.
+An approval hold remains a hold until the responsible person authorizes the action.
+
+See [follow-through configuration and checkpoints](docs/usage.md#follow-through-after-delivery)
+for policy options, wait conditions, and operator notifications.
+
 ## Check delivery
 
 ```sh
@@ -85,7 +133,8 @@ worker       Verifying · retry in 42s
 ```
 
 **Ready** means the agent acknowledged a delivery check and its connection is
-healthy. If delivery is unavailable, work stays pending. Use
+healthy; it does not mean its assignments are finished. If delivery is unavailable,
+work stays pending. Use
 `agent-mail status --check worker` to diagnose the cause, then
 `agent-mail agent retry worker` after fixing it. [Delivery and repair](docs/usage.md#delivery-verification-08).
 
@@ -99,7 +148,7 @@ still own review decisions and authorization of the next step.
 | Purpose | Commands |
 |---|---|
 | Set up | `init`, `run` |
-| Coordinate | `context`, `task`, `mail`, `watch` |
+| Coordinate | `context`, `task`, `mail`, `watch`, `attention` |
 | Inspect and repair | `status`, `agent` |
 | Configure integrations | `runtime`, `service` |
 
@@ -129,10 +178,29 @@ Update with `brew upgrade youssef-tharwat/tap/agent-mail`. Existing stores migra
 automatically on the next use, with a verified backup and worker handoff. The skill loads the
 installed binary's instructions on its next invocation. [Skill updates](docs/usage.md#agent-skill).
 
-### Durable follow-through
-
-Agent Mail can schedule bounded follow-ups for retrieved work that has no outcome,
-track explicit waits, and escalate stalled decisions independently of the coordinator.
-Groups begin in observation mode. See [follow-through configuration and checkpoints](docs/usage.md#follow-through-after-delivery).
-
 Maintained by [Youssef Tharwat](https://github.com/youssef-tharwat). [MIT](LICENSE).
+
+### Shared coordination register
+
+Group records preserve immutable, addressable revisions for contracts, briefs and
+decisions. Typed artifacts store metadata in SQLite and original bytes in a
+managed SHA-256 content store with selective Zstandard compression. Explicit task
+relationships and all/any checkpoint prerequisites support recovery without
+parsing task names. Writer handoffs require observed versions and audited reasons.
+
+```sh
+agent-mail record create --file contract.json
+agent-mail record show contract --revision 1
+agent-mail artifact ingest --file evidence.json --input test.log
+agent-mail artifact check evidence
+agent-mail task list --all-states
+agent-mail task history lane --limit 20
+agent-mail task messages lane --limit 20
+agent-mail task relations lane
+agent-mail task transfer-writer lane --file transfer.json
+```
+
+See [records](docs/records.md), [artifacts](docs/artifacts.md), and
+[task coordination](docs/task-coordination.md) for formats, authority, pagination,
+retention and backup policies. Recovery stays bounded; full contents and audit
+pages are fetched on demand. None of these reads accepts work or resolves mail.

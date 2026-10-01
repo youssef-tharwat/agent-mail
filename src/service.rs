@@ -371,8 +371,12 @@ pub async fn run(store: &Store, once: bool) -> Result<()> {
     let mut relay_jobs = JoinSet::<Result<Vec<Value>>>::new();
     let mut relay_report = Vec::new();
     let mut verification_jobs = JoinSet::new();
+    let mut lifecycle = crate::lifecycle::Monitors::default();
     loop {
         let time = now()?;
+        if !once {
+            lifecycle.refresh(store).await?;
+        }
         while verification_jobs.try_join_next().is_some() {}
         if verification_jobs.is_empty() {
             let state = store.clone();

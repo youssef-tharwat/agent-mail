@@ -20,6 +20,7 @@ pub(crate) struct Client {
     stream: WebSocketStream<UnixStream>,
     sequence: u64,
     server_version: String,
+    notifications: std::collections::VecDeque<Value>,
 }
 impl Client {
     pub(crate) async fn connect(socket: &Path) -> Result<Self> {
@@ -32,6 +33,7 @@ impl Client {
             stream,
             sequence: 0,
             server_version: String::new(),
+            notifications: std::collections::VecDeque::new(),
         };
         let initialized = client.call("initialize", json!({"clientInfo":{"name":"agent_mail","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}})).await?;
         client.server_version = initialized["userAgent"]
@@ -70,9 +72,30 @@ impl Client {
                         .context("Codex response missing result");
                 }
                 // This adapter never answers agent approval or tool requests.
+                if relevant(&response) {
+                    // Full persisted turns recover an interrupted or overflowing stream.
+                    if self.notifications.len() == 128 {
+                        self.notifications.pop_front();
+                    }
+                    self.notifications.push_back(response);
+                }
             }
         }
         anyhow::bail!("Codex connection closed before receipt")
+    }
+    pub(crate) async fn notification(&mut self) -> Result<Value> {
+        if let Some(value) = self.notifications.pop_front() {
+            return Ok(value);
+        }
+        while let Some(frame) = self.stream.next().await {
+            if let Message::Text(text) = frame? {
+                let value: Value = serde_json::from_str(&text)?;
+                if relevant(&value) {
+                    return Ok(value);
+                }
+            }
+        }
+        anyhow::bail!("Codex lifecycle stream closed")
     }
     pub(crate) async fn thread(&mut self, id: Uuid) -> Result<Thread> {
         #[derive(Deserialize)]
@@ -89,6 +112,12 @@ impl Client {
         );
         Ok(response.thread)
     }
+}
+fn relevant(value: &Value) -> bool {
+    value.get("id").is_none()
+        && (value["method"] == "turn/completed"
+            || (value["method"] == "item/completed"
+                && value["params"]["item"]["type"] == "userMessage"))
 }
 #[derive(Deserialize)]
 pub(crate) struct Thread {

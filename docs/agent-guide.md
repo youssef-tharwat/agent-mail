@@ -403,6 +403,54 @@ remain visible through task/mail details and `attention history --task ID` or
 The service owns follow-up schedules and escalation. Coordinators may end a turn
 while waiting after recording a valid next step. A background `watch` process alone
 does not process events or wake the model. Do not keep a polling loop or reset
-transport budgets to simulate progress. Groups begin in observation mode; operators
-enable dispatch with `attention configure`. Status identifies that mode and whether
-an independent operator notification route exists.
+transport budgets to simulate progress. New groups enable follow-through by default. Operators can opt out with
+`init GROUP --no-follow-through` or `attention configure --observe`; existing saved
+policies survive upgrades. Direct configuration flags preserve omitted settings.
+Where the runtime provides correlated completion receipts, ending a turn without
+an outcome or valid checkpoint triggers one corrective notification, then escalation
+if its next covered turn still ignores it. Later arrivals and explicit holds are
+not treated as neglected work. Timers recover missed events and overdue commitments.
+Status identifies the policy and whether an independent operator route exists.
+
+## Shared contracts and evidence
+
+Use `record create --file draft.json` for group-visible contracts, briefs and
+rulings. `record update ID --file update.json` requires the observed revision and
+an explicit correction reason. Earlier revisions remain readable with
+`record show ID --revision N`. Link the exact revision to the governed task;
+replacement owners read it using their own current group identity. Task ownership
+does not grant record writer authority. Group records intentionally share their
+contents; recipient-specific message bodies retain mailbox visibility.
+
+Use `artifact ingest --file metadata.json --input evidence.log` to store immutable
+bytes and `artifact fetch ID --output evidence.log` to retrieve them. Typed
+repository references include the repository and revision. External references
+and legacy evidence strings may be unavailable or unverifiable; use
+`artifact check ID` for the concrete result. Reading, downloading, or successfully
+verifying evidence never accepts a task. Managed blobs are deduplicated within
+the group, selectively compressed, and protected by retained links and pins.
+`artifact stats` reports capacity; `artifact prune` defaults to a dry run.
+Artifact backups must include SQLite metadata and referenced payloads.
+
+## Coordination audits and handoffs
+
+Use `task list --all-states` to discover closed reviews and findings, then follow
+the returned cursor. `task history ID` and `task messages ID` page retained audit
+metadata. A task link does not grant another mailbox's private body. Normal
+`context` stays bounded and focuses on current obligations.
+
+Use `task relate ID --file relation.json` for explicit hierarchy, review context,
+and dependencies. `task relations ID` reads relationship facts, including
+terminal work. Specify the source revision when recovering review coverage.
+All/any prerequisites schedule reassessment through checkpoints; a wake never
+supplies approval or clears an approval hold.
+
+Use `task transfer-writer ID --file transfer.json` for an explicit authority
+handoff with observed task version, retry key, new writer, and reason. Owner
+reassignment leaves decision authority unchanged. Transfer preserves pending mail
+and other obligations. Private incoming reports must be explicitly shared or
+forwarded by an authorized mailbox. An unavailable writer requires the explicit
+local operator recovery path; agents must never borrow the old credential.
+
+Detailed formats and policies: `docs/records.md`, `docs/artifacts.md`, and
+`docs/task-coordination.md` in the source distribution.

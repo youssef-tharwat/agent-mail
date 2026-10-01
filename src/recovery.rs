@@ -55,15 +55,51 @@ impl Store {
         let mut checkpoints = Vec::new();
         for item in &works {
             let plan = self.source_followup(actor, Some(&item.id), None).await?;
-            checkpoints.push(json!({"task":item.id,"version":plan["version"],"next_check_at":plan["next_check"],"checkpoint_recorded":!plan["checkpoint"].is_null(),"details":"task show"}));
+            checkpoints.push(json!({"task":item.id,"version":plan["version"],"next_check_at":plan["next_check"],"checkpoint_recorded":!plan["checkpoint"].is_null(),"coordination":self.task_coordination_context(actor, &item.id).await?,"details":"task show"}));
         }
         for item in &mails {
             let plan = self.source_followup(actor, None, Some(item.id)).await?;
             checkpoints.push(json!({"mail":item.id,"version":plan["version"],"next_check_at":plan["next_check"],"checkpoint_recorded":!plan["checkpoint"].is_null(),"details":"mail show"}));
         }
-        let mut value = json!({"group":group,"followups":followups,"checkpoints":checkpoints,"checkpoints_more":false,"checkpoint_help":"Use task/mail checkpoint when yielding with unfinished work; show fetches full metadata; attention list pages pending follow-ups", "work":works,"mail":mails,"work_more":work.len()>works.len(),"mail_more":mail.len()>mails.len(),"next_work_after":next_work,"next_mail_after":next_mail,"stale_peers":stale_peers,"outbox_pending":outbox_pending,"outbox_oldest":outbox_oldest});
+        let mut artifacts_more = false;
+        let mut records_more = false;
+        let mut artifact_refs = Vec::new();
+        let mut record_refs = Vec::new();
+        for item in &works {
+            let artifacts = self.artifact_links_for_task(actor, &item.id).await?;
+            artifacts_more |= artifacts.len() > 2;
+            for artifact in artifacts.into_iter().take(2) {
+                artifact_refs.push(json!({"task":item.id,"artifact":artifact.resource.id,"digest":artifact.resource.digest,"location":artifact.resource.location}));
+            }
+            let refs = self
+                .record_links(actor, &crate::records::RecordTarget::Task(item.id.clone()))
+                .await?;
+            records_more |= refs.len() > 2;
+            for reference in refs.into_iter().take(2) {
+                record_refs.push(json!({"task":item.id,"record":reference.id,"revision":reference.revision,"current_revision":reference.current_revision,"summary":reference.summary}));
+            }
+        }
+        let mut value = json!({"group":group,"artifacts":artifact_refs,"artifacts_more":artifacts_more,"records":record_refs,"records_more":records_more,"followups":followups,"checkpoints":checkpoints,"checkpoints_more":false,"checkpoint_help":"Use task/mail checkpoint when yielding with unfinished work; show fetches full metadata; attention list pages pending follow-ups", "work":works,"mail":mails,"work_more":work.len()>works.len(),"mail_more":mail.len()>mails.len(),"next_work_after":next_work,"next_mail_after":next_mail,"stale_peers":stale_peers,"outbox_pending":outbox_pending,"outbox_oldest":outbox_oldest});
         // Account for metadata too. Do not receipt any record trimmed from the response.
         while serde_json::to_vec(&value)?.len() > 4096 {
+            if value["artifacts"]
+                .as_array_mut()
+                .expect("artifact array")
+                .pop()
+                .is_some()
+            {
+                value["artifacts_more"] = json!(true);
+                continue;
+            }
+            if value["records"]
+                .as_array_mut()
+                .expect("record reference array")
+                .pop()
+                .is_some()
+            {
+                value["records_more"] = json!(true);
+                continue;
+            }
             let attention = value["followups"]["items"]
                 .as_array_mut()
                 .expect("attention array");

@@ -41,10 +41,22 @@ pub(super) struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Create and read group-visible immutable document revisions.
+    #[command(subcommand)]
+    Record(super::coordination_cli::RecordCommand),
+    /// Store, reference, retrieve and verify typed evidence.
+    #[command(subcommand)]
+    Artifact(super::coordination_cli::ArtifactCommand),
     /// Create or verify a local coordination group. Never starts an agent.
     Init {
         /// Explicit group name to initialize.
         name: String,
+        /// Explicitly enable follow-through for an existing group.
+        #[arg(long, conflicts_with = "no_follow_through")]
+        follow_through: bool,
+        /// Observe obligations without automatic follow-ups.
+        #[arg(long)]
+        no_follow_through: bool,
     },
     /// Recover my assigned tasks and pending requests in a bounded response.
     Context {
@@ -204,10 +216,49 @@ enum Task {
     },
     /// Read the current task, including version and linked messages.
     Show { id: String },
-    /// List open tasks owned or maintained by this agent.
+    /// List assigned tasks; explicit filters expose group-visible terminal history.
     List {
         #[arg(long, default_value = "")]
         after: String,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        state: Vec<TaskState>,
+        #[arg(long)]
+        all_states: bool,
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Transfer decision authority with observed version and an audit reason.
+    TransferWriter {
+        id: String,
+        #[arg(long)]
+        file: PathBuf,
+        /// Explicit local operator recovery when the writer is unavailable.
+        #[arg(long)]
+        operator_recovery: bool,
+    },
+    /// Add or change an explicit relationship using an observed task version.
+    Relate {
+        id: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Query relationships, review context and dependency facts.
+    Relations {
+        id: String,
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Page authorized linked-message metadata without exposing private bodies.
+    Messages {
+        id: String,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Apply one authorized change and optionally resolve a linked request.
     Update {
@@ -219,7 +270,13 @@ enum Task {
         changes: Changes,
     },
     /// Inspect recent versions and the reasons for each change.
-    History { id: String },
+    History {
+        id: String,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 #[derive(Subcommand)]
 enum Attention {
@@ -247,9 +304,66 @@ enum Attention {
     },
     /// Operator: configure observation/dispatch, intervals and optional notifier.
     Configure {
-        #[arg(long)]
-        file: PathBuf,
+        /// Import a complete policy. Cannot be mixed with individual settings.
+        #[arg(long, conflicts_with = "policy_changes")]
+        file: Option<PathBuf>,
+        #[command(flatten)]
+        changes: PolicyChanges,
     },
+}
+#[derive(Args, Default)]
+#[group(id = "policy_changes", multiple = true)]
+struct PolicyChanges {
+    /// Enable automatic follow-through.
+    #[arg(long, conflicts_with = "observe")]
+    enable: bool,
+    /// Keep diagnostics without dispatching follow-ups.
+    #[arg(long)]
+    observe: bool,
+    /// Recovery reminder interval, e.g. 15m. Turn events are checked immediately.
+    #[arg(long, value_parser = parse_duration)]
+    interval: Option<i64>,
+    /// Maximum unattended time, at least four intervals, e.g. 1h.
+    #[arg(long, value_parser = parse_duration)]
+    max: Option<i64>,
+    /// Absolute operator notification executable; receives JSON on stdin.
+    #[arg(long, conflicts_with = "clear_notifier")]
+    notifier: Option<PathBuf>,
+    /// Argument for the notifier, repeatable; no shell evaluation.
+    #[arg(long, requires = "notifier", allow_hyphen_values = true)]
+    notifier_arg: Vec<String>,
+    /// Remove the executable notifier; use the available Herdr route.
+    #[arg(long)]
+    clear_notifier: bool,
+}
+impl PolicyChanges {
+    fn patch(self) -> Result<agent_mail::followup::PolicyPatch> {
+        use agent_mail::followup::{Mode, PolicyPatch};
+        Ok(PolicyPatch {
+            mode: if self.enable {
+                Some(Mode::Enabled)
+            } else if self.observe {
+                Some(Mode::Observe)
+            } else {
+                None
+            },
+            interval_seconds: self.interval,
+            max_seconds: self.max,
+            notifier: if let Some(path) = self.notifier {
+                let mut args = vec![
+                    path.into_os_string()
+                        .into_string()
+                        .map_err(|_| anyhow::anyhow!("notifier path must be UTF-8"))?,
+                ];
+                args.extend(self.notifier_arg);
+                Some(Some(args))
+            } else if self.clear_notifier {
+                Some(None)
+            } else {
+                None
+            },
+        })
+    }
 }
 #[derive(Args, Default)]
 #[group(id = "changes", multiple = true)]
@@ -517,8 +631,11 @@ impl Cli {
             command,
             &[
                 ("Start", &["init", "run"]),
-                ("Coordinate", &["context", "task", "mail", "watch"]),
-                ("Manage", &["status", "agent"]),
+                (
+                    "Coordinate",
+                    &["context", "task", "mail", "record", "artifact", "watch"],
+                ),
+                ("Manage", &["status", "agent", "attention"]),
                 ("Integrations", &["runtime", "service"]),
             ],
         )
@@ -554,6 +671,10 @@ impl Cli {
         let scoped = !matches!(
             &command,
             Action::Init { .. }
+                | Action::Artifact(
+                    super::coordination_cli::ArtifactCommand::Backup { .. }
+                        | super::coordination_cli::ArtifactCommand::Restore { .. }
+                )
                 | Action::Service(_)
                 | Action::Status { check: Some(_), .. }
                 | Action::Status {
@@ -581,6 +702,8 @@ impl Cli {
                     | Action::Agent(Agent::Ack { .. })
                     | Action::Mail(_)
                     | Action::Task(_)
+                    | Action::Record(_)
+                    | Action::Artifact(_)
                     | Action::Attention(
                         Attention::List { .. }
                             | Attention::Show { .. }
@@ -603,8 +726,14 @@ impl Cli {
             return Ok(None);
         }
         let command = match command {
+            Action::Record(command) => Command::Record { group, command },
+            Action::Artifact(command) => Command::Artifact { group, command },
             Action::Run { .. } => unreachable!("handled before dispatch"),
-            Action::Init { name } => {
+            Action::Init {
+                name,
+                follow_through,
+                no_follow_through,
+            } => {
                 ensure!(
                     self.group.as_ref().is_none_or(|g| g == &name),
                     "init name conflicts with the selected group"
@@ -614,6 +743,13 @@ impl Cli {
                     socket: None,
                     standalone: true,
                     install_service: false,
+                    follow_through: if follow_through {
+                        Some(true)
+                    } else if no_follow_through {
+                        Some(false)
+                    } else {
+                        None
+                    },
                 }
             }
             Action::Context {
@@ -651,9 +787,15 @@ impl Cli {
                 Attention::History { task, mail } => {
                     Command::AttentionHistory { group, task, mail }
                 }
-                Attention::Configure { file } => Command::AttentionConfigure {
+                Attention::Configure { file, changes } => Command::AttentionConfigure {
                     group,
-                    policy: serde_json::from_str(&read_body(&file)?)?,
+                    patch: if let Some(file) = file {
+                        let policy: agent_mail::followup::Policy =
+                            serde_json::from_str(&read_body(&file)?)?;
+                        policy.into()
+                    } else {
+                        changes.patch()?
+                    },
                 },
             },
             Action::Agent(p) => match p {
@@ -808,8 +950,69 @@ impl Cli {
                         evidence,
                     },
                     Task::Show { id } => WorkCommand::Show { group, id },
-                    Task::List { after } => WorkCommand::List { group, after },
-                    Task::History { id } => WorkCommand::History { group, id },
+                    Task::List {
+                        after,
+                        cursor,
+                        state,
+                        all_states,
+                        owner,
+                        limit,
+                    } => {
+                        if all_states
+                            || !state.is_empty()
+                            || cursor.is_some()
+                            || owner.is_some()
+                            || limit.is_some()
+                        {
+                            ensure!(after.is_empty(), "use --cursor with explicit task filters");
+                            WorkCommand::ListPage {
+                                group,
+                                query: agent_mail::work::WorkListQuery {
+                                    states: state,
+                                    owner,
+                                    cursor,
+                                    limit,
+                                },
+                            }
+                        } else {
+                            WorkCommand::List { group, after }
+                        }
+                    }
+                    Task::History { id, cursor, limit } => WorkCommand::History {
+                        group,
+                        id,
+                        cursor,
+                        limit,
+                    },
+                    Task::Messages { id, cursor, limit } => WorkCommand::Messages {
+                        group,
+                        id,
+                        cursor,
+                        limit,
+                    },
+                    Task::TransferWriter {
+                        id,
+                        file,
+                        operator_recovery,
+                    } => WorkCommand::TransferWriter {
+                        group,
+                        id,
+                        transfer: super::coordination_cli::read_json(&file)?,
+                        operator_recovery,
+                    },
+                    Task::Relate { id, file } => WorkCommand::Relate {
+                        group,
+                        id,
+                        update: super::coordination_cli::read_json(&file)?,
+                    },
+                    Task::Relations { id, file } => WorkCommand::Relations {
+                        group,
+                        id,
+                        query: file
+                            .map(|p| super::coordination_cli::read_json(&p))
+                            .transpose()?
+                            .unwrap_or_default(),
+                    },
                     Task::Update {
                         id,
                         file,
@@ -849,6 +1052,7 @@ impl Cli {
                     socket: Some(socket),
                     standalone: false,
                     install_service: false,
+                    follow_through: None,
                 },
                 Runtime::HerdrPolicy { policy } => Command::PromptMode {
                     group,

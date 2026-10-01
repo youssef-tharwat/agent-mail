@@ -376,7 +376,10 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
     let message_id = if inbox {
         Uuid::new_v4().to_string()
     } else {
-        format!("agent-mail-{}-{}-{latest}", actor.id, actor.binding_version)
+        format!(
+            "agent-mail-{}-{}-{}-{latest}",
+            actor.id, actor.binding_version, endpoint.thread
+        )
     };
     let active = match peer.state().await? {
         State::Active if cancellation => true,
@@ -417,9 +420,26 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
             None
         }
     };
-    let text = store
-        .delivery_text(actor, challenge.as_deref(), endpoint.scanned)
+    let delivery = store
+        .delivery(actor, challenge.as_deref(), endpoint.scanned)
         .await?;
+    // Reserve exact visible versions before external I/O. If the response is lost,
+    // only a persisted runtime user-input/turn receipt can complete this offer.
+    if !inbox && kind == NativeRuntime::Codex && !active {
+        let mut tx = store.pool().begin().await?;
+        Store::lock_actor(&mut tx, actor).await?;
+        crate::turns::offer_tx(
+            &mut tx,
+            actor,
+            &message_id,
+            "codex",
+            &endpoint.thread,
+            &delivery.events,
+            time,
+        )
+        .await?;
+        tx.commit().await?;
+    }
     // Hold the binding lock during the bounded send: replacement/detachment cannot race it.
     let mut tx = store.pool().begin().await?;
     Store::lock_actor(&mut tx, actor).await?;
@@ -428,7 +448,7 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
     if let Peer::ClaudeInbox { socket, endpoint } = &peer {
         crate::claude_inbox::verify(store, socket, endpoint)?;
     }
-    peer.send(thread, text, active, message_id).await?;
+    peer.send(thread, delivery.text, active, message_id).await?;
     if let Some(nonce) = challenge.as_deref() {
         sqlx::query!(
             "UPDATE delivery_probes SET transport_accepted_at=COALESCE(transport_accepted_at,?),healthy_at=?,failed=0 WHERE recipient=? AND binding_version=? AND nonce=?",

@@ -29,8 +29,14 @@
 
 /// Versioned agent registration lifecycle.
 pub mod agents;
+/// Typed resource references and managed content-addressed evidence.
+pub mod artifacts;
 pub mod herdr;
 pub mod identity;
+/// Shared immutable document revisions.
+pub mod records;
+/// Explicit task relationships and dependency facts.
+pub mod relationships;
 pub mod relay;
 pub mod service;
 /// Group-scoped diagnostics and explicit installation overview.
@@ -123,3 +129,6 @@ pub mod upgrade;
 
 /// Durable checkpoints and bounded follow-through reconciliation.
 pub mod followup;
+
+mod lifecycle;
+mod turns;

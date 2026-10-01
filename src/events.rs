@@ -26,6 +26,11 @@ pub struct Notification {
     pub version: i64,
 }
 
+pub(crate) struct Delivery {
+    pub text: String,
+    pub events: Vec<Notification>,
+}
+
 impl Store {
     // Retrieval receipts stop transport retries, never resolve business requests.
     pub(crate) async fn retrieve_tx(
@@ -269,12 +274,12 @@ impl Store {
 }
 
 impl Store {
-    pub(crate) async fn delivery_text(
+    pub(crate) async fn delivery(
         &self,
         actor: &Mailbox,
         challenge: Option<&str>,
         after: i64,
-    ) -> Result<String> {
+    ) -> Result<Delivery> {
         Self::notification_text(
             actor,
             challenge,
@@ -292,7 +297,7 @@ impl Store {
         Self::check_actor(&mut tx, actor).await?;
         let events = sqlx::query_as!(Notification,"SELECT id,kind AS 'kind: EventKind',subject,version FROM herdr_wake_events WHERE recipient=? ORDER BY id DESC LIMIT 6",actor.id).fetch_all(&mut *tx).await?;
         tx.commit().await?;
-        Self::notification_text(actor, challenge, events, 480)
+        Ok(Self::notification_text(actor, challenge, events, 480)?.text)
     }
 
     fn notification_text(
@@ -300,7 +305,7 @@ impl Store {
         challenge: Option<&str>,
         events: Vec<Notification>,
         limit: usize,
-    ) -> Result<String> {
+    ) -> Result<Delivery> {
         let mut visible = events
             .iter()
             .rev()
@@ -330,7 +335,10 @@ impl Store {
                 text.push_str(&crate::verification::challenge(actor, nonce));
             }
             if text.len() <= limit {
-                return Ok(text);
+                return Ok(Delivery {
+                    text,
+                    events: visible,
+                });
             }
             if visible.is_empty() {
                 let mut recovery = String::from(
@@ -343,7 +351,10 @@ impl Store {
                     recovery.len() <= limit,
                     "notification recovery instruction exceeds transport limit"
                 );
-                return Ok(recovery);
+                return Ok(Delivery {
+                    text: recovery,
+                    events: vec![],
+                });
             }
             visible.remove(0);
             more = true;

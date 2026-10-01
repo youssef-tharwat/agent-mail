@@ -14,6 +14,7 @@ use std::{io::Read, path::PathBuf};
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod cli;
+mod coordination_cli;
 mod launch;
 
 struct RunArgs {
@@ -23,6 +24,14 @@ struct RunArgs {
 }
 
 enum Command {
+    Record {
+        group: String,
+        command: coordination_cli::RecordCommand,
+    },
+    Artifact {
+        group: String,
+        command: coordination_cli::ArtifactCommand,
+    },
     Checkpoint {
         group: String,
         source: agent_mail::followup::Source,
@@ -44,7 +53,7 @@ enum Command {
     },
     AttentionConfigure {
         group: String,
-        policy: agent_mail::followup::Policy,
+        patch: agent_mail::followup::PolicyPatch,
     },
     WatchChanges {
         group: String,
@@ -91,6 +100,7 @@ enum Command {
         /// Create a group without Herdr, ignoring an inherited socket environment.
         standalone: bool,
         install_service: bool,
+        follow_through: Option<bool>,
     },
     /// Operator: associate an inbox with a verified native agent session.
     Bind {
@@ -274,6 +284,32 @@ enum Bridge {
 }
 
 enum WorkCommand {
+    ListPage {
+        group: String,
+        query: agent_mail::work::WorkListQuery,
+    },
+    Messages {
+        group: String,
+        id: String,
+        cursor: Option<String>,
+        limit: Option<usize>,
+    },
+    TransferWriter {
+        group: String,
+        id: String,
+        transfer: agent_mail::work::WriterTransfer,
+        operator_recovery: bool,
+    },
+    Relate {
+        group: String,
+        id: String,
+        update: agent_mail::relationships::RelationUpdate,
+    },
+    Relations {
+        group: String,
+        id: String,
+        query: agent_mail::relationships::RelationQuery,
+    },
     Checkpoint {
         group: String,
         id: String,
@@ -308,6 +344,8 @@ enum WorkCommand {
     History {
         group: String,
         id: String,
+        cursor: Option<String>,
+        limit: Option<usize>,
     },
 }
 
@@ -352,6 +390,28 @@ async fn run(cli: RunArgs) -> Result<()> {
         // Tokio stdin uses a blocking reader; exit after the bridge has joined/aborted
         // its tasks and closed its child so a quiet stdin cannot stall shutdown.
         std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
+    if let Command::Artifact {
+        command:
+            coordination_cli::ArtifactCommand::Restore {
+                source,
+                destination,
+            },
+        ..
+    } = &cli.command
+    {
+        ensure!(
+            cli.session.is_none(),
+            "artifact restore requires explicit local operator authority without an agent session"
+        );
+        Store::artifact_restore(
+            source,
+            destination,
+            &agent_mail::artifacts::ArtifactLimits::default(),
+        )
+        .await?;
+        println!("{}", json!({"restored":destination,"verified":true}));
+        return Ok(());
     }
     let explicit_state = cli.state_dir.is_some();
     let root = supervision::state_root(cli.state_dir)?;
@@ -409,6 +469,7 @@ async fn run(cli: RunArgs) -> Result<()> {
             socket,
             standalone,
             install_service,
+            follow_through,
         } => {
             let socket = if standalone {
                 store
@@ -421,6 +482,23 @@ async fn run(cli: RunArgs) -> Result<()> {
                 socket
             };
             store.enroll(&group, socket.as_deref()).await?;
+            if let Some(enabled) = follow_through {
+                store
+                    .patch_followups(
+                        &group,
+                        &agent_mail::followup::PolicyPatch {
+                            mode: Some(if enabled {
+                                agent_mail::followup::Mode::Enabled
+                            } else {
+                                agent_mail::followup::Mode::Observe
+                            }),
+                            ..Default::default()
+                        },
+                        now()?,
+                    )
+                    .await?;
+            }
+            let policy = store.followup_policy(&group).await?;
             if !explicit_state {
                 supervision::save_locator(&root)?;
             }
@@ -430,7 +508,7 @@ async fn run(cli: RunArgs) -> Result<()> {
             }
             println!(
                 "{}",
-                json!({"group":group,"state_dir":root.canonicalize()?,"service_installed":install_service})
+                json!({"group":group,"state_dir":root.canonicalize()?,"service_installed":install_service,"follow_through":policy})
             );
             return Ok(());
         }
@@ -644,8 +722,8 @@ async fn run(cli: RunArgs) -> Result<()> {
                 .checkpoint(&actor, source, &key, report, now()?)
                 .await?
         }
-        Command::AttentionConfigure { group, policy } => {
-            store.configure_followups(&group, &policy, now()?).await?;
+        Command::AttentionConfigure { group, patch } => {
+            let policy = store.patch_followups(&group, &patch, now()?).await?;
             json!({"group":group,"policy":policy})
         }
         Command::AttentionList { group, after } => {
@@ -673,6 +751,13 @@ async fn run(cli: RunArgs) -> Result<()> {
             if let Some(id) = message {
                 let mut value = serde_json::to_value(store.message(&actor, id).await?)?;
                 value["followup"] = store.source_followup(&actor, None, Some(id)).await?;
+                value["records"] = serde_json::to_value(
+                    store
+                        .record_links(&actor, &agent_mail::records::RecordTarget::Message(id))
+                        .await?,
+                )?;
+                value["artifacts"] =
+                    serde_json::to_value(store.artifact_links_for_message(&actor, id).await?)?;
                 value
             } else {
                 let records = store.inbox(&actor, after).await?;
@@ -753,14 +838,6 @@ async fn run(cli: RunArgs) -> Result<()> {
                         .await?;
                     receipt_context
                 }
-                None if matches!(
-                    input.hook_event_name,
-                    agent_mail::claude_inbox::Event::SessionEnd
-                        | agent_mail::claude_inbox::Event::StopFailure
-                ) =>
-                {
-                    json!({})
-                }
                 None => {
                     store
                         .hook(&actor, serde_json::from_slice(&bytes)?, now()?)
@@ -806,6 +883,30 @@ async fn run(cli: RunArgs) -> Result<()> {
             let actor = store.authenticate(&group, cli.session.as_ref()).await?;
             store.acknowledge(&actor, event).await?;
             json!({"event":event,"acknowledged":true,"resolved":false})
+        }
+        Command::Record { group, command } => {
+            let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+            coordination_cli::run_record(&store, &actor, command).await?
+        }
+        Command::Artifact {
+            group: _,
+            command: coordination_cli::ArtifactCommand::Backup { destination },
+        } => {
+            ensure!(
+                cli.session.is_none(),
+                "artifact backup requires explicit local operator authority without an agent session"
+            );
+            store
+                .artifact_backup(
+                    &destination,
+                    &agent_mail::artifacts::ArtifactLimits::default(),
+                )
+                .await?;
+            json!({"backup":destination,"includes_managed_blobs":true})
+        }
+        Command::Artifact { group, command } => {
+            let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+            coordination_cli::run_artifact(&store, &actor, command).await?
         }
         Command::Work(command) => match command {
             WorkCommand::Checkpoint {
@@ -873,6 +974,14 @@ async fn run(cli: RunArgs) -> Result<()> {
                 let actor = store.authenticate(&group, cli.session.as_ref()).await?;
                 let mut value = serde_json::to_value(store.work_show(&actor, &id).await?)?;
                 value["followup"] = store.source_followup(&actor, Some(&id), None).await?;
+                value["coordination"] = store.task_coordination_context(&actor, &id).await?;
+                value["artifacts"] =
+                    serde_json::to_value(store.artifact_links_for_task(&actor, &id).await?)?;
+                value["records"] = serde_json::to_value(
+                    store
+                        .record_links(&actor, &agent_mail::records::RecordTarget::Task(id.clone()))
+                        .await?,
+                )?;
                 value
             }
             WorkCommand::List { group, after } => {
@@ -893,9 +1002,60 @@ async fn run(cli: RunArgs) -> Result<()> {
                 let next_after = items.last().map(|item| item.id.clone()).unwrap_or(after);
                 json!({"items":items,"more":more,"next_after":next_after})
             }
-            WorkCommand::History { group, id } => {
+            WorkCommand::History {
+                group,
+                id,
+                cursor,
+                limit,
+            } => {
                 let actor = store.authenticate(&group, cli.session.as_ref()).await?;
-                serde_json::to_value(store.work_history(&actor, &id).await?)?
+                store
+                    .work_history_page(&actor, &id, cursor.as_deref(), limit)
+                    .await?
+            }
+            WorkCommand::ListPage { group, query } => {
+                let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+                store.work_list_page(&actor, query).await?
+            }
+            WorkCommand::Messages {
+                group,
+                id,
+                cursor,
+                limit,
+            } => {
+                let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+                store
+                    .work_messages_page(&actor, &id, cursor.as_deref(), limit)
+                    .await?
+            }
+            WorkCommand::TransferWriter {
+                group,
+                id,
+                transfer,
+                operator_recovery,
+            } => {
+                if operator_recovery {
+                    ensure!(
+                        cli.session.is_none(),
+                        "operator recovery cannot use an agent session"
+                    );
+                    serde_json::to_value(
+                        store
+                            .operator_work_transfer(&group, &id, transfer, now()?)
+                            .await?,
+                    )?
+                } else {
+                    let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+                    serde_json::to_value(store.work_transfer(&actor, &id, transfer, now()?).await?)?
+                }
+            }
+            WorkCommand::Relate { group, id, update } => {
+                let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+                serde_json::to_value(store.work_relation(&actor, &id, update, now()?).await?)?
+            }
+            WorkCommand::Relations { group, id, query } => {
+                let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+                serde_json::to_value(store.work_relations(&actor, &id, query).await?)?
             }
         },
         Command::WatchChanges { group, after } => {

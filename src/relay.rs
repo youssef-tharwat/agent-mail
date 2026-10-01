@@ -70,6 +70,12 @@ pub enum Event {
     },
     /// An authoritative work revision from the group home.
     WorkSnapshot(WorkItem),
+    /// Group-visible immutable document revision and authorized references.
+    RecordSnapshot(crate::records::RecordSnapshot),
+    /// Typed resource metadata; payload transfer remains explicit.
+    ArtifactSnapshot(crate::artifacts::ArtifactSnapshot),
+    /// Explicit task relationship facts from the authoritative group home.
+    RelationSnapshot(crate::relationships::RelationSnapshot),
 }
 
 /// Portable message content identified by UUIDs across installations.
@@ -238,13 +244,12 @@ pub(crate) async fn enqueue_message(
 pub(crate) async fn enqueue_snapshot(
     tx: &mut Transaction<'_, Sqlite>,
     item: &WorkItem,
-    previous_owner: Option<&str>,
+    _previous_owner: Option<&str>,
     now: i64,
 ) -> Result<()> {
-    let previous_owner = previous_owner.unwrap_or(&item.owner);
     let rows = sqlx::query!(
-        "SELECT DISTINCT remote_machine FROM mailboxes WHERE group_name=? AND (name=? OR name=?) AND remote_machine IS NOT NULL",
-        item.group_name, item.owner, previous_owner
+        "SELECT DISTINCT remote_machine FROM mailboxes WHERE group_name=? AND remote_machine IS NOT NULL",
+        item.group_name
     )
     .fetch_all(&mut **tx)
     .await?;
@@ -293,6 +298,12 @@ impl Store {
             sqlx::query!("SELECT m.id FROM messages m JOIN mailboxes b ON b.id=m.sender WHERE b.group_name=? LIMIT 1", group)
                 .fetch_optional(&mut *tx).await?.is_none(),
             "cannot move a group after messages were published"
+        );
+        let coordination: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM shared_records WHERE group_name=?) OR EXISTS(SELECT 1 FROM artifacts WHERE group_name=?)")
+            .bind(group).bind(group).fetch_one(&mut *tx).await?;
+        ensure!(
+            !coordination,
+            "cannot move a group with shared records or artifacts"
         );
         let home = home.to_string();
         sqlx::query!("UPDATE groups SET home_machine=? WHERE name=?", home, group)
@@ -381,11 +392,27 @@ impl Store {
         } else {
             sqlx::query!("INSERT INTO mailboxes(group_name,name,binding) VALUES (?,?,json_object('runtime','remote','machine',?))",
                 group, participant, machine).execute(&mut *tx).await?;
+            crate::records::enqueue_records_for_route(&mut tx, group, parse_id(&machine)?, time)
+                .await?;
+            crate::relationships::enqueue_relations_for_route(
+                &mut tx,
+                group,
+                parse_id(&machine)?,
+                time,
+            )
+            .await?;
+            crate::artifacts::enqueue_artifacts_for_route(
+                &mut tx,
+                group,
+                parse_id(&machine)?,
+                time,
+            )
+            .await?;
             let latest = sqlx::query!("SELECT c.snapshot FROM work_changes c WHERE c.group_name=? AND c.version=(SELECT MAX(version) FROM work_changes WHERE group_name=c.group_name AND work_id=c.work_id)", group)
                 .fetch_all(&mut *tx).await?;
             for row in latest {
                 let item: WorkItem = serde_json::from_str(&row.snapshot)?;
-                if item.owner == participant {
+                {
                     enqueue(
                         &mut tx,
                         parse_id(&machine)?,
@@ -433,9 +460,17 @@ impl Store {
         )
         .fetch_all(self.pool())
         .await?;
-        rows.into_iter()
-            .map(|row| serde_json::from_str(&row.payload).map_err(Into::into))
-            .collect()
+        let mut events = Vec::new();
+        for row in rows {
+            let event: Envelope = serde_json::from_str(&row.payload)?;
+            events.push(event);
+            // Reserve space for acknowledgements and the Exchange JSON envelope.
+            if serde_json::to_vec(&events)?.len() > WIRE_LIMIT - 4096 {
+                events.pop();
+                break;
+            }
+        }
+        Ok(events)
     }
 
     /// Export a bounded batch of envelopes destined for one machine.
@@ -451,9 +486,17 @@ impl Store {
         )
         .fetch_all(self.pool())
         .await?;
-        rows.into_iter()
-            .map(|row| serde_json::from_str(&row.payload).map_err(Into::into))
-            .collect()
+        let mut events = Vec::new();
+        for row in rows {
+            let event: Envelope = serde_json::from_str(&row.payload)?;
+            events.push(event);
+            // Reserve space for acknowledgements and the Exchange JSON envelope.
+            if serde_json::to_vec(&events)?.len() > WIRE_LIMIT - 4096 {
+                events.pop();
+                break;
+            }
+        }
+        Ok(events)
     }
 
     /// Apply validated incoming events and acknowledgements in one transaction.
@@ -659,6 +702,9 @@ fn event_group(event: &Event) -> &str {
         Event::Message(m) => &m.group,
         Event::Resolution { group, .. } | Event::Withdrawal { group, .. } => group,
         Event::WorkSnapshot(item) => &item.group_name,
+        Event::RecordSnapshot(item) => &item.record.group_name,
+        Event::ArtifactSnapshot(item) => &item.artifact.group_name,
+        Event::RelationSnapshot(item) => &item.group_name,
     }
 }
 
@@ -724,7 +770,10 @@ async fn validate_forward(tx: &mut Transaction<'_, Sqlite>, envelope: &Envelope)
                 "withdrawal recipient route does not match destination"
             );
         }
-        Event::WorkSnapshot(_) => anyhow::bail!("remote node cannot publish work snapshots"),
+        Event::RecordSnapshot(_)
+        | Event::ArtifactSnapshot(_)
+        | Event::RelationSnapshot(_)
+        | Event::WorkSnapshot(_) => anyhow::bail!("remote node cannot publish work snapshots"),
     }
     Ok(())
 }
@@ -838,6 +887,27 @@ async fn apply_event(
             sqlx::query!("UPDATE deliveries SET state='withdrawn' WHERE message=(SELECT id FROM messages WHERE global_id=?) AND recipient=(SELECT id FROM mailboxes WHERE group_name=? AND name=?) AND state='pending'",
                 id, group, recipient).execute(&mut **tx).await?;
         }
+        Event::RecordSnapshot(item) => {
+            ensure!(
+                envelope.origin == home,
+                "record snapshot must come from home"
+            );
+            crate::records::apply_record_snapshot(tx, item).await?;
+        }
+        Event::RelationSnapshot(item) => {
+            ensure!(
+                envelope.origin == home,
+                "relationship snapshot must come from home"
+            );
+            crate::relationships::apply_relation_snapshot_tx(tx, item, time).await?;
+        }
+        Event::ArtifactSnapshot(item) => {
+            ensure!(
+                envelope.origin == home,
+                "artifact snapshot must come from home"
+            );
+            crate::artifacts::apply_snapshot(tx, item).await?;
+        }
         Event::WorkSnapshot(item) => {
             ensure!(envelope.origin == home, "work snapshot must come from home");
             name(&item.group_name)?;
@@ -949,6 +1019,46 @@ pub fn decode_exchange(input: &[u8]) -> Result<Exchange> {
 /// The string is not a valid UUID.
 pub fn machine(value: &str) -> Result<Uuid> {
     parse_id(value)
+}
+
+/// Queue group-visible artifact metadata to each configured group route.
+pub(crate) async fn enqueue_artifact_snapshot(
+    tx: &mut Transaction<'_, Sqlite>,
+    snapshot: &crate::artifacts::ArtifactSnapshot,
+    now: i64,
+) -> Result<()> {
+    let routes: Vec<String> = sqlx::query_scalar("SELECT DISTINCT remote_machine FROM mailboxes WHERE group_name=? AND remote_machine IS NOT NULL")
+        .bind(&snapshot.artifact.group_name).fetch_all(&mut **tx).await?;
+    for machine in routes {
+        enqueue(
+            tx,
+            parse_id(&machine)?,
+            Event::ArtifactSnapshot(snapshot.clone()),
+            now,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Queue relationship metadata to every configured group route.
+pub(crate) async fn enqueue_relation_snapshot(
+    tx: &mut Transaction<'_, Sqlite>,
+    snapshot: &crate::relationships::RelationSnapshot,
+    now: i64,
+) -> Result<()> {
+    let routes: Vec<String> = sqlx::query_scalar("SELECT DISTINCT remote_machine FROM mailboxes WHERE group_name=? AND remote_machine IS NOT NULL")
+        .bind(&snapshot.group_name).fetch_all(&mut **tx).await?;
+    for machine in routes {
+        enqueue(
+            tx,
+            parse_id(&machine)?,
+            Event::RelationSnapshot(snapshot.clone()),
+            now,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

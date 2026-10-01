@@ -43,6 +43,86 @@ impl Demo {
 }
 
 #[test]
+fn followthrough_defaults_and_direct_policy_flags_need_no_file() -> Result<()> {
+    let d = Demo::new()?;
+    assert_eq!(
+        d.ok(None, &["init", "fleet"])?["follow_through"]["mode"],
+        "enabled"
+    );
+    let policy = d.ok(
+        None,
+        &[
+            "attention",
+            "configure",
+            "--observe",
+            "--interval",
+            "10m",
+            "--max",
+            "1h",
+            "--notifier",
+            "/usr/bin/true",
+            "--notifier-arg=--quiet",
+        ],
+    )?;
+    assert_eq!(policy["policy"]["interval_seconds"], 600);
+    assert_eq!(
+        policy["policy"]["notifier"],
+        json!(["/usr/bin/true", "--quiet"])
+    );
+    assert_eq!(
+        d.ok(None, &["init", "fleet"])?["follow_through"]["mode"],
+        "observe"
+    );
+    let policy = d.ok(None, &["attention", "configure", "--enable"])?;
+    assert_eq!(policy["policy"]["interval_seconds"], 600);
+    assert_eq!(
+        policy["policy"]["notifier"],
+        json!(["/usr/bin/true", "--quiet"])
+    );
+    assert!(
+        !d.call(None, &["attention", "configure", "--enable", "--observe"])?
+            .status
+            .success()
+    );
+    assert!(
+        !d.call(None, &["attention", "configure", "--interval", "1h"])?
+            .status
+            .success()
+    );
+    assert!(
+        !d.call(
+            None,
+            &[
+                "attention",
+                "configure",
+                "--file",
+                "missing.json",
+                "--enable"
+            ]
+        )?
+        .status
+        .success()
+    );
+    assert_eq!(
+        d.ok(None, &["attention", "configure", "--clear-notifier"])?["policy"]["notifier"],
+        Value::Null
+    );
+    assert_eq!(
+        d.ok(None, &["attention", "configure"])?["policy"]["mode"],
+        "enabled"
+    );
+    assert_eq!(
+        d.ok(None, &["init", "manual", "--no-follow-through"])?["follow_through"]["mode"],
+        "observe"
+    );
+    assert_eq!(
+        d.ok(None, &["init", "manual", "--follow-through"])?["follow_through"]["mode"],
+        "enabled"
+    );
+    Ok(())
+}
+
+#[test]
 fn standalone_mail_work_and_session_replacement() -> Result<()> {
     let d = Demo::new()?;
     d.ok(None, &["init", "default"])?;
@@ -208,7 +288,7 @@ fn natural_retries_and_short_replies_preserve_one_logical_change() -> Result<()>
     assert_eq!(first, d.ok(Some(&writer), &create)?);
     assert_eq!(d.ok(Some(&writer), &["task", "show", "api"])?["version"], 2);
     assert_eq!(
-        d.ok(Some(&writer), &["task", "history", "api"])?
+        d.ok(Some(&writer), &["task", "history", "api"])?["items"]
             .as_array()
             .unwrap()
             .len(),

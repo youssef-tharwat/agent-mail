@@ -174,7 +174,23 @@ impl Store {
             None
         };
         let context = if receipt {
-            Some(self.delivery_text(actor, challenge.as_deref(), 0).await?)
+            let delivery = self.delivery(actor, challenge.as_deref(), 0).await?;
+            sqlx::query("UPDATE turn_offers SET state='abandoned' WHERE recipient=? AND binding_version=? AND runtime='hook' AND state='offered'")
+                .bind(actor.id).bind(actor.binding_version).execute(&mut *tx).await?;
+            crate::turns::offer_tx(
+                &mut tx,
+                actor,
+                endpoint
+                    .pending_id
+                    .as_deref()
+                    .context("missing native offer ID")?,
+                "hook",
+                &session,
+                &delivery.events,
+                observed_at,
+            )
+            .await?;
+            Some(delivery.text)
         } else {
             None
         };

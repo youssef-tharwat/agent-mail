@@ -557,23 +557,51 @@ recorded outcome. Agent Mail now keeps an attention plan beside each local pendi
 request and task. Runtime readiness, retrieval, the next check, and escalations are
 reported separately by `status --json` and `status --check NAME`.
 
-Existing groups start in **observation mode**. To enable follow-up dispatch, an
-operator supplies a complete group policy:
+New groups enable follow-through by default:
+
+```sh
+agent-mail init project
+# Observation only, without automatic follow-up dispatch:
+agent-mail init manual-project --no-follow-through
+
+# Change only the settings supplied; omitted settings retain their saved values.
+agent-mail --group project attention configure --interval 15m --max 1h
+agent-mail --group project attention configure --observe
+agent-mail --group project attention configure --enable
+agent-mail --group project attention configure --notifier /absolute/path/to/notify --notifier-arg fleet
+agent-mail --group project attention configure --clear-notifier
+```
+
+Plain `init` and upgrades preserve existing group policies. Use `init project
+--follow-through` or `attention configure --enable` to enable an existing group.
+Calling `attention configure` without flags reads the effective policy. Optional
+`--file policy.json` imports a complete policy, and cannot be mixed with change flags:
 
 ```json
 {"mode":"enabled","interval_seconds":900,"max_seconds":3600,"notifier":null}
 ```
 
-```sh
-agent-mail --group project attention configure --file policy.json
-```
+Native Codex delivery correlates its client message ID with persisted user input
+and completed-turn notifications. Trusted Claude/Codex hooks record the bounded
+context they supply and reconcile it at Stop. Only versions offered to that turn
+are considered; later arrivals, superseded records, valid checkpoints, and explicit
+blocked/review holds are excluded. One unhandled completed turn creates corrective
+attention; ignoring that offered correction in a later completed turn escalates
+to the task writer or mail sender. Duplicate receipts are idempotent, including
+after worker restart. A queue receipt or idle runtime state is never a completion.
 
-The interval controls two follow-up opportunities for retrieved but unhandled work;
-the third check escalates to the task writer or mail sender. Work with no usable
-runtime escalates by `max_seconds`. Exhausted delivery of an unread source escalates
-without resetting the original delivery budget. Existing pause and Herdr prompt
-policies still apply. Switch `mode` to `observe` to stop follow-up dispatch and retain
-its history. These scheduling times are independent of business deadlines.
+Dependency changes prioritize reconciliation immediately through service hints.
+The interval and maximum remain recovery bounds for missed lifecycle events,
+unavailable runtimes, and overdue checkpoints. The timer path retains two reminder
+opportunities before escalation. `max` must be at least four intervals and at most
+seven days. Existing pause and Herdr prompt policies still apply. These times are
+independent of business deadlines.
+
+Native Codex subscriptions rejoin only already loaded threads and replay a bounded
+recent history page after reconnect. Older clients without correlated input IDs,
+Claude bridge sessions without trusted hooks, and Herdr sessions without lifecycle
+hooks retain timer recovery. Failed/interrupted turns and missing history never
+count as successful completion. No adapter answers approval requests.
 
 ### Record a next step when yielding
 
@@ -660,7 +688,8 @@ Neither reading status nor inspecting history records retrieval for another agen
 Escalation first targets the writer/sender. A self-escalation goes directly to the
 operator; an unhandled escalation reaches that route after five minutes. Herdr
 uses its operator notification surface. Standalone groups can configure `notifier`
-as an array containing an **absolute executable** and arguments. It is launched
+with `attention configure --notifier /absolute/executable`, repeatable
+`--notifier-arg VALUE`, or a policy-file array containing that executable and arguments. It is launched
 without a shell, receives bounded group/attention JSON on stdin, has a five-second
 timeout, and gets at most three attempts with five-minute cooldowns. An explicitly
 configured notifier takes precedence over Herdr. Configure only a program you
@@ -674,14 +703,45 @@ with a new bounded operator budget. It does not reset business delivery attempts
 on process supervision to restart before it can send anything.
 
 Status totals cover all active sources, even when its detail list is truncated.
+`turn_receipts` distinguishes reserved offers from correlated completed turns;
+these receipts never imply a business outcome.
 Agent checks filter before pagination. Recovery responses stay within 4 KiB and
 mark only returned records retrieved; `checkpoints_more` directs agents to fetch
 full metadata through `task show` or `mail show`.
 
-Schema 18 adds attention metadata and preserves existing business records and
-receipts. Event subscriptions use protocol 2; an old subscriber gets an explicit
+Schema 19 adds durable turn offers and preserves existing attention metadata,
+business records, and receipts. Event subscriptions use protocol 2; an old subscriber gets an explicit
 upgrade error. The existing automatic upgrade path drains the old worker and
 backs up the database. Follow-up dispatch covers local tasks and local deliveries
 on Herdr, managed Codex and managed Claude. Remote task snapshots and cross-machine
 waits remain explicitly unsupported for follow-through; existing relay payloads
 retain their original contract.
+
+## Shared records, artifacts and complete task audits
+
+`record create/update --file` accepts bounded JSON; `record show ID --revision N`
+reads an immutable revision. `record history ID --before N` pages older revisions.
+`record link --file` attaches an exact revision using the task writer or message
+sender authority. See [record formats](records.md).
+
+`artifact register --file` stores typed external metadata; `artifact ingest
+--file metadata.json --input payload` stores original bytes. `artifact fetch ID
+--output PATH` verifies content before publishing a new output file. Failed
+verification never yields a successful artifact result. `artifact check ID`
+reports verified, unavailable, unsupported, or integrity failure.
+
+`artifact stats`, `artifact pin ID`, and `artifact prune [--grace SECONDS]`
+inspect retention. Pruning defaults to a dry run; `--apply` is explicit. Protected
+links and pins prevent collection. Local operator backups use `artifact backup
+DESTINATION`, and `artifact restore SOURCE DESTINATION` verifies a complete backup
+into a new state directory. Backup and restore reject agent sessions because the
+database contains other groups and private mail. A schema migration's SQLite
+backup is a database rollback copy; it is not a complete artifact archive. See
+[artifact storage](artifacts.md).
+
+The default task list remains focused on current assignments. `task list
+--all-states` or repeated `--state STATE` enables paginated group task discovery;
+continue with `--cursor` and the same filters. `task history ID --cursor CURSOR`
+pages immutable snapshots; `task messages ID` pages linked message metadata.
+Private bodies remain accessible only through the caller's authorized mailbox.
+See [coordination authority and cursor policies](task-coordination.md).
