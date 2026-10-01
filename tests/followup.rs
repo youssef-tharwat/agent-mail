@@ -119,6 +119,148 @@ impl Fixture {
     }
 }
 #[tokio::test]
+async fn scheduling_respects_checkpoints_pause_and_operator_escalation() -> Result<()> {
+    let f = Fixture::new().await?;
+    assert_eq!(followup::next_deadline(&f.store, f.time).await?, None);
+    f.task("scheduled").await?;
+    assert_eq!(
+        followup::next_deadline(&f.store, f.time).await?,
+        Some(f.time + 240)
+    );
+    f.store
+        .checkpoint(
+            &f.owner,
+            Source::Task {
+                id: "scheduled".into(),
+                version: 1,
+            },
+            "planned",
+            f.checkpoint(),
+            f.time + 1,
+        )
+        .await?;
+    assert_eq!(
+        followup::next_deadline(&f.store, f.time + 1).await?,
+        Some(f.time + 90)
+    );
+    // An elapsed checkpoint does not cause repeated immediate scans.
+    assert_eq!(
+        followup::next_deadline(&f.store, f.time + 90).await?,
+        Some(f.time + 240)
+    );
+    let pool = support::pool(&f.store).await?;
+    sqlx::query("UPDATE groups SET paused=1 WHERE name='g'")
+        .execute(&pool)
+        .await?;
+    assert_eq!(followup::next_deadline(&f.store, f.time + 1).await?, None);
+    sqlx::query("UPDATE groups SET paused=0 WHERE name='g'")
+        .execute(&pool)
+        .await?;
+    sqlx::query("UPDATE followup_policy SET mode='observe' WHERE group_name='g'")
+        .execute(&pool)
+        .await?;
+    assert_eq!(followup::next_deadline(&f.store, f.time + 1).await?, None);
+    sqlx::query("UPDATE followup_policy SET mode='enabled' WHERE group_name='g'")
+        .execute(&pool)
+        .await?;
+    followup::reconcile(&f.store, f.time + 240).await?;
+    assert_eq!(
+        followup::next_deadline(&f.store, f.time + 240).await?,
+        Some(f.time + 540)
+    );
+    sqlx::query("UPDATE attention_occurrences SET operator_state='accepted' WHERE stage=3")
+        .execute(&pool)
+        .await?;
+    assert_eq!(followup::next_deadline(&f.store, f.time + 240).await?, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconciled_attention_notifies_watchers_without_waiting_for_recovery() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.task("scheduled").await?;
+    f.store
+        .checkpoint(
+            &f.owner,
+            Source::Task {
+                id: "scheduled".into(),
+                version: 1,
+            },
+            "planned",
+            f.checkpoint(),
+            f.time + 1,
+        )
+        .await?;
+    let server = agent_mail::stream::Server::start(f.store.clone())?;
+    let mut watch = f.store.watch(&f.owner, None).await?;
+    followup::reconcile(&f.store, f.time + 90).await?;
+    let batch = tokio::time::timeout(std::time::Duration::from_secs(2), watch.next()).await??;
+    assert_eq!(batch.changes.followups.len(), 1);
+    assert_eq!(
+        f.store.work_show(&f.owner, "scheduled").await?.state,
+        TaskState::Active
+    );
+    drop(watch);
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn running_worker_wakes_for_a_new_checkpoint_before_its_recovery_scan() -> Result<()> {
+    use std::{process::Stdio, time::Duration};
+    let f = Fixture::new().await?;
+    f.task("scheduled").await?;
+    let mut worker = tokio::process::Command::new(env!("CARGO_BIN_EXE_agent-mail"))
+        .args(["--state-dir"])
+        .arg(f.temp.path())
+        .args(["service", "run"])
+        .env_remove("AGENT_MAIL_SESSION")
+        .env_remove("AGENT_MAIL_GROUP")
+        .env_remove("HERDR_ENV")
+        .env_remove("HERDR_SOCKET_PATH")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !f.temp.path().join("service-status.json").exists() {
+            anyhow::ensure!(
+                worker.try_wait()?.is_none(),
+                "worker exited before its first scan"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    let mut watch = f.store.watch(&f.owner, None).await?;
+    let time = agent_mail::now()?;
+    let mut checkpoint = f.checkpoint();
+    checkpoint.next_check_at = time + 3;
+    f.store
+        .checkpoint(
+            &f.owner,
+            Source::Task {
+                id: "scheduled".into(),
+                version: 1,
+            },
+            "planned",
+            checkpoint,
+            time,
+        )
+        .await?;
+    let batch = tokio::time::timeout(Duration::from_secs(4), watch.next()).await??;
+    assert_eq!(batch.changes.followups.len(), 1);
+    assert_eq!(
+        f.store.work_show(&f.owner, "scheduled").await?.state,
+        TaskState::Active
+    );
+    worker.kill().await?;
+    worker.wait().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn completed_turns_cover_only_offered_versions_and_escalate_once() -> Result<()> {
     let f = Fixture::new().await?;
     f.task("offered").await?;

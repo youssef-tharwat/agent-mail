@@ -658,6 +658,10 @@ the original escalation boundary is preserved.
 
 ### Handle scheduled attention
 
+Keep `agent-mail service run` running to deliver scheduled attention. The worker
+wakes at the next follow-up deadline and signals watchers after committing new
+attention. A five-second recovery scan covers missed signals.
+
 ```sh
 agent-mail attention list
 agent-mail attention list --after 123

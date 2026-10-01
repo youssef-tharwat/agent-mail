@@ -124,20 +124,19 @@ impl Agent {
         caller_pane: Option<&str>,
         caller_session: Option<&str>,
     ) -> Result<&Session> {
-        if self.agent_session.is_none()
-            && let Some(caller_pane) = caller_pane
-            && caller_pane != target
+        if let Some(caller_pane) =
+            caller_pane.filter(|pane| self.agent_session.is_none() && *pane != target)
         {
             bail!(
                 "the selected Herdr pane {target:?} has no native session identity, while this process inherits HERDR_PANE_ID={caller_pane:?}. These identify different panes, so Agent Mail will not bind using the inherited identity. Verify the selected pane's Herdr session/integration, then retry when Herdr reports its native session identity"
             );
         }
         let session = self.identity()?;
-        if caller_pane == Some(target)
-            && session.agent == "codex"
-            && session.kind == SessionKind::Id
-            && let Some(caller_session) = caller_session
-        {
+        if let Some(caller_session) = caller_session.filter(|_| {
+            caller_pane == Some(target)
+                && session.agent == "codex"
+                && session.kind == SessionKind::Id
+        }) {
             ensure!(
                 session.value == caller_session,
                 "Herdr reports pane {target:?} as Codex session {:?}, but this Codex process reports session {caller_session:?}; no binding was changed. Resolve the pane/session mismatch before retrying",

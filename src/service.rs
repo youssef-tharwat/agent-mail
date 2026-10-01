@@ -25,6 +25,18 @@ use std::{
 };
 use tokio::task::{JoinError, JoinSet};
 
+const RECOVERY_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+
+fn deadline_delay(deadline: Option<i64>, wall_time: Duration) -> Duration {
+    deadline
+        .and_then(|deadline| u64::try_from(deadline).ok())
+        .map_or(RECOVERY_SCAN_INTERVAL, |deadline| {
+            Duration::from_secs(deadline)
+                .saturating_sub(wall_time)
+                .min(RECOVERY_SCAN_INTERVAL)
+        })
+}
+
 /// Exclusive ownership of one installation’s delivery worker.
 #[derive(Debug)]
 pub struct WorkerLock(File);
@@ -239,9 +251,12 @@ async fn wake(
         json!({"target": target.pane, "text": text}),
     )
     .await?;
-    if let Some(nonce) = challenge.as_deref()
-        && let Err(error) = store.record_delivery_challenge(binding, nonce, time).await
-    {
+    let recorded = if let Some(nonce) = challenge.as_deref() {
+        store.record_delivery_challenge(binding, nonce, time).await
+    } else {
+        Ok(())
+    };
+    if let Err(error) = recorded {
         eprintln!(
             "agent-mail: could not record delivery check for {}/{}: {error:#}",
             binding.group_name, binding.name
@@ -436,8 +451,21 @@ pub async fn run(store: &Store, once: bool) -> Result<()> {
             println!("{}", String::from_utf8(bytes)?);
             break;
         }
+        // Include deadlines that elapsed while this scan was running.
+        let delay = match crate::followup::next_deadline(store, time).await {
+            Ok(deadline) => deadline_delay(
+                deadline,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .context("system clock is before the Unix epoch")?,
+            ),
+            Err(error) => {
+                eprintln!("agent-mail: could not read attention schedule: {error:#}");
+                RECOVERY_SCAN_INTERVAL
+            }
+        };
         tokio::select! {
-            () = tokio::time::sleep(Duration::from_secs(5)) => {},
+            () = tokio::time::sleep(delay) => {},
             () = async { if let Some(server)=&stream { server.changed().await } else { std::future::pending::<()>().await } } => {},
             result = tokio::signal::ctrl_c() => { result?; break; }
             _ = terminate.recv() => { break; }

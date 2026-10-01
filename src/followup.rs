@@ -810,12 +810,40 @@ async fn advance_attention(
     Ok(())
 }
 
-/// Reconcile a fair bounded page; the five-second service scan recovers missed hints.
+/// Return the next future attention deadline for the local worker.
+/// Elapsed deadlines are left to bounded reconciliation so unread or held work
+/// cannot make the worker spin. Disabled and paused groups do not schedule wakes.
+/// # Errors
+/// Reading the persisted attention schedule fails.
+pub async fn next_deadline(store: &Store, time: i64) -> Result<Option<i64>> {
+    Ok(sqlx::query_scalar(
+        "WITH enabled AS (
+            SELECT f.* FROM active_followups f
+            JOIN followup_policy p ON p.group_name=f.group_name
+            JOIN groups g ON g.name=f.group_name
+            WHERE p.mode='enabled' AND g.paused=0
+        ), deadlines AS (
+            SELECT next_check AS deadline FROM enabled WHERE stage<3
+            UNION ALL SELECT escalate_at FROM enabled WHERE stage<3
+            UNION ALL SELECT MAX(o.operator_after,o.operator_next)
+                FROM active_attention o JOIN enabled f ON f.id=o.followup
+                WHERE o.stage=3 AND o.operator_attempts<3 AND o.operator_state<>'accepted'
+        ) SELECT MIN(deadline) FROM deadlines WHERE deadline>?",
+    )
+    .bind(time)
+    .fetch_one(store.pool())
+    .await?)
+}
+
+/// Reconcile a fair bounded page; periodic service scans recover missed hints.
 pub async fn reconcile(store: &Store, time: i64) -> Result<()> {
     let mut tx = store.pool().begin().await?;
     // Take SQLite's writer reservation before reading decisions.
     sqlx::query("UPDATE followup_policy SET updated=updated WHERE 0")
         .execute(&mut *tx)
+        .await?;
+    let before: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id),0) FROM coordination_events")
+        .fetch_one(&mut *tx)
         .await?;
     // Bounded repair also covers registrations that became local after assignment.
     sqlx::query("INSERT OR IGNORE INTO followups(group_name,message,recipient,authority,opened,next_check,escalate_at) SELECT b.group_name,d.message,b.id,m.sender,m.created,?+p.max_seconds,?+p.max_seconds FROM deliveries d JOIN messages m ON m.id=d.message JOIN mailboxes b ON b.id=d.recipient JOIN followup_policy p ON p.group_name=b.group_name WHERE d.state='pending' AND b.remote_machine IS NULL AND NOT EXISTS(SELECT 1 FROM followups f WHERE f.message=d.message AND f.recipient=b.id) ORDER BY m.id,b.id LIMIT 100")
@@ -889,7 +917,13 @@ pub async fn reconcile(store: &Store, time: i64) -> Result<()> {
             publish_dependency_ready(&mut tx, &p, time).await?;
         }
     }
+    let after: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id),0) FROM coordination_events")
+        .fetch_one(&mut *tx)
+        .await?;
     tx.commit().await?;
+    if after != before {
+        crate::stream::hint(store.root()).await;
+    }
     Ok(())
 }
 
