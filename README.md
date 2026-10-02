@@ -8,6 +8,52 @@ receive small notifications and fetch details when needed. No account or hosted 
 
 ![Assign work, recover context, report results, and record a decision.](assets/agent-mail-demo.gif)
 
+## Architecture
+
+One local binary provides the CLI, delivery service, and optional SSH bridge.
+Each machine keeps its own store; groups share that store and service while
+keeping their tasks, identities, and inboxes separate.
+
+```mermaid
+flowchart TB
+    Agents["Codex / Claude Code agents"]
+    Operator["Operator"]
+
+    subgraph Local["Local machine · Agent Mail"]
+        CLI["CLI and recovery hooks"]
+        DB[("SQLite · mail.db<br/>Tasks, mail, records, identities<br/>Events, checkpoints, delivery receipts")]
+        Objects[("Managed artifact bytes<br/>SHA-256 content store")]
+        Service["Delivery service<br/>Deadline reconciliation, bounded retries<br/>Reminders and escalation"]
+        Adapters["Runtime adapters<br/>Codex app-server / Claude native inbox<br/>Optional Herdr integration"]
+        Relay["Optional SSH bridge"]
+
+        CLI <-->|"Authenticated reads and writes"| DB
+        CLI <-->|"Verified ingest and fetch"| Objects
+        CLI -.->|"Wake hint after commit"| Service
+        Service <-->|"Reconcile durable state"| DB
+        Service -->|"Serialized wake attempts"| Adapters
+        CLI -->|"Explicit sync"| Relay
+        Service -.->|"Peer opt-in for automatic sync"| Relay
+        Relay <-->|"Durable inbox, outbox and snapshots"| DB
+    end
+
+    Agents -->|"Fetch context, checkpoint, report and decide"| CLI
+    Operator -->|"Configure, inspect and repair"| CLI
+    Adapters -->|"Compact notifications"| Agents
+    Service -.->|"Configured operator notification route"| Operator
+    Relay <-->|"SSH stdio"| Peer["Remote Agent Mail node<br/>Its own SQLite store and runtime adapters"]
+```
+
+SQLite holds the authoritative coordination state; managed artifact bytes live
+on local disk. The service recovers pending work from persisted events and
+deadlines after restart. Agents fetch details on demand, and the task writer
+records decisions: a notification, delivery receipt, or status reply does not
+complete work. Approval holds remain in place during escalation.
+
+See [minimal continuation](docs/MINIMAL_CONTINUATION.md),
+[artifacts](docs/artifacts.md), and [task coordination](docs/task-coordination.md)
+for scheduling, storage, and authority details.
+
 ## Install
 
 Install the CLI and its agent skill:
