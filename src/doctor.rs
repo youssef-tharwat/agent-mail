@@ -182,7 +182,7 @@ pub async fn inspect(
             if config.paused == 0 && config.auto_prompt != 0 { None } else { Some("Resume this group and configure its Herdr prompt policy before relying on automatic delivery") });
     }
     if actor.binding.herdr().is_some() {
-        match sqlx::query!("SELECT b.attempts AS 'attempts!: i64',b.next_wake AS 'next_wake!: i64',b.wake_attempted AS 'wake_attempted!: i64',MAX(e.id) AS latest FROM mailboxes b LEFT JOIN herdr_wake_events e ON e.recipient=b.id WHERE b.id=? AND b.binding_version=? GROUP BY b.id",actor.id,actor.binding_version).fetch_one(store.pool()).await {
+        match sqlx::query!("SELECT b.attempts AS 'attempts!: i64',b.next_wake AS 'next_wake!: i64',b.wake_attempted AS 'wake_attempted!: i64',(SELECT MAX(e.id) FROM herdr_wake_events e WHERE e.recipient=b.id) AS 'latest?: i64' FROM mailboxes b WHERE b.id=? AND b.binding_version=?",actor.id,actor.binding_version).fetch_one(store.pool()).await {
             Ok(row) => {
                 let fresh=row.latest.is_some_and(|id| id>row.wake_attempted);
                 let attempts=if fresh {0} else {row.attempts};

@@ -1039,6 +1039,11 @@ async fn partial_retrieval_does_not_reset_the_same_generation_budget() -> Result
 async fn herdr_exhaustion_diagnostics_are_event_and_group_scoped() -> Result<()> {
     use agent_mail::attention::AttentionKind;
     let f = Fixture::new().await?;
+    let server = agent_mail::stream::Server::start(f.store.clone())?;
+    let report = agent_mail::doctor::inspect(f.store.root(), "g", Some("b"), None).await;
+    assert!(report.checks.iter().any(|c| c.check == "herdr_wake"
+        && c.status == agent_mail::doctor::Level::Pass
+        && c.detail["pending_event"].is_null()));
     let id = f.send("unreceived").await?;
     for now in [1000, 1300, 1600] {
         service::tick(&f.store, now).await?;
@@ -1054,7 +1059,6 @@ async fn herdr_exhaustion_diagnostics_are_event_and_group_scoped() -> Result<()>
     assert!(!is_exhausted(
         &f.store.attention_for(Some("other"), 1600).await?.items
     ));
-    let server = agent_mail::stream::Server::start(f.store.clone())?;
     let report = agent_mail::doctor::inspect(f.store.root(), "g", Some("b"), None).await;
     assert!(
         report

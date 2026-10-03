@@ -70,7 +70,9 @@ impl Store {
     }
 
     pub(crate) async fn herdr_attention(&self, actor: &Mailbox) -> Result<(bool, bool)> {
-        let row = sqlx::query!("SELECT MAX(e.id) AS latest,b.wake_attempted AS 'wake_attempted!: i64' FROM mailboxes b LEFT JOIN herdr_wake_events e ON e.recipient=b.id WHERE b.id=? AND b.binding_version=? GROUP BY b.id",actor.id,actor.binding_version).fetch_one(self.pool()).await?;
+        // Filter inside the subquery: a left join materializes the entire event
+        // view for each mailbox instead of using its recipient index.
+        let row = sqlx::query!("SELECT (SELECT MAX(e.id) FROM herdr_wake_events e WHERE e.recipient=b.id) AS 'latest?: i64',b.wake_attempted AS 'wake_attempted!: i64' FROM mailboxes b WHERE b.id=? AND b.binding_version=?",actor.id,actor.binding_version).fetch_one(self.pool()).await?;
         Ok((
             row.latest.is_some(),
             row.latest.is_some_and(|id| id > row.wake_attempted),
