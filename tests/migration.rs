@@ -9,6 +9,108 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::fs;
 
 #[tokio::test]
+async fn version_twenty_two_adds_wake_indexes_without_changing_events_or_receipts() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("state");
+    let migrations = temp.path().join("old-migrations");
+    fs::create_dir_all(&root)?;
+    fs::create_dir_all(&migrations)?;
+    for entry in fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_str().expect("migration filename is UTF-8");
+        if name.ends_with(".sql") && name[..4].parse::<u32>()? <= 22 {
+            fs::copy(entry.path(), migrations.join(name))?;
+        }
+    }
+    let options = SqliteConnectOptions::new()
+        .filename(root.join("mail.db"))
+        .create_if_missing(true);
+    let pool = SqlitePoolOptions::new().connect_with(options).await?;
+    sqlx::migrate::Migrator::new(migrations.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+    sqlx::raw_sql(r#"
+        INSERT INTO node VALUES ('00000000-0000-4000-8000-000000000001');
+        INSERT INTO groups(name,socket,home_machine) VALUES ('g','','00000000-0000-4000-8000-000000000001');
+        INSERT INTO mailboxes(id,group_name,name,binding) VALUES
+          (1,'g','sender','{"runtime":"standalone","session":"00000000-0000-4000-8000-000000000002"}'),
+          (2,'g','owner','{"runtime":"standalone","session":"00000000-0000-4000-8000-000000000003"}');
+        INSERT INTO messages(id,sender,dedup_key,canonical,summary,body,created,due)
+          VALUES (1,1,'mail','{}','Pending','Body',100,1000);
+        INSERT INTO deliveries(message,recipient) VALUES (1,2);
+        UPDATE followups SET stage=1 WHERE message=1;
+        INSERT INTO attention_occurrences(followup,plan_version,stage,recipient,created)
+          SELECT id,version,1,recipient,101 FROM followups WHERE message=1;
+        INSERT INTO coordination_events(recipient,kind,subject,version,created)
+          SELECT recipient,'attention_due',CAST(id AS TEXT),1,101 FROM attention_occurrences;
+        INSERT INTO coordination_events(recipient,kind,subject,version,created)
+          VALUES (2,'mail_pending','1',1,102), (2,'mail_pending','01',0,103),
+                 (1,'mail_pending','1',0,104), (2,'mail_changed','1',0,105);
+        INSERT INTO event_receipts(recipient,binding_version,event)
+          SELECT recipient,1,id FROM coordination_events WHERE kind='mail_pending' AND version=1;
+    "#).execute(&pool).await?;
+    let snapshot = |pool: sqlx::SqlitePool| async move {
+        let mut rows = Vec::new();
+        for view in ["coordination_events", "wake_events", "herdr_wake_events"] {
+            rows.push(sqlx::query_scalar::<_, String>(&format!(
+                "SELECT printf('%d|%d|%s|%s|%d',id,recipient,kind,subject,version) FROM {view} ORDER BY id"
+            )).fetch_all(&pool).await?);
+        }
+        rows.push(sqlx::query_scalar::<_, String>(
+            "SELECT printf('%d|%d|%d',recipient,binding_version,event) FROM event_receipts ORDER BY recipient,event"
+        ).fetch_all(&pool).await?);
+        anyhow::Ok(rows)
+    };
+    let before = snapshot(pool.clone()).await?;
+    assert_eq!(
+        before[1].len(),
+        2,
+        "only current mail and attention are actionable"
+    );
+    assert_eq!(
+        before[2].len(),
+        1,
+        "the current binding receipted the mail event"
+    );
+    pool.close().await;
+
+    let store = upgrade::open(&root, OpenMode::Existing).await?;
+    let pool = support::pool(&store).await?;
+    assert_eq!(snapshot(pool.clone()).await?, before);
+    let plan = sqlx::query_as::<_, (i64, i64, i64, String)>(
+        "EXPLAIN QUERY PLAN SELECT id FROM wake_events WHERE recipient=2",
+    )
+    .fetch_all(&pool)
+    .await?;
+    for index in [
+        "coordination_event_supersession",
+        "pending_delivery_subject",
+        "attention_subject",
+    ] {
+        assert!(
+            plan.iter().any(|row| row.3.contains(index)),
+            "missing index {index}: {plan:?}"
+        );
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await?,
+        23
+    );
+    assert!(
+        sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await?
+            .is_empty()
+    );
+    assert_eq!(fs::read_dir(root.join("backups"))?.count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn existing_version_four_state_upgrades_to_opt_in_sync() -> Result<()> {
     let temp = tempfile::Builder::new()
         .prefix("agent-mail-migration-")
@@ -45,7 +147,7 @@ async fn existing_version_four_state_upgrades_to_opt_in_sync() -> Result<()> {
     let version = sqlx::query!("PRAGMA user_version")
         .fetch_one(&support::pool(&store).await?)
         .await?;
-    assert_eq!(version.user_version, Some(22));
+    assert_eq!(version.user_version, Some(23));
     let peer = uuid::Uuid::new_v4();
     store.add_peer(peer, "test-host").await?;
     assert!(!store.peers_status().await?[0].auto_sync);
@@ -384,7 +486,7 @@ async fn version_sixteen_upgrades_without_changing_business_or_legacy_budgets() 
             .fetch_one(&pool)
             .await?
             .user_version,
-        Some(22)
+        Some(23)
     );
     Ok(())
 }
@@ -443,7 +545,7 @@ async fn automatic_open_never_initializes_missing_state_or_downgrades() -> Resul
     let pool = SqlitePoolOptions::new()
         .connect_with(SqliteConnectOptions::new().filename(root.join("mail.db")))
         .await?;
-    sqlx::query!("PRAGMA user_version=23")
+    sqlx::query!("PRAGMA user_version=24")
         .execute(&pool)
         .await?;
     pool.close().await;
