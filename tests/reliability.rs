@@ -14,7 +14,7 @@ use tempfile::TempDir;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixListener,
-    sync::Mutex,
+    sync::{Mutex, Notify},
     task::JoinHandle,
 };
 
@@ -25,6 +25,14 @@ struct Host {
     notifications: usize,
     enabled: bool,
     drop_prompt_response: bool,
+    invalid_agent_response: bool,
+    prompt_gate: Option<Arc<PromptGate>>,
+}
+
+#[derive(Default)]
+struct PromptGate {
+    entered: Notify,
+    release: Notify,
 }
 
 struct Fixture {
@@ -87,10 +95,13 @@ impl Fixture {
                         return;
                     };
                     let mut host = shared.lock().await;
+                    let gate = (request["method"] == "agent.prompt")
+                        .then(|| host.prompt_gate.clone())
+                        .flatten();
                     let result = match request["method"].as_str().unwrap_or_default() {
                         "agent.get" => {
                             let target = request["params"]["target"].as_str().unwrap_or_default();
-                            json!({"type":"agent_info","agent":host.agents.iter().find(|a| a.pane_id==target)})
+                            json!({"type":"agent_info","agent":host.agents.iter().find(|a| a.pane_id==target && !host.invalid_agent_response)})
                         }
                         "agent.list" => json!({"type":"agent_list","agents":host.agents}),
                         "plugin.list" => {
@@ -115,6 +126,10 @@ impl Fixture {
                         _ => json!({"type":"ok"}),
                     };
                     drop(host);
+                    if let Some(gate) = gate {
+                        gate.entered.notify_one();
+                        gate.release.notified().await;
+                    }
                     let response = format!("{}\n", json!({"id":request["id"],"result":result}));
                     let _ = write.write_all(response.as_bytes()).await;
                 });
@@ -197,6 +212,233 @@ fn message(key: &str) -> Publish {
         reply_to: None,
         work_id: None,
     }
+}
+
+#[tokio::test]
+async fn slow_herdr_delivery_blocks_other_writers_and_records_completion_or_cancellation()
+-> Result<()> {
+    use sqlx::{Connection, sqlite::SqliteConnectOptions};
+    use std::time::{Duration, Instant};
+    for cancel in [false, true] {
+        let f = Fixture::new().await?;
+        f.store.enroll("unrelated", None).await?;
+        let mut writer = sqlx::SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(f.store.root().join("mail.db"))
+                .busy_timeout(Duration::from_millis(50)),
+        )
+        .await?;
+        f.send("slow-runtime").await?;
+        let gate = Arc::new(PromptGate::default());
+        f.host.lock().await.prompt_gate = Some(gate.clone());
+        let state = f.store.clone();
+        let delivery = tokio::spawn(async move { service::tick(&state, 1000).await });
+        tokio::time::timeout(Duration::from_secs(2), gate.entered.notified()).await?;
+        // The real worker is now inside agent.prompt, after acquiring its writer lock.
+        let blocked_at = Instant::now();
+        let name: String = sqlx::query_scalar("SELECT name FROM groups WHERE name='unrelated'")
+            .fetch_one(&mut writer)
+            .await?;
+        assert_eq!(name, "unrelated", "WAL readers can still proceed");
+        let error = sqlx::query("UPDATE groups SET paused=1 WHERE name='unrelated'")
+            .execute(&mut writer)
+            .await
+            .expect_err("an unrelated writer must wait behind the slow runtime");
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("5")
+        );
+        let blocked_us = u64::try_from(blocked_at.elapsed().as_micros())?;
+        if cancel {
+            delivery.abort();
+            assert!(delivery.await.unwrap_err().is_cancelled());
+            gate.release.notify_one();
+        } else {
+            gate.release.notify_one();
+            let observations = delivery.await??;
+            assert!(
+                observations
+                    .iter()
+                    .any(|o| o.state == agent_mail::states::DeliveryState::Queued)
+            );
+        }
+        sqlx::query("PRAGMA busy_timeout=2000")
+            .execute(&mut writer)
+            .await?;
+        sqlx::query("UPDATE groups SET paused=1 WHERE name='unrelated'")
+            .execute(&mut writer)
+            .await?;
+        f.store.set_auto_prompt("g", false).await?;
+        service::run(&f.store, true).await?;
+        let report: Value =
+            serde_json::from_slice(&std::fs::read(f.store.root().join("service-status.json"))?)?;
+        let timings = report["delivery_timings"]
+            .as_array()
+            .expect("worker must publish delivery timings");
+        let timing = |phase| {
+            timings
+                .iter()
+                .find(|m| m["operation"] == "herdr_delivery" && m["phase"] == phase)
+                .unwrap()
+        };
+        let hold = timing("writer_hold");
+        let transport = timing("transport");
+        assert_eq!(timing("writer_acquire")["completed"], 1);
+        assert!(hold["max_us"].as_u64().unwrap() >= transport["max_us"].as_u64().unwrap());
+        assert!(transport["max_us"].as_u64().unwrap() >= blocked_us);
+        for measurement in [hold, transport] {
+            assert_eq!(measurement["in_flight"], 0);
+            assert_eq!(measurement[if cancel { "aborted" } else { "completed" }], 1);
+            assert_eq!(measurement["failed"], 0);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn verification_retains_health_and_dispatch_errors_without_stopping_other_checks()
+-> Result<()> {
+    for health_error in [true, false] {
+        let f = Fixture::new().await?;
+        for index in 0..8 {
+            let live = agent(&format!("w1:p{}", index + 3));
+            f.host.lock().await.agents.push(live.clone());
+            f.store
+                .bind("g", &format!("lane-{index}"), &live, false)
+                .await?;
+        }
+        {
+            let mut host = f.host.lock().await;
+            host.invalid_agent_response = health_error;
+            host.drop_prompt_response = !health_error;
+        }
+        let report =
+            serde_json::to_value(agent_mail::verification::reconcile(&f.store, 1000).await?)?;
+        assert_eq!(report["checked"], 10);
+        assert_eq!(report["failed"], 10);
+        let errors = report["errors"].as_array().unwrap();
+        assert_eq!(
+            errors.len(),
+            8,
+            "details must be bounded without losing failure totals"
+        );
+        for error in errors {
+            let error = error.as_str().unwrap();
+            assert!(error.len() <= 1024);
+            assert!(error.contains(if health_error {
+                "health check failed"
+            } else {
+                "challenge dispatch failed"
+            }));
+        }
+        let db = support::pool(&f.store).await?;
+        let failed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delivery_probes WHERE failed=1")
+            .fetch_one(&db)
+            .await?;
+        assert_eq!(
+            failed, 10,
+            "failure reporting must preserve persisted delivery health"
+        );
+        db.close().await;
+        if !health_error {
+            f.store.set_auto_prompt("g", false).await?;
+            service::run(&f.store, true).await?;
+            let snapshot: Value = serde_json::from_slice(&std::fs::read(
+                f.store.root().join("service-status.json"),
+            )?)?;
+            let timing = |phase| {
+                snapshot["delivery_timings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|m| m["operation"] == "herdr_verification" && m["phase"] == phase)
+                    .unwrap()
+            };
+            assert_eq!(timing("transport")["failed"], 10);
+            assert_eq!(timing("writer_hold")["aborted"], 10);
+            assert_eq!(timing("writer_hold")["in_flight"], 0);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_scan_publishes_verification_failure_before_returning_error() -> Result<()> {
+    let f = Fixture::new().await?;
+    let db = support::pool(&f.store).await?;
+    sqlx::query("ALTER TABLE mailboxes RENAME TO unavailable_mailboxes")
+        .execute(&db)
+        .await?;
+    db.close().await;
+    assert!(service::run(&f.store, true).await.is_err());
+    let report: Value =
+        serde_json::from_slice(&std::fs::read(f.store.root().join("service-status.json"))?)?;
+    assert!(
+        report["verification"]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("mailboxes"))
+    );
+    assert_eq!(report["verification_running"], false);
+    Ok(())
+}
+
+#[tokio::test]
+async fn continuous_worker_publishes_verification_task_failures() -> Result<()> {
+    use std::time::Duration;
+    let f = Fixture::new().await?;
+    let db = support::pool(&f.store).await?;
+    // Fault injection affects the registration-list query, before per-agent checks.
+    sqlx::query("ALTER TABLE mailboxes RENAME TO unavailable_mailboxes")
+        .execute(&db)
+        .await?;
+    db.close().await;
+    let mut worker = tokio::process::Command::new(env!("CARGO_BIN_EXE_agent-mail"))
+        .args([
+            "--state-dir",
+            f.store.root().to_str().unwrap(),
+            "service",
+            "run",
+        ])
+        .env_remove("AGENT_MAIL_GROUP")
+        .env_remove("AGENT_MAIL_SESSION")
+        .env_remove("HERDR_ENV")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let status_path = f.store.root().join("service-status.json");
+    let observed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(bytes) = std::fs::read(&status_path) {
+                let report: Value = serde_json::from_slice(&bytes)?;
+                if let Some(error) = report["verification"]["error"].as_str() {
+                    assert!(
+                        error.contains("mailboxes"),
+                        "retain database error context: {error}"
+                    );
+                    break Ok::<(), anyhow::Error>(());
+                }
+            }
+            assert!(
+                worker.try_wait()?.is_none(),
+                "worker should keep serving after a failed check"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    worker.kill().await?;
+    observed??;
+    let mut stderr = String::new();
+    use tokio::io::AsyncReadExt;
+    worker
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .await?;
+    assert!(stderr.contains("agent-mail: delivery verification:"));
+    Ok(())
 }
 
 #[tokio::test]

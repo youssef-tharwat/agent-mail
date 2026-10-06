@@ -52,6 +52,8 @@ pub mod supervision;
 pub mod verification;
 pub mod work;
 
+mod diagnostics;
+
 /// Stable Herdr plugin identifier used for session-scoped enablement checks.
 pub const PLUGIN_ID: &str = "youssef-tharwat.agent-mail";
 /// Maximum message body size in UTF-8 bytes, keeping relay batches bounded.

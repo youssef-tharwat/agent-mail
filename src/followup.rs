@@ -242,6 +242,24 @@ struct Plan {
     stage: i64,
     scanned: i64,
 }
+
+/// Authority responsible for a source's reminder and escalation schedule.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Schedule {
+    /// This task or request has an independent schedule.
+    Source,
+    /// A retrieved request shares its linked task's current schedule.
+    Task {
+        /// Same-group task identifier.
+        id: crate::names::TaskId,
+        /// Current task revision governing the schedule.
+        version: i64,
+        /// Follow-up metadata identifier for that task.
+        followup: i64,
+    },
+}
+
 impl Plan {
     fn report(&self) -> Result<Option<Checkpoint>> {
         self.checkpoint
@@ -253,11 +271,28 @@ impl Plan {
     fn value(&self) -> Result<Value> {
         let mut value = serde_json::to_value(self)?;
         value["checkpoint"] = serde_json::to_value(self.report()?)?;
+        value["schedule"] = serde_json::to_value(Schedule::Source)?;
         Ok(value)
     }
 }
 
 impl Store {
+    async fn scheduled_plan_value(tx: &mut Transaction<'_, Sqlite>, plan: &Plan) -> Result<Value> {
+        let mut value = plan.value()?;
+        if plan.message.is_some() {
+            let task = sqlx::query("SELECT f.id,f.task,f.task_version FROM task_request_schedules s JOIN followups f ON f.id=s.task_followup WHERE s.followup=?")
+                .bind(plan.id).fetch_optional(&mut **tx).await?;
+            if let Some(task) = task {
+                value["schedule"] = serde_json::to_value(Schedule::Task {
+                    id: task.get::<String, _>("task").parse()?,
+                    version: task.get("task_version"),
+                    followup: task.get("id"),
+                })?;
+            }
+        }
+        Ok(value)
+    }
+
     /// Configure bounded follow-through. This is an operator action.
     pub async fn configure_followups(&self, group: &str, policy: &Policy, time: i64) -> Result<()> {
         self.patch_followups(group, &policy.clone().into(), time)
@@ -520,8 +555,13 @@ impl Store {
         Self::check_actor(&mut tx, actor).await?;
         let row=sqlx::query_as::<_,Plan>("SELECT * FROM followups WHERE group_name=? AND ((task=? AND (recipient=? OR authority=?)) OR (message=? AND recipient=?))")
             .bind(&actor.group_name).bind(task).bind(actor.id).bind(actor.id).bind(message).bind(actor.id).fetch_optional(&mut *tx).await?;
+        let value = if let Some(plan) = row {
+            Self::scheduled_plan_value(&mut tx, &plan).await?
+        } else {
+            json!({"supported":false,"reason":"no local follow-up visible; remote follow-up unsupported"})
+        };
         tx.commit().await?;
-        row.map_or(Ok(json!({"supported":false,"reason":"no local follow-up visible; remote follow-up unsupported"})),|p|p.value())
+        Ok(value)
     }
     /// List checkpoint history visible to the current responsible actor.
     pub async fn checkpoint_history(
@@ -599,9 +639,10 @@ impl Store {
             row.get("plan_version"),
         )
         .await?;
+        let followup = Self::scheduled_plan_value(&mut tx, &plan).await?;
         tx.commit().await?;
         Ok(
-            json!({"id":id,"current":active,"stage":row.get::<i64,_>("stage"),"reason":row.get::<String,_>("reason"),"followup":plan.value()?,"mail":mail,"instruction":"Read the included mail or fetch the current task. Act within its authority or record a checkpoint/blocker. Retrieval does not settle work."}),
+            json!({"id":id,"current":active,"stage":row.get::<i64,_>("stage"),"reason":row.get::<String,_>("reason"),"followup":followup,"mail":mail,"instruction":"Read the included mail or fetch the current task. Act within its authority or record a checkpoint/blocker. Retrieval does not settle work."}),
         )
     }
     /// Record source retrieval for all runtimes, separately from transport receipts.
@@ -894,7 +935,7 @@ async fn advance_attention(
 pub async fn next_deadline(store: &Store, time: i64) -> Result<Option<i64>> {
     Ok(sqlx::query_scalar(
         "WITH enabled AS (
-            SELECT f.* FROM active_followups f
+            SELECT f.* FROM scheduled_followups f
             JOIN followup_policy p ON p.group_name=f.group_name
             JOIN groups g ON g.name=f.group_name
             WHERE p.mode='enabled' AND g.paused=0
@@ -927,7 +968,7 @@ pub async fn reconcile(store: &Store, time: i64) -> Result<()> {
     sqlx::query("INSERT OR IGNORE INTO followups(group_name,task,task_version,recipient,authority,opened,next_check,escalate_at) SELECT w.group_name,w.id,w.version,b.id,a.id,w.updated,?+p.max_seconds,?+p.max_seconds FROM work_items w JOIN mailboxes b ON b.group_name=w.group_name AND b.name=w.owner JOIN mailboxes a ON a.group_name=w.group_name AND a.name=w.writer JOIN followup_policy p ON p.group_name=w.group_name WHERE w.open=1 AND b.remote_machine IS NULL AND NOT EXISTS(SELECT 1 FROM followups f WHERE f.group_name=w.group_name AND f.task=w.id) ORDER BY w.group_name,w.id LIMIT 100")
         .bind(time).bind(time).execute(&mut *tx).await?;
     let plans = sqlx::query_as::<_, Plan>(
-        "SELECT * FROM active_followups WHERE stage<3 OR (dependency_ready_at IS NULL AND json_extract(checkpoint,'$.waiting.kind') IN ('task','tasks','mail','pull_request')) ORDER BY scanned,id LIMIT 100",
+        "SELECT * FROM scheduled_followups WHERE stage<3 OR (dependency_ready_at IS NULL AND json_extract(checkpoint,'$.waiting.kind') IN ('task','tasks','mail','pull_request')) ORDER BY scanned,id LIMIT 100",
     )
     .fetch_all(&mut *tx)
     .await?;
@@ -1012,9 +1053,9 @@ impl Store {
         time: i64,
         actor: Option<i64>,
     ) -> Result<Value> {
-        let totals=sqlx::query("SELECT COUNT(*) AS pending,COALESCE(SUM(next_check<=?),0) AS due,COALESCE(SUM(stage=3),0) AS escalated FROM active_followups WHERE (? IS NULL OR group_name=?) AND (? IS NULL OR recipient=? OR authority=?)")
+        let totals=sqlx::query("SELECT COUNT(*) AS pending,COALESCE(SUM(s.followup IS NULL),0) AS scheduled,COALESCE(SUM(s.followup IS NOT NULL),0) AS shared_requests,COALESCE(SUM(s.followup IS NULL AND f.next_check<=?),0) AS due,COALESCE(SUM(s.followup IS NULL AND f.stage=3),0) AS escalated FROM active_followups f LEFT JOIN task_request_schedules s ON s.followup=f.id WHERE (? IS NULL OR f.group_name=?) AND (? IS NULL OR f.recipient=? OR f.authority=?)")
             .bind(time).bind(group).bind(group).bind(actor).bind(actor).bind(actor).fetch_one(self.pool()).await?;
-        let rows=sqlx::query("SELECT f.*,b.name AS owner,b.binding_version AS current_binding,a.name AS decision_owner,p.mode FROM active_followups f JOIN mailboxes b ON b.id=f.recipient JOIN mailboxes a ON a.id=f.authority JOIN followup_policy p ON p.group_name=f.group_name WHERE (? IS NULL OR f.group_name=?) AND (? IS NULL OR f.recipient=? OR f.authority=?) ORDER BY f.escalate_at,f.id LIMIT 101").bind(group).bind(group).bind(actor).bind(actor).bind(actor).fetch_all(self.pool()).await?;
+        let rows=sqlx::query("SELECT f.*,b.name AS owner,b.binding_version AS current_binding,a.name AS decision_owner,p.mode FROM scheduled_followups f JOIN mailboxes b ON b.id=f.recipient JOIN mailboxes a ON a.id=f.authority JOIN followup_policy p ON p.group_name=f.group_name WHERE (? IS NULL OR f.group_name=?) AND (? IS NULL OR f.recipient=? OR f.authority=?) ORDER BY f.escalate_at,f.id LIMIT 101").bind(group).bind(group).bind(actor).bind(actor).bind(actor).fetch_all(self.pool()).await?;
         let more = rows.len() > 100;
         let mut items = Vec::new();
         for r in rows.iter().take(100) {
@@ -1039,7 +1080,7 @@ impl Store {
         let notifications=sqlx::query("SELECT o.id,f.group_name,o.operator_state,o.operator_detail,o.operator_attempts,o.operator_next FROM active_attention o JOIN followups f ON f.id=o.followup WHERE o.stage=3 AND (? IS NULL OR f.group_name=?) AND (? IS NULL OR f.recipient=? OR f.authority=?) ORDER BY o.id DESC LIMIT 101").bind(group).bind(group).bind(actor).bind(actor).bind(actor).fetch_all(self.pool()).await?;
         let alerts:Vec<Value>=notifications.iter().take(100).map(|r|json!({"id":r.get::<i64,_>("id"),"group":r.get::<String,_>("group_name"),"state":r.get::<String,_>("operator_state"),"detail":r.get::<Option<String>,_>("operator_detail"),"attempts":r.get::<i64,_>("operator_attempts"),"next_attempt":r.get::<i64,_>("operator_next")})).collect();
         Ok(
-            json!({"totals":{"pending":totals.get::<i64,_>("pending"),"due":totals.get::<i64,_>("due"),"escalated":totals.get::<i64,_>("escalated")},"items":items,"more":more || notifications.len()>100 || delivery.len()>100,"delivery_attempts":attempts,"operator_notifications":alerts,"remote_followup":"unsupported"}),
+            json!({"totals":{"pending":totals.get::<i64,_>("pending"),"scheduled":totals.get::<i64,_>("scheduled"),"shared_requests":totals.get::<i64,_>("shared_requests"),"due":totals.get::<i64,_>("due"),"escalated":totals.get::<i64,_>("escalated")},"items":items,"more":more || notifications.len()>100 || delivery.len()>100,"delivery_attempts":attempts,"operator_notifications":alerts,"remote_followup":"unsupported"}),
         )
     }
 }

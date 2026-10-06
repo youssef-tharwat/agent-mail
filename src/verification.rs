@@ -1,5 +1,6 @@
 //! Bounded end-to-end challenges. Runtime receipts cannot acknowledge for the agent.
 use crate::{
+    diagnostics::{Operation, Phase, error_text},
     identity::Binding,
     states::{DeliveryReadiness as State, NativeRuntime},
     store::{Mailbox, Store},
@@ -449,9 +450,10 @@ async fn reconcile_one(store: &Store, actor: &Mailbox, now: i64) -> Result<()> {
     let Some((route, nonce)) = store.ensure_probe(actor, now).await? else {
         return Ok(());
     };
-    let health = healthy(store, actor, &route).await.unwrap_or(false);
-    let checked = health.then_some(now);
-    let failed = !health;
+    let health = healthy(store, actor, &route).await;
+    let available = matches!(&health, Ok(true));
+    let checked = available.then_some(now);
+    let failed = !available;
     sqlx::query!(
         "UPDATE delivery_probes SET healthy_at=?,failed=? WHERE recipient=? AND nonce=?",
         checked,
@@ -460,8 +462,12 @@ async fn reconcile_one(store: &Store, actor: &Mailbox, now: i64) -> Result<()> {
         nonce
     )
     .execute(store.pool())
-    .await?;
-    if !health {
+    .await
+    .with_context(|| match &health {
+        Err(error) => format!("could not record route health failure: {error:#}"),
+        Ok(_) => "could not record route health check".into(),
+    })?;
+    if !health.context("delivery route health check failed")? {
         return Ok(());
     }
     if sqlx::query!(
@@ -484,14 +490,16 @@ async fn reconcile_one(store: &Store, actor: &Mailbox, now: i64) -> Result<()> {
             send_herdr(store, actor, &nonce, Path::new(&socket), now).await
         }
     };
-    if result.is_err() {
+    if let Err(error) = result {
         sqlx::query!(
             "UPDATE delivery_probes SET healthy_at=NULL,failed=1 WHERE recipient=? AND nonce=?",
             actor.id,
             nonce
         )
         .execute(store.pool())
-        .await?;
+        .await
+        .with_context(|| format!("could not record delivery check failure: {error:#}"))?;
+        return Err(error).context("delivery challenge dispatch failed");
     }
     Ok(())
 }
@@ -513,43 +521,87 @@ async fn send_herdr(
     if !store.reserve_probe(actor, nonce, now).await? {
         return Ok(());
     }
-    let mut tx = store.pool().begin().await?;
-    Store::lock_actor(&mut tx, actor).await?;
+    let operation = Operation::HerdrVerification;
+    let mut tx = store.delivery_transaction(actor, operation).await?;
     ensure!(
         Store::probe_current(&mut tx, actor, nonce, now).await?,
         "connection changed"
     );
-    ensure!(
-        crate::herdr::plugin_enabled(socket).await?,
-        "plugin disabled"
-    );
-    crate::herdr::call(
-        socket,
-        "agent.prompt",
-        serde_json::json!({"target":binding.pane,"text":challenge(actor,nonce)}),
-    )
-    .await?;
-    sqlx::query!("UPDATE delivery_probes SET transport_accepted_at=COALESCE(transport_accepted_at,?) WHERE recipient=? AND nonce=?",now,actor.id,nonce).execute(&mut *tx).await?;
+    store
+        .diagnostics()
+        .measure(operation, Phase::Transport, async {
+            ensure!(
+                crate::herdr::plugin_enabled(socket).await?,
+                "plugin disabled"
+            );
+            crate::herdr::call(
+                socket,
+                "agent.prompt",
+                serde_json::json!({"target":binding.pane,"text":challenge(actor,nonce)}),
+            )
+            .await?;
+            Ok(())
+        })
+        .await?;
+    sqlx::query!("UPDATE delivery_probes SET transport_accepted_at=COALESCE(transport_accepted_at,?) WHERE recipient=? AND nonce=?",now,actor.id,nonce).execute(&mut **tx).await?;
     tx.commit().await?;
     Ok(())
 }
-/// Reconcile checks without blocking domain delivery. At most four endpoint probes run together.
-pub async fn reconcile(store: &Store, now: i64) -> Result<()> {
+/// Bounded results of a verification scan; individual failures do not stop other checks.
+#[derive(Debug, Serialize)]
+pub struct ReconcileReport {
+    /// Unix seconds when this scan was started.
+    pub checked_at: i64,
+    /// Number of registrations checked, including failures.
+    pub checked: usize,
+    /// Number of failed checks, including errors omitted from the detail list.
+    pub failed: usize,
+    /// At most eight contextual errors, each limited to 1 KiB of UTF-8 text.
+    pub errors: Vec<String>,
+}
+
+/// Reconcile checks in a separate worker task. At most four endpoint probes run together.
+///
+/// # Errors
+/// The registration list cannot be read. Individual failures are retained in the report.
+pub async fn reconcile(store: &Store, now: i64) -> Result<ReconcileReport> {
     use futures_util::{StreamExt, stream};
     let rows=sqlx::query!("SELECT group_name,name FROM mailboxes WHERE agent_state='registered' AND remote_machine IS NULL").fetch_all(store.pool()).await?;
-    stream::iter(rows)
-        .for_each_concurrent(4, |r| async move {
-            if let Ok(actor) = store.mailbox(&r.group_name, &r.name).await {
-                if let Err(error) = reconcile_one(store, &actor, now).await {
-                    eprintln!(
-                        "agent-mail: delivery check for {}/{} failed: {error}",
-                        r.group_name, r.name
-                    );
-                }
+    let checks = stream::iter(rows)
+        .map(|r| async move {
+            async {
+                let actor = store.mailbox(&r.group_name, &r.name).await?;
+                reconcile_one(store, &actor, now).await
             }
+            .await
+            .with_context(|| format!("delivery check for {}/{} failed", r.group_name, r.name))
         })
-        .await;
-    Ok(())
+        .buffer_unordered(4);
+    tokio::pin!(checks);
+    let mut report = ReconcileReport {
+        checked_at: now,
+        checked: 0,
+        failed: 0,
+        errors: Vec::new(),
+    };
+    while let Some(result) = checks.next().await {
+        report.checked += 1;
+        if let Err(error) = result {
+            report.failed += 1;
+            if report.errors.len() < 8 {
+                let error = error_text(format!("{error:#}"));
+                eprintln!("agent-mail: {error}");
+                report.errors.push(error);
+            }
+        }
+    }
+    if report.failed > report.errors.len() {
+        eprintln!(
+            "agent-mail: {} additional delivery check failures omitted",
+            report.failed - report.errors.len()
+        );
+    }
+    Ok(report)
 }
 
 impl Store {

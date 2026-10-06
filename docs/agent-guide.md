@@ -393,6 +393,16 @@ IDs with `task show` or `mail show`, and scheduled `followups` IDs with
 run them and follow the returned page cursors as needed. A delivery-check
 acknowledgment does not substitute for these reads or the authorized next action.
 
+Retrieved requests linked to a task share its schedule when the sender is its
+writer and the recipient is its current owner. Their `followup.schedule` names
+the governing task and revision. Checkpoint that task for progress or waiting;
+do not create a second mail checkpoint just to repeat the same report. An explicit
+mail checkpoint or business deadline keeps that request independent. Replies,
+resolution and withdrawal remain explicit; closing a task does not settle mail.
+Read every listed attention occurrence with `attention show`, including stale
+ones, so its exact retrieval is recorded. Keep unchanged waiting summaries quiet;
+report a changed condition, a decision needed, or work completed.
+
 Finish with an ordinary reply/resolve/task decision when appropriate. If work is
 unfinished when yielding, record its next step and review time using
 `task checkpoint ID --version TASK_VERSION --key KEY --file PATH` or

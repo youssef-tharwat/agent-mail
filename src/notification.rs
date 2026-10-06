@@ -205,6 +205,7 @@ impl Store {
                 .iter()
                 .any(|i| i.reason == AttentionReason::StopWork && !saved.items.contains(i));
             if old.binding_version == actor.binding_version
+                && valid
                 && !all_seen
                 && !cancellation
                 && old.expires > time

@@ -7,6 +7,7 @@
 
 use crate::states::DeliveryState;
 use crate::{
+    diagnostics::{Operation, Phase},
     herdr,
     identity::Binding,
     now,
@@ -275,13 +276,13 @@ async fn wake(
         text.len() <= 480,
         "Herdr attention exceeds terminal prompt budget"
     );
-    let mut tx = store.pool().begin().await?;
-    Store::lock_actor(&mut tx, binding).await?;
+    let operation = Operation::HerdrDelivery;
+    let mut tx = store.delivery_transaction(binding, operation).await?;
     if sqlx::query_scalar!(
         "SELECT paused<>0 OR auto_prompt=0 AS 'held!: i64' FROM groups WHERE name=?",
         binding.group_name
     )
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?
         != 0
         || !Store::validate_attention_tx(&mut tx, binding, &batch).await?
@@ -289,12 +290,18 @@ async fn wake(
         tx.commit().await?;
         return Ok(DeliveryState::StateChanged);
     }
-    herdr::call(
-        socket,
-        "agent.prompt",
-        json!({"target": target.pane, "text": text}),
-    )
-    .await?;
+    store
+        .diagnostics()
+        .measure(
+            operation,
+            Phase::Transport,
+            herdr::call(
+                socket,
+                "agent.prompt",
+                json!({"target": target.pane, "text": text}),
+            ),
+        )
+        .await?;
     tx.commit().await?;
     let recorded = if let Some(nonce) = challenge.as_deref() {
         store.record_delivery_challenge(binding, nonce, time).await
@@ -411,10 +418,28 @@ fn relay_result(job: std::result::Result<Result<Vec<Value>>, JoinError>) -> Vec<
     }
 }
 
+fn verification_result(
+    job: std::result::Result<Result<crate::verification::ReconcileReport>, JoinError>,
+) -> Result<crate::verification::ReconcileReport> {
+    job.context("delivery verification task failed")?
+}
+
+fn verification_report(result: &Result<crate::verification::ReconcileReport>) -> Value {
+    match result {
+        Ok(report) => json!(report),
+        Err(error) => {
+            let error = crate::diagnostics::error_text(format!("{error:#}"));
+            eprintln!("agent-mail: delivery verification: {error}");
+            json!({"error":error})
+        }
+    }
+}
+
 /// Run one worker scan or serve continuously until interrupted.
 ///
 /// # Errors
 /// Worker locking, state I/O, clock reading, signal handling, or server shutdown fails.
+/// In one-scan mode, failure to run verification also returns an error after writing status.
 pub async fn run(store: &Store, once: bool) -> Result<()> {
     let _once_lock = if once {
         Some(WorkerLock::acquire(store.root())?)
@@ -431,6 +456,7 @@ pub async fn run(store: &Store, once: bool) -> Result<()> {
     let mut relay_jobs = JoinSet::<Result<Vec<Value>>>::new();
     let mut relay_report = Vec::new();
     let mut verification_jobs = JoinSet::new();
+    let mut verification = Value::Null;
     let mut external_jobs = JoinSet::new();
     loop {
         let time = now()?;
@@ -447,7 +473,9 @@ pub async fn run(store: &Store, once: bool) -> Result<()> {
             let state = store.clone();
             external_jobs.spawn(async move { crate::external::refresh(&state, time).await });
         }
-        while verification_jobs.try_join_next().is_some() {}
+        while let Some(job) = verification_jobs.try_join_next() {
+            verification = verification_report(&verification_result(job));
+        }
         if verification_jobs.is_empty() {
             let state = store.clone();
             verification_jobs
@@ -474,7 +502,17 @@ pub async fn run(store: &Store, once: bool) -> Result<()> {
         if let Some(job) = finished {
             relay_report = relay_result(job);
         }
-        let report = match result {
+        let mut verification_error = None;
+        if once {
+            while let Some(job) = verification_jobs.join_next().await {
+                let result = verification_result(job);
+                verification = verification_report(&result);
+                if let Err(error) = result {
+                    verification_error = Some(error);
+                }
+            }
+        }
+        let mut report = match result {
             Ok(observations) => {
                 json!({"checked_at": time, "observations": observations,"relay":relay_report,"relay_running":!relay_jobs.is_empty()})
             }
@@ -482,11 +520,14 @@ pub async fn run(store: &Store, once: bool) -> Result<()> {
                 json!({"checked_at": time, "error": format!("{error:#}"),"relay":relay_report,"relay_running":!relay_jobs.is_empty()})
             }
         };
+        report["verification"] = verification.clone();
+        report["verification_running"] = json!(!verification_jobs.is_empty());
+        report["delivery_timings"] = json!(store.diagnostics().snapshot());
         let mut bytes = serde_json::to_vec(&report)?;
         // Runtime diagnostics are bounded and replace the previous snapshot.
         if bytes.len() > 128 * 1024 {
             bytes = serde_json::to_vec(
-                &json!({"checked_at":time,"error":"status exceeded limit; inspect inboxes with status"}),
+                &json!({"checked_at":time,"error":"status exceeded limit; inspect inboxes with status","verification":verification,"verification_running":!verification_jobs.is_empty(),"delivery_timings":store.diagnostics().snapshot()}),
             )?;
         }
         let path = store.root().join("service-status.tmp");
@@ -500,8 +541,8 @@ pub async fn run(store: &Store, once: bool) -> Result<()> {
         file.write_all(&bytes)?;
         std::fs::rename(path, store.root().join("service-status.json"))?;
         if once {
-            while let Some(job) = verification_jobs.join_next().await {
-                job??;
+            if let Some(error) = verification_error {
+                return Err(error);
             }
             println!("{}", String::from_utf8(bytes)?);
             break;

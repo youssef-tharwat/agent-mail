@@ -28,7 +28,7 @@ pub async fn report(store: &Store, group: Option<&str>) -> Result<Value> {
     // Free-form global errors and relay details can mention other fleets. Only
     // the explicit operator overview includes them verbatim.
     let scan = if group.is_some() && !scan.is_null() {
-        json!({"checked_at":scan["checked_at"],"observations":scoped_rows(scan["observations"].clone(),group),"service_error":scan.get("error").is_some()})
+        json!({"checked_at":scan["checked_at"],"observations":scoped_rows(scan["observations"].clone(),group),"service_error":scan.get("error").is_some(),"verification_error":scan["verification"].get("error").is_some() || scan["verification"]["failed"].as_u64().is_some_and(|failed|failed>0)})
     } else {
         scan
     };

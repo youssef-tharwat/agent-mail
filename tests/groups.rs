@@ -90,13 +90,15 @@ async fn overlapping_names_and_large_fleets_do_not_mix_context_or_status() -> Re
     std::fs::write(
         tmp.path().join("service-status.json"),
         serde_json::to_vec(
-            &json!({"checked_at":1,"observations":[{"group":"awp","detail":"private-awp"},{"group":"recall","state":"waiting"}],"error":"private-awp","relay":[{"error":"private-awp"}]}),
+            &json!({"checked_at":1,"observations":[{"group":"awp","detail":"private-awp"},{"group":"recall","state":"waiting"}],"error":"private-awp","relay":[{"error":"private-awp"}],"verification":{"checked":1,"failed":1,"errors":["private-awp"]},"delivery_timings":[{"operation":"herdr_delivery","phase":"writer_hold","max_us":100}]}),
         )?,
     )?;
     let report = agent_mail::status::report(&store, Some("recall")).await?;
     assert_eq!(report["attention"]["work"].as_array().unwrap().len(), 1);
     assert_eq!(report["attention"]["more"], false);
     assert!(!report.to_string().contains("awp"));
+    assert_eq!(report["last_scan"]["verification_error"], true);
+    assert!(report["last_scan"].get("delivery_timings").is_none());
     assert_eq!(report["groups"].as_array().unwrap().len(), 1);
     assert!(
         agent_mail::status::report(&store, None).await?["attention"]["more"]

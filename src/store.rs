@@ -135,6 +135,7 @@ struct StoreInner {
     pool: SqlitePool,
     root: PathBuf,
     _guard: DatabaseGuard,
+    diagnostics: crate::diagnostics::Diagnostics,
 }
 
 /// Excludes migration for the lifetime of all store handles.
@@ -299,7 +300,7 @@ pub struct Pending {
 }
 
 /// Schema understood by this binary.
-pub(crate) const SCHEMA_VERSION: i64 = 24;
+pub(crate) const SCHEMA_VERSION: i64 = 25;
 
 impl Store {
     /// Open a database, optionally creating and migrating its schema.
@@ -425,6 +426,7 @@ impl Store {
                 pool,
                 root: root.to_path_buf(),
                 _guard: guard,
+                diagnostics: crate::diagnostics::Diagnostics::default(),
             }),
         })
     }
@@ -436,6 +438,30 @@ impl Store {
 
     pub(crate) fn pool(&self) -> &SqlitePool {
         &self.inner.pool
+    }
+
+    pub(crate) fn diagnostics(&self) -> &crate::diagnostics::Diagnostics {
+        &self.inner.diagnostics
+    }
+
+    pub(crate) async fn delivery_transaction(
+        &self,
+        actor: &Mailbox,
+        operation: crate::diagnostics::Operation,
+    ) -> Result<crate::diagnostics::DeliveryTransaction<'_>> {
+        use crate::diagnostics::{DeliveryTransaction, Phase};
+        let transaction = self
+            .diagnostics()
+            .measure(operation, Phase::WriterAcquire, async {
+                let mut tx = self.pool().begin().await?;
+                Self::lock_actor(&mut tx, actor).await?;
+                Ok(tx)
+            })
+            .await?;
+        Ok(DeliveryTransaction {
+            transaction,
+            timer: self.diagnostics().start(operation, Phase::WriterHold),
+        })
     }
 
     /// Close all pooled connections and consume this handle.

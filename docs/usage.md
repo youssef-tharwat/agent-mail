@@ -409,7 +409,7 @@ clears prior launch evidence; an old session cannot establish new readiness.
 ## Existing installations
 
 Upgrade the binary, then use Agent Mail normally. Commands, hooks, managed launches
-and worker startup automatically upgrade an existing store to schema 24. Missing
+and worker startup automatically upgrade an existing store to schema 25. Missing
 stores still require `agent-mail init GROUP`. Help, the skill guide and read-only
 `status --check NAME` diagnostics do not migrate state.
 
@@ -733,6 +733,40 @@ Changing the configured notifier retries failed, unconfigured, or uncertain aler
 with a new bounded operator budget. It does not reset business delivery attempts.
 `last_scan_age_seconds` exposes stale worker observations; a stopped worker relies
 on process supervision to restart before it can send anything.
+
+A retrieved request explicitly linked with `--task` shares that task's current
+follow-up schedule when its sender is the task writer and its recipient is the
+current owner. Task checkpoints, waiting conditions, blocked/review holds and
+decision escalation then govern the request too, without a second reminder stream.
+Unread requests still require delivery. Requests with explicit business deadlines,
+their own checkpoints, or different responsible parties keep independent schedules.
+Mail details expose `followup.schedule` with the governing task and revision.
+Checkpoint the task to change a shared schedule; use a mail checkpoint when that
+request needs an independent next step. Replies, resolution and withdrawal still
+settle mail explicitly. Task closure or reassignment never silently settles it.
+
+Follow-up totals count all pending sources and separately report `scheduled` and
+`shared_requests`. The detail list shows independent schedules; due/escalated
+totals count each governing schedule once. Old mail occurrences stop being current
+as soon as a retrieved request adopts its task's schedule, and invalid delivery
+reservations release immediately so they cannot hold newer attention for five minutes.
+
+The installation overview (`status --all-groups --json`) includes the last
+completed `last_scan.verification` report and `verification_running`. Failed
+checks include bounded error details; a failed worker task is reported explicitly.
+Group-scoped status exposes an installation-wide `verification_error` flag without other groups'
+error details. A later successful scan replaces the previous check report.
+
+`last_scan.delivery_timings` records runtime delivery and verification separately.
+For each transport, `writer_acquire` includes pool acquisition and waiting for the
+SQLite writer lock, `writer_hold` covers acquisition through commit, and `transport`
+measures runtime I/O inside that transaction. Counts distinguish success, failure
+and abandonment; `total_us` and `max_us` are elapsed microseconds. Abandonment
+includes cancellation and early error returns; its hold timing ends when the
+transaction is dropped, before asynchronous rollback finishes. These bounded,
+installation-wide counters are shared by cloned store handles and reset on worker
+restart. They add no database writes and do not measure agent ingestion or task
+completion. Use them to establish contention before changing transaction guards.
 
 Status totals cover all active sources, even when its detail list is truncated.
 Agent checks filter before pagination. Recovery responses stay within 4 KiB and

@@ -7,6 +7,7 @@
 
 use crate::states::DeliveryState;
 use crate::{
+    diagnostics::{Operation, Phase},
     identity::Binding,
     service::Observation,
     store::{Mailbox, Store},
@@ -452,9 +453,9 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
         text.push_str(&crate::verification::challenge(actor, nonce));
     }
     // Hold the binding lock during the bounded send: replacement/detachment cannot race it.
-    let mut tx = store.pool().begin().await?;
-    Store::lock_actor(&mut tx, actor).await?;
-    let still_attached = sqlx::query!("SELECT recipient FROM runtime_wakes WHERE recipient=? AND binding_version=? AND socket=? AND thread=? AND EXISTS(SELECT 1 FROM groups WHERE name=? AND paused=0) AND EXISTS(SELECT 1 FROM attention_dispatch WHERE recipient=? AND token=?)",actor.id,actor.binding_version,endpoint.socket,endpoint.thread,actor.group_name,actor.id,batch.token).fetch_optional(&mut *tx).await?.is_some();
+    let operation = Operation::NativeDelivery;
+    let mut tx = store.delivery_transaction(actor, operation).await?;
+    let still_attached = sqlx::query!("SELECT recipient FROM runtime_wakes WHERE recipient=? AND binding_version=? AND socket=? AND thread=? AND EXISTS(SELECT 1 FROM groups WHERE name=? AND paused=0) AND EXISTS(SELECT 1 FROM attention_dispatch WHERE recipient=? AND token=?)",actor.id,actor.binding_version,endpoint.socket,endpoint.thread,actor.group_name,actor.id,batch.token).fetch_optional(&mut **tx).await?.is_some();
     ensure!(still_attached, "Runtime endpoint changed before delivery");
     if !Store::validate_attention_tx(&mut tx, actor, &batch).await? {
         tx.commit().await?;
@@ -463,7 +464,14 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
     if let Peer::ClaudeInbox { socket, endpoint } = &peer {
         crate::claude_inbox::verify(store, socket, endpoint)?;
     }
-    peer.send(thread, text, active, message_id).await?;
+    store
+        .diagnostics()
+        .measure(
+            operation,
+            Phase::Transport,
+            peer.send(thread, text, active, message_id),
+        )
+        .await?;
     if let Some(nonce) = challenge.as_deref() {
         sqlx::query!(
             "UPDATE delivery_probes SET transport_accepted_at=COALESCE(transport_accepted_at,?),healthy_at=?,failed=0 WHERE recipient=? AND binding_version=? AND nonce=?",
@@ -473,7 +481,7 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
             actor.binding_version,
             nonce
         )
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
     if inbox {
@@ -485,7 +493,7 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
         latest,
         actor.id
     )
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     // Queue acceptance is not ingestion. Keep the reservation and bounded retry
     // state until explicit batch acknowledgement or record retrieval.
@@ -531,8 +539,8 @@ pub(crate) async fn send_verification(
     if !store.reserve_probe(actor, nonce, time).await? {
         return Ok(());
     }
-    let mut tx = store.pool().begin().await?;
-    Store::lock_actor(&mut tx, actor).await?;
+    let operation = Operation::NativeVerification;
+    let mut tx = store.delivery_transaction(actor, operation).await?;
     ensure!(
         Store::probe_current(&mut tx, actor, nonce, time).await?,
         "verification connection changed"
@@ -540,14 +548,20 @@ pub(crate) async fn send_verification(
     if let Peer::ClaudeInbox { socket, endpoint } = &peer {
         crate::claude_inbox::verify(store, socket, endpoint)?;
     }
-    peer.send(
-        thread,
-        crate::verification::challenge(actor, nonce),
-        false,
-        nonce.into(),
-    )
-    .await?;
-    sqlx::query!("UPDATE delivery_probes SET transport_accepted_at=COALESCE(transport_accepted_at,?),healthy_at=?,failed=0 WHERE recipient=? AND binding_version=? AND nonce=?",time,time,actor.id,actor.binding_version,nonce).execute(&mut *tx).await?;
+    store
+        .diagnostics()
+        .measure(
+            operation,
+            Phase::Transport,
+            peer.send(
+                thread,
+                crate::verification::challenge(actor, nonce),
+                false,
+                nonce.into(),
+            ),
+        )
+        .await?;
+    sqlx::query!("UPDATE delivery_probes SET transport_accepted_at=COALESCE(transport_accepted_at,?),healthy_at=?,failed=0 WHERE recipient=? AND binding_version=? AND nonce=?",time,time,actor.id,actor.binding_version,nonce).execute(&mut **tx).await?;
     tx.commit().await?;
     Ok(())
 }

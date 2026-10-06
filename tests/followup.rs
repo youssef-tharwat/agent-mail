@@ -16,6 +16,447 @@ struct Fixture {
     owner: Mailbox,
     time: i64,
 }
+
+fn task_request(key: &str, task: &str, recipient: &str) -> Publish {
+    Publish {
+        intent: agent_mail::states::MessageIntent::Request,
+        recipients: vec![recipient.into()],
+        key: key.into(),
+        summary: "Regenerate the SDK".into(),
+        body: "Continue the explicitly linked assignment".into(),
+        due_after: None,
+        reply_to: None,
+        work_id: Some(task.into()),
+    }
+}
+
+#[tokio::test]
+async fn linked_requests_share_blocked_task_schedule_without_settling_mail() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.task("sdk").await?;
+    let request = f
+        .store
+        .publish(
+            &f.writer,
+            task_request("sdk-request", "sdk", "owner"),
+            f.time,
+        )
+        .await?;
+    f.store.message(&f.owner, request).await?;
+    f.store
+        .update_work(
+            &f.writer,
+            "sdk",
+            WorkUpdate {
+                version: 1,
+                reason: "Waiting for operator promotion".into(),
+                patch: WorkPatch {
+                    state: Some(TaskState::Blocked),
+                    ..Default::default()
+                },
+                resolve_message: None,
+            },
+            f.time + 2,
+        )
+        .await?;
+    f.store.work_show(&f.owner, "sdk").await?;
+    followup::reconcile(&f.store, f.time + 63).await?;
+    assert!(
+        f.events(&f.owner).await?.is_empty(),
+        "the linked request must not nudge the blocked owner"
+    );
+    let attention = f.store.attention_list(&f.writer, 0).await?;
+    assert_eq!(attention["items"].as_array().unwrap().len(), 1);
+    assert_eq!(attention["items"][0]["task"], "sdk");
+    assert!(attention["items"][0]["message"].is_null());
+    let details = f
+        .store
+        .source_followup(&f.owner, None, Some(request))
+        .await?;
+    assert_eq!(details["schedule"]["kind"], "task");
+    assert_eq!(details["schedule"]["id"], "sdk");
+    assert_eq!(details["schedule"]["version"], 2);
+    assert_eq!(
+        f.store.message(&f.owner, request).await?.state,
+        agent_mail::states::MessageState::Pending
+    );
+    let status = f.store.followup_status(Some("g"), f.time + 63).await?;
+    assert_eq!(status["totals"]["pending"], 2);
+    assert_eq!(status["totals"]["scheduled"], 1);
+    assert_eq!(status["totals"]["shared_requests"], 1);
+    let reopened = Store::open(f.temp.path(), false).await?;
+    followup::reconcile(&reopened, f.time + 300).await?;
+    assert_eq!(
+        f.events(&f.writer).await?.len(),
+        1,
+        "restart must not add a mail escalation beside the task escalation"
+    );
+    assert!(f.events(&f.owner).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn task_checkpoint_controls_linked_request_deadline_and_resumption() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.task("dependency").await?;
+    f.task("sdk").await?;
+    let request = f
+        .store
+        .publish(
+            &f.writer,
+            task_request("sdk-request", "sdk", "owner"),
+            f.time,
+        )
+        .await?;
+    f.store.message(&f.owner, request).await?;
+    f.store.work_show(&f.owner, "sdk").await?;
+    let mut report = f.checkpoint();
+    report.waiting = Some(WaitFor::Task {
+        id: "dependency".into(),
+        states: vec![TaskState::Accepted],
+    });
+    f.store
+        .checkpoint(
+            &f.owner,
+            Source::Task {
+                id: "sdk".into(),
+                version: 1,
+            },
+            "wait",
+            report,
+            f.time + 1,
+        )
+        .await?;
+    // The unrelated dependency has its own hard boundary; the linked request's
+    // earlier mail reminder must not become a second deadline.
+    assert_eq!(
+        followup::next_deadline(&f.store, f.time + 1).await?,
+        Some(f.time + 90)
+    );
+    f.store
+        .update_work(
+            &f.writer,
+            "dependency",
+            WorkUpdate {
+                version: 1,
+                reason: "Dependency accepted".into(),
+                patch: WorkPatch {
+                    state: Some(TaskState::Accepted),
+                    ..Default::default()
+                },
+                resolve_message: None,
+            },
+            f.time + 2,
+        )
+        .await?;
+    followup::reconcile(&f.store, f.time + 3).await?;
+    let occurrences = f.store.attention_list(&f.owner, 0).await?;
+    assert_eq!(occurrences["items"].as_array().unwrap().len(), 1);
+    assert_eq!(occurrences["items"][0]["task"], "sdk");
+    assert_eq!(occurrences["items"][0]["reason"], "dependency_ready");
+    assert!(occurrences["items"][0]["message"].is_null());
+    assert_eq!(
+        f.store.message(&f.owner, request).await?.state,
+        agent_mail::states::MessageState::Pending
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn linked_request_exceptions_remain_independently_actionable() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.task("sdk").await?;
+    f.store.register("g", "reviewer", false).await?;
+    f.store.register("g", "other-owner", false).await?;
+    let reviewer = f.store.mailbox("g", "reviewer").await?;
+    let other = f.store.mailbox("g", "other-owner").await?;
+    let shared = f
+        .store
+        .publish(&f.writer, task_request("shared", "sdk", "owner"), f.time)
+        .await?;
+    f.store.message(&f.owner, shared).await?;
+    let unread = f
+        .store
+        .publish(&f.writer, task_request("unread", "sdk", "owner"), f.time)
+        .await?;
+    let unrelated_sender = f
+        .store
+        .publish(&reviewer, task_request("question", "sdk", "owner"), f.time)
+        .await?;
+    f.store.message(&f.owner, unrelated_sender).await?;
+    let unrelated_recipient = f
+        .store
+        .publish(
+            &f.writer,
+            task_request("other", "sdk", "other-owner"),
+            f.time,
+        )
+        .await?;
+    f.store.message(&other, unrelated_recipient).await?;
+    let mut urgent_request = task_request("urgent", "sdk", "owner");
+    urgent_request.due_after = Some(20);
+    let urgent = f.store.publish(&f.writer, urgent_request, f.time).await?;
+    f.store.message(&f.owner, urgent).await?;
+    let own_checkpoint = f
+        .store
+        .publish(&f.writer, task_request("own-plan", "sdk", "owner"), f.time)
+        .await?;
+    f.store.message(&f.owner, own_checkpoint).await?;
+    f.store
+        .checkpoint(
+            &f.owner,
+            Source::Mail { id: own_checkpoint },
+            "independent",
+            f.checkpoint(),
+            f.time + 1,
+        )
+        .await?;
+    for (actor, id) in [
+        (&f.owner, unread),
+        (&f.owner, unrelated_sender),
+        (&other, unrelated_recipient),
+        (&f.owner, urgent),
+        (&f.owner, own_checkpoint),
+    ] {
+        assert_eq!(
+            f.store.source_followup(actor, None, Some(id)).await?["schedule"]["kind"],
+            "source"
+        );
+    }
+    assert_eq!(
+        f.store
+            .source_followup(&f.owner, None, Some(shared))
+            .await?["schedule"]["kind"],
+        "task"
+    );
+    followup::reconcile(&f.store, f.time + 61).await?;
+    let reminders = f.store.attention_list(&f.owner, 0).await?;
+    assert!(
+        reminders["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["message"] == urgent)
+    );
+    assert!(
+        !reminders["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["message"] == shared || o["message"] == own_checkpoint)
+    );
+    f.store.message(&f.owner, unread).await?;
+    assert_eq!(
+        f.store
+            .source_followup(&f.owner, None, Some(unread))
+            .await?["schedule"]["kind"],
+        "task"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sharing_a_task_schedule_requires_retrieval_by_the_current_binding() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.task("sdk").await?;
+    let request = f
+        .store
+        .publish(
+            &f.writer,
+            task_request("sdk-request", "sdk", "owner"),
+            f.time,
+        )
+        .await?;
+    f.store.message(&f.owner, request).await?;
+    assert_eq!(
+        f.store
+            .source_followup(&f.owner, None, Some(request))
+            .await?["schedule"]["kind"],
+        "task"
+    );
+    f.store.register("g", "owner", true).await?;
+    let replacement = f.store.mailbox("g", "owner").await?;
+    assert!(replacement.binding_version > f.owner.binding_version);
+    assert!(
+        f.store
+            .source_followup(&f.owner, None, Some(request))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        f.store
+            .source_followup(&replacement, None, Some(request))
+            .await?["schedule"]["kind"],
+        "source"
+    );
+    f.store.message(&replacement, request).await?;
+    assert_eq!(
+        f.store
+            .source_followup(&replacement, None, Some(request))
+            .await?["schedule"]["kind"],
+        "task"
+    );
+    assert_eq!(
+        f.store.message(&replacement, request).await?.state,
+        agent_mail::states::MessageState::Pending
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn task_reassignment_and_closure_never_hide_or_settle_old_requests() -> Result<()> {
+    for terminal in [false, true] {
+        let f = Fixture::new().await?;
+        f.task("sdk").await?;
+        let request = f
+            .store
+            .publish(
+                &f.writer,
+                task_request("sdk-request", "sdk", "owner"),
+                f.time,
+            )
+            .await?;
+        f.store.message(&f.owner, request).await?;
+        assert_eq!(
+            f.store
+                .source_followup(&f.owner, None, Some(request))
+                .await?["schedule"]["kind"],
+            "task"
+        );
+        let patch = if terminal {
+            WorkPatch {
+                state: Some(TaskState::Cancelled),
+                ..Default::default()
+            }
+        } else {
+            f.store.register("g", "replacement", false).await?;
+            WorkPatch {
+                owner: Some("replacement".into()),
+                ..Default::default()
+            }
+        };
+        f.store
+            .update_work(
+                &f.writer,
+                "sdk",
+                WorkUpdate {
+                    version: 1,
+                    reason: "Assignment changed".into(),
+                    patch,
+                    resolve_message: None,
+                },
+                f.time + 2,
+            )
+            .await?;
+        assert_eq!(
+            f.store
+                .source_followup(&f.owner, None, Some(request))
+                .await?["schedule"]["kind"],
+            "source"
+        );
+        followup::reconcile(&f.store, f.time + 61).await?;
+        let attention = f.store.attention_list(&f.owner, 0).await?;
+        assert_eq!(attention["items"][0]["message"], request);
+        assert_eq!(
+            f.store.message(&f.owner, request).await?.state,
+            agent_mail::states::MessageState::Pending
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn adopting_task_schedule_invalidates_old_mail_attention_and_releases_lease() -> Result<()> {
+    let f = Fixture::new().await?;
+    f.task("sdk").await?;
+    f.store.work_show(&f.owner, "sdk").await?;
+    let request = f
+        .store
+        .publish(
+            &f.writer,
+            task_request("sdk-request", "sdk", "owner"),
+            f.time,
+        )
+        .await?;
+    // An unread request retains its own availability escalation.
+    followup::reconcile(&f.store, f.time + 240).await?;
+    let occurrences = f.store.attention_list(&f.writer, 0).await?;
+    for occurrence in occurrences["items"].as_array().unwrap() {
+        if !occurrence["task"].is_null() {
+            f.store
+                .attention_show(&f.writer, occurrence["id"].as_i64().unwrap())
+                .await?;
+        }
+    }
+    let old_occurrence = occurrences["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["message"] == request)
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let old = f
+        .store
+        .claim_attention(
+            &f.writer,
+            agent_mail::names::DeliveryConsumer::Native,
+            f.time + 240,
+        )
+        .await?
+        .unwrap();
+    assert_eq!(old.attention.items[0].subject, old_occurrence.to_string());
+    f.store.message(&f.owner, request).await?;
+    assert!(
+        f.store
+            .attention_snapshot(&f.writer)
+            .await?
+            .items
+            .is_empty()
+    );
+    f.store.register("g", "reviewer", false).await?;
+    let reviewer = f.store.mailbox("g", "reviewer").await?;
+    let fresh = f
+        .store
+        .publish(
+            &reviewer,
+            Publish {
+                work_id: None,
+                ..task_request("fresh", "sdk", "writer")
+            },
+            f.time + 241,
+        )
+        .await?;
+    let batch = f
+        .store
+        .claim_attention(
+            &f.writer,
+            agent_mail::names::DeliveryConsumer::Native,
+            f.time + 241,
+        )
+        .await?
+        .expect("an invalid mail lease must release before its five-minute expiry");
+    assert_eq!(batch.attention.items[0].subject, fresh.to_string());
+    assert_eq!(
+        batch.attention.items[0].kind,
+        agent_mail::states::EventKind::MailPending
+    );
+    assert_ne!(batch.token, old.token);
+    assert!(
+        f.store
+            .acknowledge_attention(&f.writer, &old.token)
+            .await
+            .is_err()
+    );
+    let stale = f.store.attention_show(&f.writer, old_occurrence).await?;
+    assert_eq!(stale["current"], false);
+    assert_eq!(stale["followup"]["schedule"]["kind"], "task");
+    assert_eq!(
+        f.store.message(&f.owner, request).await?.state,
+        agent_mail::states::MessageState::Pending
+    );
+    Ok(())
+}
 impl Fixture {
     async fn hook(&self, event: &str, time: i64) -> Result<Value> {
         self.store

@@ -48,6 +48,7 @@ macro_rules! name_type {
     };
 }
 name_type!(GroupName, "Validated coordination group name.");
+name_type!(TaskId, "Validated task identifier within a group.");
 name_type!(
     ParticipantName,
     "Validated participant name within a group."
