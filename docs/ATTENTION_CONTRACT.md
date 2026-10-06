@@ -56,6 +56,13 @@ send key is a conflict, not an opportunity to reinterpret the old message.
 
 ## Outstanding reasons for attention
 
+Every new message also has [typed context](MAIL_CONTEXT.md): a task and observed
+version, or an explicit conversation. Replies inherit the exact parent context.
+Context does not itself create a response obligation or supply task authority.
+Schema 26 preserves historical canonical records and recovers conversation roots;
+new unscoped sends and old wire message variants are rejected. Upgrade all relay
+hops and synchronize capabilities before new contextual mail is sent.
+
 The existing task and request records remain authoritative. Attention is their
 recipient-scoped projection, evaluated with current observations, persisted
 waiting conditions, deadlines, and delivery policy.

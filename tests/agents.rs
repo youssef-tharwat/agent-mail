@@ -17,8 +17,7 @@ fn request(to: &str, key: &str) -> Publish {
         summary: "Review".into(),
         body: "Evidence".into(),
         due_after: None,
-        reply_to: None,
-        work_id: None,
+        context: agent_mail::mail_context::ContextSource::NewConversation,
     }
 }
 fn task(id: &str, owner: &str) -> WorkDraft {

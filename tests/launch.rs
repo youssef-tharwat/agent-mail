@@ -305,6 +305,7 @@ fn committed_mutations_report_unavailable_recipients_without_duplicate_writes() 
         "Review needed",
         "--key",
         "delivery-result",
+        "--new-conversation",
     ];
     let sent = d.call(&args)?;
     assert_eq!(sent["persisted"], true);

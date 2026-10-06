@@ -609,8 +609,7 @@ async fn paginated_targets_and_record_message_inspection_preserve_visibility() -
                 summary: "Review".into(),
                 body: "Inspect evidence".into(),
                 due_after: None,
-                reply_to: None,
-                work_id: None,
+                context: agent_mail::mail_context::ContextSource::NewConversation,
             },
             11,
         )

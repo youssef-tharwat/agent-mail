@@ -193,7 +193,13 @@ enum Command {
         summary: String,
         body_file: Option<PathBuf>,
         due_after: Option<i64>,
-        work_id: Option<String>,
+        context: agent_mail::mail_context::ContextSource,
+    },
+    /// Read a bounded page of private conversation metadata.
+    Conversation {
+        group: String,
+        id: agent_mail::mail_context::ConversationId,
+        after: i64,
     },
     /// List pending summaries, or fetch a single message body.
     Inbox {
@@ -698,7 +704,7 @@ async fn run(cli: RunArgs) -> Result<()> {
             summary,
             body_file,
             due_after,
-            work_id,
+            context,
         } => {
             let actor = store.authenticate(&group, cli.session.as_ref()).await?;
             let body = body_file
@@ -716,13 +722,16 @@ async fn run(cli: RunArgs) -> Result<()> {
                         summary,
                         body,
                         due_after,
-                        reply_to: None,
-                        work_id,
+                        context,
                     },
                     now()?,
                 )
                 .await?;
-            json!({"id":id,"persisted":true,"delivery":store.message_delivery_outcome(&group,id).await})
+            json!({"id":id,"context":store.message_context(&actor,id).await?,"persisted":true,"delivery":store.message_delivery_outcome(&group,id).await})
+        }
+        Command::Conversation { group, id, after } => {
+            let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+            serde_json::to_value(store.conversation(&actor, id, after).await?)?
         }
         Command::Checkpoint {
             group,

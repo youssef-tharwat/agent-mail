@@ -10,6 +10,7 @@ use crate::states::{AgentState, Availability, MessageState};
 use crate::{
     BODY_LIMIT, SUMMARY_LIMIT, bounded,
     identity::{Binding, Participant},
+    mail_context::{ContextSource, MessageContext, ParentMessage},
     name,
     relay::{self, Event},
 };
@@ -169,6 +170,7 @@ impl Drop for DatabaseGuard {
 
 /// Message content, recipients, and associations validated when publishing.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Publish {
     /// Explicit effect; omission retains legacy request behavior.
     #[serde(
@@ -186,10 +188,8 @@ pub struct Publish {
     pub body: String,
     /// Number of seconds after publication until the message becomes overdue.
     pub due_after: Option<i64>,
-    /// Optional identifier of the message being answered.
-    pub reply_to: Option<i64>,
-    /// Optional work identifier associated with this message.
-    pub work_id: Option<String>,
+    /// Required subject, or a parent from which to inherit that subject.
+    pub context: ContextSource,
 }
 
 impl Publish {
@@ -203,7 +203,8 @@ impl Publish {
             "only requests may have a business deadline"
         );
         ensure!(
-            self.intent != crate::states::MessageIntent::Response || self.reply_to.is_some(),
+            self.intent != crate::states::MessageIntent::Response
+                || self.context.reply_to().is_some(),
             "a response must reference its request"
         );
         self.recipients.sort();
@@ -225,9 +226,6 @@ impl Publish {
                 .is_none_or(|seconds| (1..=31_536_000).contains(&seconds)),
             "due-after must be 1–31536000 seconds"
         );
-        if let Some(work_id) = &self.work_id {
-            name(work_id)?;
-        }
         Ok(())
     }
 }
@@ -249,6 +247,12 @@ pub struct InboxItem {
     pub due: Option<i64>,
     /// Optional work identifier associated with this message.
     pub work_id: Option<String>,
+    /// Durable task revision or conversation this message concerns.
+    pub context: MessageContext,
+    /// Parent message whose context this message inherited.
+    pub reply_to: Option<i64>,
+    /// Portable parent reference, also retained when the parent is not stored locally.
+    pub parent: Option<ParentMessage>,
 }
 
 /// Message content and the recipient’s current delivery disposition.
@@ -274,6 +278,12 @@ pub struct Message {
     pub reply_id: Option<i64>,
     /// Optional work identifier associated with this message.
     pub work_id: Option<String>,
+    /// Durable task revision or conversation this message concerns.
+    pub context: MessageContext,
+    /// Parent message whose context this message inherited.
+    pub reply_to: Option<i64>,
+    /// Portable parent reference, also retained when the parent is not stored locally.
+    pub parent: Option<ParentMessage>,
 }
 
 /// Aggregate pending obligations and reminder state for one mailbox.
@@ -300,7 +310,7 @@ pub struct Pending {
 }
 
 /// Schema understood by this binary.
-pub(crate) const SCHEMA_VERSION: i64 = 25;
+pub(crate) const SCHEMA_VERSION: i64 = 26;
 
 impl Store {
     /// Open a database, optionally creating and migrating its schema.
@@ -768,7 +778,8 @@ impl Store {
             return Ok(existing.id);
         }
         if publish.intent == crate::states::MessageIntent::Response {
-            let parent = sqlx::query!("SELECT m.sender,b.name FROM messages m JOIN mailboxes b ON b.id=m.sender JOIN deliveries d ON d.message=m.id WHERE m.id=? AND d.recipient=? AND m.intent='request'",publish.reply_to,actor.id)
+            let reply_to = publish.context.reply_to();
+            let parent = sqlx::query!("SELECT m.sender,b.name FROM messages m JOIN mailboxes b ON b.id=m.sender JOIN deliveries d ON d.message=m.id WHERE m.id=? AND d.recipient=? AND m.intent='request'",reply_to,actor.id)
                 .fetch_optional(&mut **tx).await?.context("response requires a request addressed to this agent")?;
             ensure!(
                 publish.recipients == [parent.name],
@@ -776,27 +787,8 @@ impl Store {
             );
         }
         let mut recipient_ids = Vec::new();
-        if let Some(work_id) = &publish.work_id {
-            ensure!(
-                sqlx::query!(
-                    "SELECT id FROM work_items WHERE group_name=? AND id=?",
-                    actor.group_name,
-                    work_id
-                )
-                .fetch_optional(&mut **tx)
-                .await?
-                .is_some()
-                    || sqlx::query!(
-                        "SELECT work_id FROM work_snapshots WHERE group_name=? AND work_id=?",
-                        actor.group_name,
-                        work_id
-                    )
-                    .fetch_optional(&mut **tx)
-                    .await?
-                    .is_some(),
-                "work item is not in this group"
-            );
-        }
+        let subject = crate::mail_context::resolve_tx(tx, actor, &publish.context).await?;
+        let context = serde_json::to_string(&subject.context)?;
         for recipient in &publish.recipients {
             let record = sqlx::query!(
                 "SELECT id FROM mailboxes WHERE group_name=? AND name=?",
@@ -815,8 +807,8 @@ impl Store {
         let legacy_due = due.unwrap_or(now);
         let global_id = uuid::Uuid::new_v4().to_string();
         let intent = publish.intent.as_str();
-        let result = sqlx::query!("INSERT INTO messages(sender,dedup_key,canonical,summary,body,created,due,reply_to,work_id,global_id,deadline,intent) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            actor.id, publish.key, canonical, publish.summary, publish.body, now, legacy_due, publish.reply_to, publish.work_id, global_id, due,intent).execute(&mut **tx).await?;
+        let result = sqlx::query!("INSERT INTO messages(sender,dedup_key,canonical,summary,body,created,due,reply_to,work_id,global_id,deadline,intent,context,parent_global_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            actor.id, publish.key, canonical, publish.summary, publish.body, now, legacy_due, subject.reply_to, subject.work_id, global_id, due,intent,context,subject.parent_global_id).execute(&mut **tx).await?;
         let id = result.last_insert_rowid();
         for recipient in recipient_ids {
             sqlx::query!(
@@ -852,7 +844,7 @@ impl Store {
         let mut tx = self.pool().begin().await?;
         Self::check_actor(&mut tx, actor).await?;
         let items = sqlx::query_as!(InboxItem,
-            "SELECT m.intent AS 'intent: crate::states::MessageIntent',m.id, b.name AS sender, m.summary, m.created, m.deadline AS due, m.work_id FROM deliveries d JOIN messages m ON m.id=d.message JOIN mailboxes b ON b.id=m.sender WHERE d.recipient=? AND d.state='pending' AND m.id>? AND (m.intent='request' OR NOT EXISTS(SELECT 1 FROM message_observations o WHERE o.message=m.id AND o.recipient=d.recipient AND o.binding_version=?)) ORDER BY m.id LIMIT 6",
+            "SELECT m.intent AS 'intent: crate::states::MessageIntent',m.id, b.name AS sender, m.summary, m.created, m.deadline AS due, m.work_id,m.context AS 'context!: MessageContext',m.reply_to,CASE WHEN m.parent_global_id IS NOT NULL THEN json_object('global_id',m.parent_global_id,'local_id',m.reply_to) END AS 'parent?: ParentMessage' FROM deliveries d JOIN messages m ON m.id=d.message JOIN mailboxes b ON b.id=m.sender WHERE d.recipient=? AND d.state='pending' AND m.id>? AND (m.intent='request' OR NOT EXISTS(SELECT 1 FROM message_observations o WHERE o.message=m.id AND o.recipient=d.recipient AND o.binding_version=?)) ORDER BY m.id LIMIT 6",
             actor.id, after,actor.binding_version).fetch_all(&mut *tx).await?;
         tx.commit().await?;
         Ok(items)
@@ -866,7 +858,7 @@ impl Store {
         let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
         let item = sqlx::query_as!(Message,
-            "SELECT m.intent AS 'intent: crate::states::MessageIntent',m.id,b.name AS sender,m.summary,m.body,m.created,m.deadline AS due,d.state AS 'state: MessageState',d.reply_id,m.work_id FROM messages m JOIN deliveries d ON d.message=m.id JOIN mailboxes b ON b.id=m.sender WHERE m.id=? AND d.recipient=?",
+            "SELECT m.intent AS 'intent: crate::states::MessageIntent',m.id,b.name AS sender,m.summary,m.body,m.created,m.deadline AS due,d.state AS 'state: MessageState',d.reply_id,m.work_id,m.context AS 'context!: MessageContext',m.reply_to,CASE WHEN m.parent_global_id IS NOT NULL THEN json_object('global_id',m.parent_global_id,'local_id',m.reply_to) END AS 'parent?: ParentMessage' FROM messages m JOIN deliveries d ON d.message=m.id JOIN mailboxes b ON b.id=m.sender WHERE m.id=? AND d.recipient=?",
             id, actor.id).fetch_optional(&mut *tx).await?.context("message is not in this inbox")?;
         Self::retrieve_tx(
             &mut tx,
@@ -944,7 +936,7 @@ impl Store {
         );
         let reply_id = if let Some((key, body)) = reply {
             let sender = sqlx::query!(
-                "SELECT b.name, m.work_id FROM messages m JOIN mailboxes b ON b.id=m.sender WHERE m.id=?",
+                "SELECT b.name FROM messages m JOIN mailboxes b ON b.id=m.sender WHERE m.id=?",
                 id
             )
             .fetch_one(&mut **tx)
@@ -960,8 +952,9 @@ impl Store {
                 summary,
                 body,
                 due_after: None,
-                reply_to: Some(id),
-                work_id: sender.work_id,
+                context: ContextSource::Reply {
+                    message: id.try_into()?,
+                },
             };
             Some(Self::publish_tx(tx, actor, &mut p, now).await?)
         } else {

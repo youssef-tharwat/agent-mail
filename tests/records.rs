@@ -146,8 +146,7 @@ async fn successor_recovers_pinned_contract_without_mailbox_impersonation() -> R
                 summary: "Private".into(),
                 body: "Private reasoning".into(),
                 due_after: None,
-                reply_to: None,
-                work_id: None,
+                context: agent_mail::mail_context::ContextSource::NewConversation,
             },
             now,
         )

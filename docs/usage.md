@@ -98,7 +98,7 @@ Inside the worker’s session:
 ```sh
 agent-mail context
 agent-mail mail send coordinator "Reviewed abc123; evidence: reviews/api.md" \
-  --task api-review --key api-review-result-v1
+  --task api-review --version 1 --key api-review-result-v1
 ```
 
 The task's writer decides whether the result is acceptable. Creating or updating
@@ -127,11 +127,19 @@ a runtime. Repeating init preserves a previously configured group connection.
 ```sh
 agent-mail mail list
 agent-mail mail show 12
-agent-mail mail send reviewer "Review def456" --key review-def456 --task api-review
+agent-mail mail send reviewer "Review def456" --key review-def456 --task api-review --version 1
 agent-mail mail reply 12 "Reviewed; see reviews/api.md"
 agent-mail mail resolve 13 --note "Handled by the linked task decision"
 agent-mail mail withdraw 14
 ```
+
+Every send requires exactly one context: `--task ID --version VERSION`,
+`--new-conversation`, `--conversation UUID`, or `--reply-to MESSAGE_ID`.
+Use the version from the task you read; it records your observation without
+changing the task. Replies inherit it even if the task has since changed.
+New conversations return their UUID in the send result. `mail conversation UUID`
+pages only your authored and addressed summaries; it does not read bodies or
+receipt attention. [Context semantics and examples](MAIL_CONTEXT.md).
 
 - `send` creates a new logical request. Reuse its key for identical retries; use
   a new key for a changed or genuinely new request. Add recipients with `--to`.
@@ -409,7 +417,7 @@ clears prior launch evidence; an old session cannot establish new readiness.
 ## Existing installations
 
 Upgrade the binary, then use Agent Mail normally. Commands, hooks, managed launches
-and worker startup automatically upgrade an existing store to schema 25. Missing
+and worker startup automatically upgrade an existing store to schema 26. Missing
 stores still require `agent-mail init GROUP`. Help, the skill guide and read-only
 `status --check NAME` diagnostics do not migrate state.
 

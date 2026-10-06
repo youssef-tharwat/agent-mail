@@ -69,8 +69,7 @@ async fn overlapping_names_and_large_fleets_do_not_mix_context_or_status() -> Re
                 summary: "private-awp".into(),
                 body: "private-awp".into(),
                 due_after: None,
-                reply_to: None,
-                work_id: None,
+                context: agent_mail::mail_context::ContextSource::NewConversation,
             },
             1,
         )

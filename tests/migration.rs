@@ -9,6 +9,243 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::fs;
 
 #[tokio::test]
+async fn version_twenty_five_recovers_threads_and_queued_context_without_rewriting_mail()
+-> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("state");
+    let migrations = temp.path().join("old-migrations");
+    fs::create_dir_all(&root)?;
+    fs::create_dir_all(&migrations)?;
+    for entry in fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let name = filename.to_str().unwrap();
+        if name.ends_with(".sql") && name[..4].parse::<u32>()? <= 25 {
+            fs::copy(entry.path(), migrations.join(name))?;
+        }
+    }
+    let pool = SqlitePoolOptions::new()
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(root.join("mail.db"))
+                .create_if_missing(true),
+        )
+        .await?;
+    sqlx::migrate::Migrator::new(migrations.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+    sqlx::raw_sql(r#"
+        INSERT INTO node VALUES ('00000000-0000-4000-8000-000000000001');
+        INSERT INTO groups(name,socket,home_machine) VALUES ('g','','00000000-0000-4000-8000-000000000001');
+        INSERT INTO mailboxes(id,group_name,name,binding) VALUES
+          (1,'g','writer','{"runtime":"standalone","session":"00000000-0000-4000-8000-000000000002"}'),
+          (2,'g','owner','{"runtime":"standalone","session":"00000000-0000-4000-8000-000000000003"}');
+        INSERT INTO work_items(group_name,id,writer,owner,scope,state,next_action,version,updated)
+          VALUES ('g','t','writer','owner','Review','blocked','Await approval',7,99);
+        INSERT INTO messages(id,sender,dedup_key,canonical,summary,body,created,due,work_id,global_id,intent)
+          VALUES (1,1,'request','original-request','Review','private original',100,100,'t','00000000-0000-4000-8000-000000000011','request');
+        INSERT INTO deliveries(message,recipient) VALUES (1,2);
+        INSERT INTO messages(id,sender,dedup_key,canonical,summary,body,created,due,work_id,global_id,intent,reply_to)
+          VALUES (2,2,'response','original-response','Answer','private answer',101,101,'t','00000000-0000-4000-8000-000000000012','response',1);
+        INSERT INTO deliveries(message,recipient) VALUES (2,1);
+        INSERT INTO event_receipts(recipient,binding_version,event)
+          SELECT 2,1,id FROM coordination_events WHERE recipient=2;
+        INSERT INTO attention_attempts(recipient,binding_version,event,attempts,next_attempt)
+          SELECT 1,1,id,2,500 FROM coordination_events WHERE recipient=1;
+        UPDATE followups SET retrieved_at=110,retrieved_binding=1 WHERE message=1;
+        INSERT INTO recovery_emissions(recipient,binding_version,client_session) VALUES (2,1,'client');
+        INSERT INTO outbox(event_id,dest_machine,payload,created) VALUES (
+          '00000000-0000-4000-8000-000000000021','00000000-0000-4000-8000-000000000004',
+          json_object('event_id','00000000-0000-4000-8000-000000000021',
+           'origin','00000000-0000-4000-8000-000000000001',
+           'destination','00000000-0000-4000-8000-000000000004',
+           'event',json_object('kind','message','data',json_object(
+            'id','00000000-0000-4000-8000-000000000011','group','g','sender','writer','recipient','owner',
+            'key','request','summary','Review','body','private original','created',100,'due',NULL,
+            'work_id','t','reply_to',NULL))),100);
+        INSERT INTO outbox(event_id,dest_machine,payload,created) VALUES (
+          '00000000-0000-4000-8000-000000000022','00000000-0000-4000-8000-000000000004',
+          json_object('event_id','00000000-0000-4000-8000-000000000022',
+           'origin','00000000-0000-4000-8000-000000000001',
+           'destination','00000000-0000-4000-8000-000000000004',
+           'event',json_object('kind','typed_message','data',json_object('intent','notice','message',json_object(
+            'id','00000000-0000-4000-8000-000000000013','group','g','sender','owner','recipient','writer',
+            'key','forwarded-answer','summary','Forwarded','body','private forwarded','created',102,'due',NULL,
+            'work_id','t','reply_to','00000000-0000-4000-8000-000000000012')))),102);
+    "#).execute(&pool).await?;
+    let receipt_count: i64 = sqlx::query_scalar("SELECT count(*) FROM event_receipts")
+        .fetch_one(&pool)
+        .await?;
+    let attempts: i64 = sqlx::query_scalar("SELECT sum(attempts) FROM attention_attempts")
+        .fetch_one(&pool)
+        .await?;
+    pool.close().await;
+    let store = upgrade::open(&root, OpenMode::Existing).await?;
+    let pool = support::pool(&store).await?;
+    let writer = store.mailbox("g", "writer").await?;
+    let owner = store.mailbox("g", "owner").await?;
+    let request = store.message_context(&owner, 1).await?;
+    assert_eq!(store.message_context(&writer, 2).await?, request);
+    assert_eq!(
+        serde_json::to_value(&request)?,
+        serde_json::json!({"kind":"conversation","id":"00000000-0000-4000-8000-000000000011"})
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT canonical FROM messages WHERE id=1")
+            .fetch_one(&pool)
+            .await?,
+        "original-request"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT body FROM messages WHERE id=2")
+            .fetch_one(&pool)
+            .await?,
+        "private answer"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM deliveries WHERE message=1")
+            .fetch_one(&pool)
+            .await?,
+        "pending"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT work_id FROM messages WHERE id=1")
+            .fetch_one(&pool)
+            .await?,
+        "t"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM task_request_schedules")
+            .fetch_one(&pool)
+            .await?,
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM event_receipts")
+            .fetch_one(&pool)
+            .await?,
+        receipt_count
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT sum(attempts) FROM attention_attempts")
+            .fetch_one(&pool)
+            .await?,
+        attempts
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM recovery_emissions")
+            .fetch_one(&pool)
+            .await?,
+        0
+    );
+    let outgoing = store.export().await?;
+    assert_eq!(outgoing.len(), 2);
+    for (index, envelope) in outgoing.iter().enumerate() {
+        assert_eq!(
+            envelope.event_id.to_string(),
+            format!("00000000-0000-4000-8000-{:012}", 21 + index)
+        );
+        let agent_mail::relay::Event::ContextMessage {
+            context,
+            message,
+            intent,
+        } = &envelope.event
+        else {
+            panic!("contextual event")
+        };
+        assert_eq!(context, &request);
+        assert_eq!(message.work_id.as_deref(), Some("t"));
+        assert_eq!(
+            *intent,
+            if index == 0 {
+                agent_mail::states::MessageIntent::Request
+            } else {
+                agent_mail::states::MessageIntent::Notice
+            }
+        );
+    }
+    assert!(
+        sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await?
+            .is_empty()
+    );
+    assert_eq!(fs::read_dir(root.join("backups"))?.count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cyclic_history_aborts_context_migration_without_changing_original_rows() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("state");
+    let migrations = temp.path().join("old-migrations");
+    fs::create_dir_all(&root)?;
+    fs::create_dir_all(&migrations)?;
+    for entry in fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let name = filename.to_str().unwrap();
+        if name.ends_with(".sql") && name[..4].parse::<u32>()? <= 25 {
+            fs::copy(entry.path(), migrations.join(name))?;
+        }
+    }
+    let options = SqliteConnectOptions::new()
+        .filename(root.join("mail.db"))
+        .create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .connect_with(options.clone())
+        .await?;
+    sqlx::migrate::Migrator::new(migrations.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+    sqlx::raw_sql(r#"
+        INSERT INTO node VALUES ('00000000-0000-4000-8000-000000000001');
+        INSERT INTO groups(name,socket,home_machine) VALUES ('g','','00000000-0000-4000-8000-000000000001');
+        INSERT INTO mailboxes(id,group_name,name,binding)
+          VALUES (1,'g','owner','{"runtime":"standalone","session":"00000000-0000-4000-8000-000000000002"}');
+        INSERT INTO messages(id,sender,dedup_key,canonical,summary,body,created,due)
+          VALUES (1,1,'one','original-one','One','private one',100,100);
+        INSERT INTO messages(id,sender,dedup_key,canonical,summary,body,created,due,reply_to)
+          VALUES (2,1,'two','original-two','Two','private two',101,101,1);
+        UPDATE messages SET reply_to=2 WHERE id=1;
+    "#).execute(&pool).await?;
+    pool.close().await;
+    assert!(upgrade::open(&root, OpenMode::Existing).await.is_err());
+    let old = SqlitePoolOptions::new().connect_with(options).await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+            .fetch_one(&old)
+            .await?,
+        25
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM messages WHERE global_id IS NULL")
+            .fetch_one(&old)
+            .await?,
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM pragma_table_info('messages') WHERE name='context'"
+        )
+        .fetch_one(&old)
+        .await?,
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT canonical FROM messages WHERE id=1")
+            .fetch_one(&old)
+            .await?,
+        "original-one"
+    );
+    assert_eq!(fs::read_dir(root.join("backups"))?.count(), 1);
+    old.close().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn version_twenty_four_preserves_requests_and_budgets_when_schedules_merge() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path().join("state");
@@ -68,7 +305,7 @@ async fn version_twenty_four_preserves_requests_and_budgets_when_schedules_merge
         sqlx::query_scalar::<_, i64>("PRAGMA user_version")
             .fetch_one(&pool)
             .await?,
-        25
+        26
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM active_attention")
@@ -307,7 +544,7 @@ async fn version_twenty_two_adds_wake_indexes_without_changing_events_or_receipt
         sqlx::query_scalar::<_, i64>("PRAGMA user_version")
             .fetch_one(&pool)
             .await?,
-        25
+        26
     );
     assert!(
         sqlx::query("PRAGMA foreign_key_check")
@@ -356,7 +593,7 @@ async fn existing_version_four_state_upgrades_to_opt_in_sync() -> Result<()> {
     let version = sqlx::query!("PRAGMA user_version")
         .fetch_one(&support::pool(&store).await?)
         .await?;
-    assert_eq!(version.user_version, Some(25));
+    assert_eq!(version.user_version, Some(26));
     let peer = uuid::Uuid::new_v4();
     store.add_peer(peer, "test-host").await?;
     assert!(!store.peers_status().await?[0].auto_sync);
@@ -695,7 +932,7 @@ async fn version_sixteen_upgrades_without_changing_business_or_legacy_budgets() 
             .fetch_one(&pool)
             .await?
             .user_version,
-        Some(25)
+        Some(26)
     );
     Ok(())
 }
@@ -754,7 +991,7 @@ async fn automatic_open_never_initializes_missing_state_or_downgrades() -> Resul
     let pool = SqlitePoolOptions::new()
         .connect_with(SqliteConnectOptions::new().filename(root.join("mail.db")))
         .await?;
-    sqlx::query!("PRAGMA user_version=26")
+    sqlx::query!("PRAGMA user_version=27")
         .execute(&pool)
         .await?;
     pool.close().await;

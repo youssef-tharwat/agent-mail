@@ -58,10 +58,13 @@ The worker receives a notification and reports back:
 
 ```sh
 agent-mail mail send coordinator "API review complete" \
-  --task api-review --key api-review-result --body-file reviews/api.md
+  --task api-review --version 1 --key api-review-result --body-file reviews/api.md
 ```
 
 The coordinator records the decision. A reply alone leaves the task pending.
+Every send requires a task and observed version, an existing conversation, a
+parent message, or `--new-conversation`. Replies inherit their parent's context.
+[Mail contexts and private conversations](docs/MAIL_CONTEXT.md).
 [Full assignment and review flow](docs/agent-guide.md#assignment--result--decision).
 
 ## Follow-through

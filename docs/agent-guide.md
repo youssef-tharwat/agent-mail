@@ -8,7 +8,7 @@ description: >-
 
 Use the skill bundled with the running binary: `agent-mail --skill`. Startup and
 recovery hooks supply it automatically; do not reload instructions already in
-context. This guide matches 0.12; use the installed binary's guide for older versions.
+context. This guide matches 0.13; use the installed binary's guide for older versions.
 Use `agent-mail COMMAND --help` for syntax. Task/mail/agent operations return JSON;
 `status` is a readable summary, `status --json` returns structured data, and
 `status --check NAME` returns detailed diagnostics. `run` preserves the child interface.
@@ -79,8 +79,8 @@ only for the intended group; do not guess groups to repair access failures.
 
 | Need | Operation and effect |
 |---|---|
-| New request, blocker or result | `mail send RECIPIENT "SUMMARY" --key KEY --task ID`; creates a pending obligation for the recipient. |
-| Quiet information or a routine broadcast | `mail send RECIPIENT "SUMMARY" --intent notice --key KEY`; preserves information without a reply, deadline, follow-up, or model interruption. |
+| New request, blocker or result | `mail send RECIPIENT "SUMMARY" --key KEY --task ID --version VERSION`; creates a pending obligation for the recipient. |
+| Quiet information or a routine broadcast | `mail send RECIPIENT "SUMMARY" --intent notice --key KEY --conversation ID`; preserves information without a reply, deadline, follow-up, or model interruption. |
 | Final answer to an inbox request | `mail reply MESSAGE_ID "ANSWER"`; sends a response and resolves your delivery atomically. The requester receives attention to inspect the response; no reciprocal reply or resolution is owed. |
 | Outcome with no answer needed | `mail resolve MESSAGE_ID --note "OUTCOME"`; resolves your delivery without sending mail. |
 | Withdraw your outgoing request | `mail withdraw MESSAGE_ID`; does not cancel or accept its task. |
@@ -91,7 +91,15 @@ Reading and delivery receipts never resolve a request. Use a new `mail send`
 for interim discussion while the original request remains actionable; `reply` is
 final, and resolving first then replying conflicts. Each new logical send needs
 its own key; reuse the same key and identical content only for retries. Include
-`--task ID` explicitly; associations are never inferred.
+exactly one explicit context: `--task ID --version VERSION`, `--conversation ID`,
+`--new-conversation`, or `--reply-to MESSAGE_ID`. Read the task and supply the
+version you actually observed. An older version remains visible as an older
+observation; it never grants authority or asserts that the task is still current.
+Final `mail reply` and interim `mail send --reply-to` inherit their parent's context;
+an interim send leaves the original request pending. New conversations return their
+UUID in the send's `context`. Use `mail conversation UUID` for paginated summaries
+of messages you authored or received; it never exposes other recipients' mail or
+marks bodies retrieved. Associations are never guessed from recent activity.
 
 Use `--body-file PATH` or `--body-file -` for longer send/reply content. Summaries
 are limited to 240 UTF-8 bytes and bodies to 8 KiB. Keep large material outside
@@ -125,7 +133,7 @@ once when starting or recovering after a reset to load existing obligations.
 After sending a request, the sender can wait without polling:
 
 ```sh
-agent-mail mail send reviewer "Please review this change" --key review-1 --due-in 30m
+agent-mail mail send reviewer "Please review this change" --key review-1 --due-in 30m --new-conversation
 agent-mail mail wait MESSAGE_ID
 ```
 
@@ -160,7 +168,7 @@ issues and the decision needed:
 
 ```sh
 agent-mail mail send coordinator "API reviewed at abc123; decision needed" \
-  --task api --key api-result-v1 --body-file result.txt
+  --task api --version 1 --key api-result-v1 --body-file result.txt
 ```
 
 Use `mail reply` instead if this is the final answer to an existing inbox request.

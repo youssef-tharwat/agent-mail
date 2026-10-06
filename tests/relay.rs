@@ -99,8 +99,13 @@ fn message(to: &str, key: &str, work_id: Option<&str>) -> Publish {
         summary: "A bounded request".into(),
         body: "See revision abc123".into(),
         due_after: Some(900),
-        reply_to: None,
-        work_id: work_id.map(str::to_owned),
+        context: match work_id {
+            Some(id) => agent_mail::mail_context::ContextSource::Task {
+                id: id.parse().unwrap(),
+                version: 1.try_into().unwrap(),
+            },
+            None => agent_mail::mail_context::ContextSource::NewConversation,
+        },
     }
 }
 
@@ -147,6 +152,238 @@ async fn transfer(from: &Node, to: &Node, at: i64) -> Result<()> {
             at + 2,
         )
         .await?;
+    Ok(())
+}
+
+async fn negotiate(one: &Node, two: &Node) -> Result<()> {
+    for (local, peer) in [(one, two), (two, one)] {
+        local
+            .store
+            .exchange(
+                peer.id().await?,
+                Exchange {
+                    capabilities: agent_mail::relay::capabilities(),
+                    incoming: vec![],
+                    ack: vec![],
+                },
+                99,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn context_cannot_be_downgraded_or_forged_during_relay() -> Result<()> {
+    use agent_mail::{
+        mail_context::{ContextSource, MessageContext},
+        relay::Event,
+    };
+    let home = Node::new("home", "coordinator").await?;
+    let remote = Node::new("remote", "worker").await?;
+    remote.store.set_home("g", home.id().await?).await?;
+    home.store
+        .route("g", "worker", remote.id().await?, 100)
+        .await?;
+    let coordinator = home.store.mailbox("g", "coordinator").await?;
+    let worker = remote.store.mailbox("g", "worker").await?;
+    home.store
+        .exchange(
+            remote.id().await?,
+            Exchange {
+                capabilities: vec!["communication_intent_v1".into()],
+                incoming: vec![],
+                ack: vec![],
+            },
+            100,
+        )
+        .await?;
+    assert!(
+        home.store
+            .publish(&coordinator, message("worker", "unsupported", None), 101)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM messages")
+            .fetch_one(&support::pool(&home.store).await?)
+            .await?,
+        0
+    );
+    negotiate(&home, &remote).await?;
+    home.store
+        .work_create(
+            &coordinator,
+            WorkDraft {
+                id: "t".into(),
+                scope: "Review".into(),
+                owner: "worker".into(),
+                state: agent_mail::states::TaskState::Open,
+                next_action: "Review".into(),
+                deadline: None,
+                evidence: vec![],
+            },
+            102,
+        )
+        .await?;
+    let mut request = message("worker", "task-request", None);
+    request.context = ContextSource::Task {
+        id: "t".parse()?,
+        version: 1.try_into()?,
+    };
+    home.store.publish(&coordinator, request, 103).await?;
+    let original = home.store.export_for(remote.id().await?).await?;
+    let mut forged = original.clone();
+    let target = forged
+        .iter_mut()
+        .find(|e| matches!(e.event, Event::ContextMessage { .. }))
+        .unwrap();
+    let Event::ContextMessage { context, .. } = &mut target.event else {
+        unreachable!()
+    };
+    *context = MessageContext::Task {
+        id: "t".parse()?,
+        version: 2.try_into()?,
+    };
+    assert!(
+        remote
+            .store
+            .exchange(
+                home.id().await?,
+                Exchange {
+                    capabilities: agent_mail::relay::capabilities(),
+                    incoming: forged,
+                    ack: vec![]
+                },
+                104
+            )
+            .await
+            .is_err()
+    );
+    assert!(remote.store.inbox(&worker, 0).await?.is_empty());
+    assert!(
+        remote.store.work_show(&worker, "t").await.is_err(),
+        "failed batch must roll back its snapshot too"
+    );
+    transfer(&home, &remote, 105).await?;
+    let stored = remote.store.inbox(&worker, 0).await?.remove(0);
+    assert_eq!(
+        stored.context,
+        MessageContext::Task {
+            id: "t".parse()?,
+            version: 1.try_into()?
+        }
+    );
+    let mut duplicate = original
+        .into_iter()
+        .find(|e| matches!(e.event, Event::ContextMessage { .. }))
+        .unwrap();
+    duplicate.event_id = uuid::Uuid::new_v4();
+    let Event::ContextMessage { context, .. } = &mut duplicate.event else {
+        unreachable!()
+    };
+    *context = MessageContext::Conversation {
+        id: uuid::Uuid::new_v4().try_into()?,
+    };
+    assert!(
+        remote
+            .store
+            .exchange(
+                home.id().await?,
+                Exchange {
+                    capabilities: agent_mail::relay::capabilities(),
+                    incoming: vec![duplicate.clone()],
+                    ack: vec![]
+                },
+                107
+            )
+            .await
+            .is_err()
+    );
+    let mut unscoped = serde_json::to_value(&duplicate)?;
+    unscoped["event"]["data"]
+        .as_object_mut()
+        .unwrap()
+        .remove("context");
+    assert!(serde_json::from_value::<Envelope>(unscoped).is_err());
+    let mut old = serde_json::to_value(duplicate)?;
+    old["event"]["kind"] = serde_json::json!("message");
+    assert!(serde_json::from_value::<Envelope>(old).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn private_parent_ancestry_survives_a_recipient_without_the_parent() -> Result<()> {
+    use agent_mail::mail_context::{ContextSource, MessageContext};
+    let home = Node::new("home", "coordinator").await?;
+    let remote = Node::new("remote", "worker").await?;
+    remote.store.set_home("g", home.id().await?).await?;
+    home.store
+        .route("g", "worker", remote.id().await?, 100)
+        .await?;
+    home.store.register("g", "private-recipient", false).await?;
+    negotiate(&home, &remote).await?;
+    let coordinator = home.store.mailbox("g", "coordinator").await?;
+    let worker = remote.store.mailbox("g", "worker").await?;
+    let parent = home
+        .store
+        .publish(
+            &coordinator,
+            message("private-recipient", "private", None),
+            101,
+        )
+        .await?;
+    let parent_uuid: String = sqlx::query_scalar("SELECT global_id FROM messages WHERE id=?")
+        .bind(parent)
+        .fetch_one(&support::pool(&home.store).await?)
+        .await?;
+    let mut invite = message("worker", "invite", None);
+    invite.context = ContextSource::Reply {
+        message: parent.try_into()?,
+    };
+    let invite_id = home.store.publish(&coordinator, invite, 102).await?;
+    let context = home.store.message_context(&coordinator, invite_id).await?;
+    transfer(&home, &remote, 103).await?;
+    let incoming = remote.store.inbox(&worker, 0).await?.remove(0);
+    assert_eq!(incoming.context, context);
+    assert_eq!(incoming.reply_to, None);
+    let ancestry = incoming.parent.as_ref().unwrap();
+    assert_eq!(ancestry.global_id.to_string(), parent_uuid);
+    assert_eq!(ancestry.local_id, None);
+    let MessageContext::Conversation { id } = context else {
+        panic!("conversation")
+    };
+    assert_eq!(
+        remote
+            .store
+            .conversation(&worker, id, 0)
+            .await?
+            .messages
+            .len(),
+        1
+    );
+    assert_eq!(
+        remote.store.conversation(&worker, id, 0).await?.messages[0]
+            .parent
+            .as_ref()
+            .unwrap(),
+        ancestry
+    );
+    remote
+        .store
+        .resolve(
+            &worker,
+            incoming.id,
+            "Done",
+            Some(("answer".into(), "Reviewed".into())),
+            104,
+        )
+        .await?;
+    transfer(&remote, &home, 105).await?;
+    assert_eq!(
+        home.store.inbox(&coordinator, 0).await?.remove(0).context,
+        MessageContext::Conversation { id }
+    );
     Ok(())
 }
 
@@ -266,6 +503,7 @@ async fn offline_mail_reply_resolution_and_snapshot_survive_replay() -> Result<(
         .store
         .route("g", "coordinator", home.id().await?, 1_000)
         .await?;
+    negotiate(&home, &remote).await?;
     let coordinator = home.store.mailbox("g", "coordinator").await?;
     let worker = remote.store.mailbox("g", "worker").await?;
 
@@ -375,6 +613,8 @@ async fn home_relays_between_remote_nodes_once() -> Result<()> {
     left.store
         .route("g", "right", right.id().await?, 1_000)
         .await?;
+    negotiate(&home, &left).await?;
+    negotiate(&home, &right).await?;
     let sender = left.store.mailbox("g", "left").await?;
     let recipient = right.store.mailbox("g", "right").await?;
     left.store
@@ -422,6 +662,7 @@ async fn bridge_commands_exchange_json_across_processes() -> Result<()> {
         .route("g", "worker", remote.id().await?, 1_000)
         .await?;
     let sender = home.store.mailbox("g", "coordinator").await?;
+    negotiate(&home, &remote).await?;
     home.store
         .publish(&sender, message("worker", "bridge", None), 1000)
         .await?;
@@ -493,6 +734,7 @@ async fn explicit_sync_uses_ssh_stdio_and_clears_both_outboxes() -> Result<()> {
         .store
         .route("g", "coordinator", home_id, 1_000)
         .await?;
+    negotiate(&home, &remote).await?;
     home.store.add_peer(remote_id, "test-remote").await?;
 
     let fake_ssh = FakeSsh::new(&remote)?;
@@ -552,6 +794,7 @@ async fn worker_sync_requires_opt_in_and_target_change_revokes_it() -> Result<()
         .store
         .route("g", "coordinator", home_id, 1_000)
         .await?;
+    negotiate(&home, &remote).await?;
     home.store.add_peer(remote_id, "test-remote").await?;
     let fake_ssh = FakeSsh::new(&remote)?;
     let remote_id_text = remote_id.to_string();
@@ -645,6 +888,7 @@ async fn withdrawal_uses_the_supplied_timestamp_for_relay_events() -> Result<()>
     let remote = Node::new("worker-pane", "worker").await?;
     let remote_id = remote.id().await?;
     home.store.route("g", "worker", remote_id, 100).await?;
+    negotiate(&home, &remote).await?;
     let actor = home.store.caller("g", "coordinator-pane").await?;
     let id = home
         .store

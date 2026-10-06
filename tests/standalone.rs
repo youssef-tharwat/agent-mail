@@ -43,6 +43,76 @@ impl Demo {
 }
 
 #[test]
+fn send_requires_context_and_conversation_replies_inherit_it() -> Result<()> {
+    let d = Demo::new()?;
+    d.ok(None, &["init", "g"])?;
+    let writer = d.register("writer")?;
+    let owner = d.register("owner")?;
+    for extra in [
+        vec![],
+        vec!["--task", "t"],
+        vec!["--task", "t", "--version", "0"],
+        vec![
+            "--new-conversation",
+            "--conversation",
+            "00000000-0000-4000-8000-000000000001",
+        ],
+    ] {
+        let mut args = vec!["mail", "send", "owner", "Discussion", "--key", "first"];
+        args.extend(extra);
+        assert!(!d.call(Some(&writer), &args)?.status.success());
+    }
+    assert!(
+        d.ok(Some(&owner), &["mail", "list"])?["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let sent = d.ok(
+        Some(&writer),
+        &[
+            "mail",
+            "send",
+            "owner",
+            "Discussion",
+            "--key",
+            "first",
+            "--new-conversation",
+        ],
+    )?;
+    let id = sent["id"].to_string();
+    assert_eq!(sent["context"]["kind"], "conversation");
+    let interim = d.ok(
+        Some(&owner),
+        &[
+            "mail",
+            "send",
+            "writer",
+            "Progress",
+            "--key",
+            "interim",
+            "--reply-to",
+            &id,
+        ],
+    )?;
+    assert_eq!(interim["context"], sent["context"]);
+    assert_eq!(
+        d.ok(Some(&owner), &["mail", "show", &id])?["state"],
+        "pending"
+    );
+    let thread = sent["context"]["id"].as_str().unwrap();
+    let page = d.ok(Some(&writer), &["mail", "conversation", thread])?;
+    assert_eq!(page["messages"].as_array().unwrap().len(), 2);
+    let reply = d.ok(Some(&owner), &["mail", "reply", &id, "Complete"])?;
+    let response = d.ok(
+        Some(&writer),
+        &["mail", "show", &reply["reply_id"].to_string()],
+    )?;
+    assert_eq!(response["context"], sent["context"]);
+    Ok(())
+}
+
+#[test]
 fn followthrough_defaults_and_direct_policy_flags_need_no_file() -> Result<()> {
     let d = Demo::new()?;
     assert_eq!(
@@ -152,6 +222,8 @@ fn standalone_mail_work_and_session_replacement() -> Result<()> {
             "request",
             "--task",
             "api",
+            "--version",
+            "1",
         ],
     )?;
     let id = sent["id"].to_string();
@@ -246,7 +318,15 @@ fn standalone_identity_is_scoped_and_never_infers_liveness() -> Result<()> {
     );
     d.ok(
         Some(&a),
-        &["mail", "send", "b", "Check mail", "--key", "one"],
+        &[
+            "mail",
+            "send",
+            "b",
+            "Check mail",
+            "--key",
+            "one",
+            "--new-conversation",
+        ],
     )?;
     let status = d.ok(None, &["service", "run", "--once"])?;
     assert_eq!(status["observations"][0]["state"], "unavailable");
@@ -314,7 +394,15 @@ fn natural_retries_and_short_replies_preserve_one_logical_change() -> Result<()>
     );
     let sent = d.ok(
         Some(&writer),
-        &["mail", "send", "worker", "Question", "--key", "question"],
+        &[
+            "mail",
+            "send",
+            "worker",
+            "Question",
+            "--key",
+            "question",
+            "--new-conversation",
+        ],
     )?;
     let id = sent["id"].to_string();
     assert!(d.ok(Some(&worker), &["mail", "show", &id])?["due"].is_null());

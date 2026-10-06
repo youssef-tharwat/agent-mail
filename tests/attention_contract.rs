@@ -29,8 +29,7 @@ fn message(to: &str, key: &str, intent: MessageIntent) -> Publish {
         summary: "Communication".into(),
         body: "Details".into(),
         due_after: None,
-        reply_to: None,
-        work_id: None,
+        context: agent_mail::mail_context::ContextSource::NewConversation,
     }
 }
 
@@ -109,7 +108,9 @@ async fn response_observation_and_request_disposition_remain_distinct() -> Resul
         .publish(&a, message("one", "request", MessageIntent::Request), 100)
         .await?;
     let mut answer = message("writer", "answer", MessageIntent::Response);
-    answer.reply_to = Some(request);
+    answer.context = agent_mail::mail_context::ContextSource::Reply {
+        message: request.try_into()?,
+    };
     let response = store.publish(&b, answer, 101).await?;
     let first_reply = store
         .wait_mail_for(&a, request, None, MailPredicate::FirstReply)

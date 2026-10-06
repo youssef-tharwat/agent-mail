@@ -19,7 +19,7 @@ SCENES = (
      'Same task. Same next action.', 'The assignment is stored in local SQLite.'),
     ('Send the result', 'worker',
      ['agent-mail mail send coordinator "Reviewed abc123" \\',
-      '  --task api --key api-result-v1'],
+      '  --task api --version 1 --key api-result-v1'],
      'Result saved. Waiting for a decision.', 'The message stays pending until explicitly resolved.'),
     ('Accept and resolve', 'coordinator',
      ['agent-mail task update api --version 1 --reason "Reviewed" \\',

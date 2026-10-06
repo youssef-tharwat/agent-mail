@@ -439,8 +439,10 @@ async fn linked_message_paging_never_exposes_private_payloads() -> Result<()> {
                     summary: "private summary".into(),
                     body: "private body".into(),
                     due_after: None,
-                    reply_to: None,
-                    work_id: Some("t".into()),
+                    context: agent_mail::mail_context::ContextSource::Task {
+                        id: "t".parse().unwrap(),
+                        version: 1.try_into().unwrap(),
+                    },
                 },
                 2,
             )

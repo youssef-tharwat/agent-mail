@@ -131,6 +131,12 @@ fn parse_send_intent(value: &str) -> Result<agent_mail::states::MessageIntent> {
 }
 #[derive(Subcommand)]
 enum Mail {
+    /// Read only conversation messages authored by or addressed to me.
+    Conversation {
+        id: agent_mail::mail_context::ConversationId,
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+    },
     /// Record a next step or waiting condition without resolving work.
     Checkpoint {
         id: i64,
@@ -141,6 +147,7 @@ enum Mail {
     },
 
     /// Send a request or quiet notice. Reuse the key only for an identical retry.
+    #[command(group(clap::ArgGroup::new("mail_context").required(true).args(["work", "conversation", "new_conversation", "reply_to"])))]
     Send {
         /// Request a disposition, or publish a quiet informational notice.
         #[arg(long, value_parser=parse_send_intent, default_value_t=agent_mail::states::MessageIntent::Request)]
@@ -155,9 +162,21 @@ enum Mail {
         /// Additional recipients (repeat for more).
         #[arg(long)]
         to: Vec<String>,
-        /// Related task ID; never inferred from recent activity.
-        #[arg(long = "task")]
-        work: Option<String>,
+        /// Task this message concerns; requires its observed version.
+        #[arg(long = "task", requires = "version")]
+        work: Option<agent_mail::names::TaskId>,
+        /// Task version observed by the sender, from task show.
+        #[arg(long, requires = "work")]
+        version: Option<agent_mail::mail_context::TaskVersion>,
+        /// Continue an existing conversation in which I participate.
+        #[arg(long)]
+        conversation: Option<agent_mail::mail_context::ConversationId>,
+        /// Explicitly start a new conversation without creating a task.
+        #[arg(long)]
+        new_conversation: bool,
+        /// Inherit the context of an authored or addressed message; does not settle it.
+        #[arg(long)]
+        reply_to: Option<agent_mail::mail_context::MessageId>,
         /// Full body file, or - to read bounded stdin.
         #[arg(long)]
         body_file: Option<PathBuf>,
@@ -876,6 +895,7 @@ impl Cli {
                 consumer,
             },
             Action::Mail(mail) => match mail {
+                Mail::Conversation { id, after } => Command::Conversation { group, id, after },
                 Mail::Checkpoint { id, key, file } => Command::Checkpoint {
                     group,
                     source: agent_mail::followup::Source::Mail { id },
@@ -899,17 +919,35 @@ impl Cli {
                     key,
                     mut to,
                     work,
+                    version,
+                    conversation,
+                    new_conversation,
+                    reply_to,
                     body_file,
                     due_in,
                 } => {
                     to.push(recipient);
+                    use agent_mail::mail_context::ContextSource;
+                    let context = match (work, version, conversation, new_conversation, reply_to) {
+                        (Some(id), Some(version), None, false, None) => {
+                            ContextSource::Task { id, version }
+                        }
+                        (None, None, Some(id), false, None) => ContextSource::Conversation { id },
+                        (None, None, None, true, None) => ContextSource::NewConversation,
+                        (None, None, None, false, Some(message)) => {
+                            ContextSource::Reply { message }
+                        }
+                        _ => anyhow::bail!(
+                            "supply exactly one mail context; task context requires --version"
+                        ),
+                    };
                     Command::Send {
                         intent,
                         group,
                         recipients: to,
                         summary,
                         key,
-                        work_id: work,
+                        context,
                         body_file,
                         due_after: due_in,
                     }

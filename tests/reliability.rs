@@ -209,8 +209,7 @@ fn message(key: &str) -> Publish {
         summary: "Inspect the contract".into(),
         body: "Durable body".into(),
         due_after: Some(900),
-        reply_to: None,
-        work_id: None,
+        context: agent_mail::mail_context::ContextSource::NewConversation,
     }
 }
 
@@ -696,6 +695,7 @@ async fn cli_roundtrip_bounds_identity_and_restart() -> Result<()> {
                 "g",
                 "--key",
                 "cli",
+                "--new-conversation",
             ],
         )
         .await?;
@@ -747,6 +747,7 @@ async fn cli_roundtrip_bounds_identity_and_restart() -> Result<()> {
                 "g",
                 "--key",
                 "cli",
+                "--new-conversation",
             ],
         )
         .await?;
@@ -899,7 +900,10 @@ async fn work_writer_versions_and_mail_links_survive_restart() -> Result<()> {
             .is_err()
     );
     let mut linked = message("linked");
-    linked.work_id = Some("lane-api".into());
+    linked.context = agent_mail::mail_context::ContextSource::Task {
+        id: "lane-api".parse()?,
+        version: 1.try_into()?,
+    };
     let id = f.store.publish(&f.a, linked, 1003).await?;
     assert_eq!(
         f.store.message(&f.b, id).await?.work_id.as_deref(),

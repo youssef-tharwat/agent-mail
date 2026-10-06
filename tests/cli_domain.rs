@@ -65,8 +65,7 @@ async fn no_deadline_still_publishes_delivery_events_without_false_overdue() -> 
                 summary: "Review".into(),
                 body: String::new(),
                 due_after: None,
-                reply_to: None,
-                work_id: None,
+                context: agent_mail::mail_context::ContextSource::NewConversation,
             },
             1000,
         )

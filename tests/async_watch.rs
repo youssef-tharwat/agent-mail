@@ -43,8 +43,7 @@ fn mail(recipients: &[&str], key: &str, due_after: Option<i64>) -> Publish {
         summary: "Please review".into(),
         body: "Review the patch".into(),
         due_after,
-        reply_to: None,
-        work_id: None,
+        context: agent_mail::mail_context::ContextSource::NewConversation,
     }
 }
 

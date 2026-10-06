@@ -25,8 +25,10 @@ fn task_request(key: &str, task: &str, recipient: &str) -> Publish {
         summary: "Regenerate the SDK".into(),
         body: "Continue the explicitly linked assignment".into(),
         due_after: None,
-        reply_to: None,
-        work_id: Some(task.into()),
+        context: agent_mail::mail_context::ContextSource::Task {
+            id: task.parse().unwrap(),
+            version: 1.try_into().unwrap(),
+        },
     }
 }
 
@@ -421,7 +423,7 @@ async fn adopting_task_schedule_invalidates_old_mail_attention_and_releases_leas
         .publish(
             &reviewer,
             Publish {
-                work_id: None,
+                context: agent_mail::mail_context::ContextSource::NewConversation,
                 ..task_request("fresh", "sdk", "writer")
             },
             f.time + 241,
@@ -531,8 +533,7 @@ impl Fixture {
                     summary: "Decision needed".into(),
                     body: "Evidence".into(),
                     due_after: None,
-                    reply_to: None,
-                    work_id: None,
+                    context: agent_mail::mail_context::ContextSource::NewConversation,
                 },
                 self.time,
             )
@@ -731,8 +732,10 @@ async fn turn_boundaries_leave_task_deadlines_pending_and_restart_recovers_them(
                 summary: "Partial progress".into(),
                 body: "Remaining evidence still needs inspection".into(),
                 due_after: None,
-                reply_to: None,
-                work_id: Some("partial".into()),
+                context: agent_mail::mail_context::ContextSource::Task {
+                    id: "partial".parse().unwrap(),
+                    version: 1.try_into().unwrap(),
+                },
             },
             f.time + 2,
         )
@@ -970,8 +973,7 @@ async fn self_escalation_receipts_only_the_mail_actually_returned() -> Result<()
                 summary: "Own decision".into(),
                 body: "Read this source".into(),
                 due_after: None,
-                reply_to: None,
-                work_id: None,
+                context: agent_mail::mail_context::ContextSource::NewConversation,
             },
             f.time,
         )
@@ -1632,8 +1634,10 @@ async fn reply_before_checkpoint_is_not_lost_and_does_not_accept_work() -> Resul
                 summary: "Review result".into(),
                 body: String::new(),
                 due_after: None,
-                reply_to: None,
-                work_id: Some("review".into()),
+                context: agent_mail::mail_context::ContextSource::Task {
+                    id: "review".parse().unwrap(),
+                    version: 1.try_into().unwrap(),
+                },
             },
             f.time,
         )

@@ -610,7 +610,7 @@ impl Store {
                 "source is not addressed to this agent"
             );
             let item = sqlx::query_as!(Message,
-                "SELECT m.intent AS 'intent: crate::states::MessageIntent',m.id,b.name AS sender,m.summary,m.body,m.created,m.deadline AS due,d.state AS 'state: MessageState',d.reply_id,m.work_id FROM messages m JOIN deliveries d ON d.message=m.id JOIN mailboxes b ON b.id=m.sender WHERE m.id=? AND d.recipient=?",
+                "SELECT m.intent AS 'intent: crate::states::MessageIntent',m.id,b.name AS sender,m.summary,m.body,m.created,m.deadline AS due,d.state AS 'state: MessageState',d.reply_id,m.work_id,m.context AS 'context!: crate::mail_context::MessageContext',m.reply_to,CASE WHEN m.parent_global_id IS NOT NULL THEN json_object('global_id',m.parent_global_id,'local_id',m.reply_to) END AS 'parent?: crate::mail_context::ParentMessage' FROM messages m JOIN deliveries d ON d.message=m.id JOIN mailboxes b ON b.id=m.sender WHERE m.id=? AND d.recipient=?",
                 message, plan.recipient).fetch_one(&mut *tx).await?;
             if actor.id == plan.recipient {
                 Self::retrieve_tx(

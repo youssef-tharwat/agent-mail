@@ -34,6 +34,8 @@ pub mod artifacts;
 pub mod external;
 pub mod herdr;
 pub mod identity;
+/// Mandatory task and conversation context for durable mail.
+pub mod mail_context;
 /// Validated coordination and delivery identities.
 pub mod names;
 /// Outstanding attention and shared model-delivery reservations.

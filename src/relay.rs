@@ -5,6 +5,7 @@
 //! Both subprocess output streams are bounded while reading, and exchange failures
 //! kill and reap the child. Business operations accept Unix seconds from their caller.
 
+use crate::mail_context::MessageContext;
 use crate::states::{MessageIntent, MessageState};
 use crate::{BODY_LIMIT, SUMMARY_LIMIT, bounded, name, store::Store, work::WorkItem};
 use anyhow::{Context, Result, ensure};
@@ -21,10 +22,11 @@ use uuid::Uuid;
 // Keep each exchange small enough to fit the wire budget and avoid starving peers.
 const BATCH_LIMIT: usize = 16;
 const INTENT_CAPABILITY: &str = "communication_intent_v1";
+const CONTEXT_CAPABILITY: &str = "mail_context_v1";
 
 /// Capabilities advertised by this relay implementation.
 pub fn capabilities() -> Vec<String> {
-    vec![INTENT_CAPABILITY.into()]
+    vec![INTENT_CAPABILITY.into(), CONTEXT_CAPABILITY.into()]
 }
 // Shared by encoding and streaming reads; changing this changes the relay wire contract.
 const WIRE_LIMIT: usize = 256 * 1024;
@@ -52,12 +54,12 @@ pub struct Envelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Event {
-    /// A message to deliver to the destination participant.
-    Message(WireMessage),
-    /// Typed communication; older relays reject this variant instead of downgrading it.
-    TypedMessage {
+    /// Contextual communication; older relays reject it instead of discarding its subject.
+    ContextMessage {
         /// Explicit communication meaning.
         intent: MessageIntent,
+        /// Durable task revision or conversation this communication concerns.
+        context: MessageContext,
         /// Original message content and request reference.
         message: WireMessage,
     },
@@ -216,7 +218,7 @@ pub(crate) async fn enqueue_message(
     created: i64,
 ) -> Result<()> {
     let row = sqlx::query!(
-        "SELECT m.intent AS 'intent: MessageIntent',m.global_id,m.dedup_key,m.summary,m.body,m.created,m.deadline AS due,m.work_id,m.reply_to,s.name AS sender,s.group_name,r.name AS recipient,r.remote_machine FROM messages m JOIN mailboxes s ON s.id=m.sender JOIN mailboxes r ON r.id=? WHERE m.id=?",
+        "SELECT m.intent AS 'intent: MessageIntent',m.context AS 'context!: MessageContext',m.global_id,m.dedup_key,m.summary,m.body,m.created,m.deadline AS due,m.work_id,m.parent_global_id,s.name AS sender,s.group_name,r.name AS recipient,r.remote_machine FROM messages m JOIN mailboxes s ON s.id=m.sender JOIN mailboxes r ON r.id=? WHERE m.id=?",
         recipient_id,
         message_id
     )
@@ -225,7 +227,7 @@ pub(crate) async fn enqueue_message(
     let Some(machine) = row.remote_machine else {
         return Ok(());
     };
-    if !row.intent.is_request() {
+    {
         let home = sqlx::query_scalar!(
             "SELECT home_machine FROM groups WHERE name=?",
             row.group_name
@@ -241,24 +243,15 @@ pub(crate) async fn enqueue_message(
             sqlx::query_scalar!(
                 "SELECT EXISTS(SELECT 1 FROM relay_capabilities WHERE machine=? AND capability=?)",
                 next_hop,
-                INTENT_CAPABILITY
+                CONTEXT_CAPABILITY
             )
             .fetch_one(&mut **tx)
             .await?
                 != 0,
-            "next relay hop has not advertised communication intent support; sync the upgraded peer first"
+            "next relay hop has not advertised mail context support; sync the upgraded peer first"
         );
     }
-    let reply_to = if let Some(id) = row.reply_to {
-        sqlx::query!("SELECT global_id FROM messages WHERE id=?", id)
-            .fetch_optional(&mut **tx)
-            .await?
-            .and_then(|r| r.global_id)
-            .map(|s| parse_id(&s))
-            .transpose()?
-    } else {
-        None
-    };
+    let reply_to = row.parent_global_id.as_deref().map(parse_id).transpose()?;
     let message = WireMessage {
         id: parse_id(
             row.global_id
@@ -276,13 +269,10 @@ pub(crate) async fn enqueue_message(
         work_id: row.work_id,
         reply_to,
     };
-    let event = if row.intent.is_request() {
-        Event::Message(message)
-    } else {
-        Event::TypedMessage {
-            intent: row.intent,
-            message,
-        }
+    let event = Event::ContextMessage {
+        intent: row.intent,
+        context: row.context,
+        message,
     };
     enqueue(tx, parse_id(&machine)?, event, created).await
 }
@@ -566,11 +556,14 @@ impl Store {
         sqlx::query!("DELETE FROM relay_capabilities WHERE machine=?", source_id)
             .execute(&mut *tx)
             .await?;
-        if exchange.capabilities.iter().any(|c| c == INTENT_CAPABILITY) {
+        for capability in [INTENT_CAPABILITY, CONTEXT_CAPABILITY] {
+            if !exchange.capabilities.iter().any(|c| c == capability) {
+                continue;
+            }
             sqlx::query!(
                 "INSERT INTO relay_capabilities(machine,capability) VALUES(?,?)",
                 source_id,
-                INTENT_CAPABILITY
+                capability
             )
             .execute(&mut *tx)
             .await?;
@@ -792,7 +785,7 @@ impl Store {
 
 fn event_group(event: &Event) -> &str {
     match event {
-        Event::Message(m) | Event::TypedMessage { message: m, .. } => &m.group,
+        Event::ContextMessage { message: m, .. } => &m.group,
         Event::Resolution { group, .. } | Event::Withdrawal { group, .. } => group,
         Event::WorkSnapshot(item) => &item.group_name,
         Event::RecordSnapshot(item) => &item.record.group_name,
@@ -801,25 +794,44 @@ fn event_group(event: &Event) -> &str {
     }
 }
 
+async fn validate_context_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    message: &WireMessage,
+    context: &MessageContext,
+) -> Result<()> {
+    if let MessageContext::Task { id, .. } = context {
+        ensure!(
+            message.work_id.as_deref() == Some(id.as_str()),
+            "task context does not match the message association"
+        );
+        crate::mail_context::validate_task_tx(tx, &message.group, context).await?;
+    }
+    Ok(())
+}
+
 async fn validate_forward(tx: &mut Transaction<'_, Sqlite>, envelope: &Envelope) -> Result<()> {
     match &envelope.event {
-        Event::Message(m) | Event::TypedMessage { message: m, .. } => {
+        Event::ContextMessage {
+            message: m,
+            intent,
+            context,
+        } => {
             name(&m.group)?;
             name(&m.sender)?;
             name(&m.recipient)?;
-            if let Event::TypedMessage { intent, .. } = &envelope.event {
+            {
                 ensure!(
-                    !intent.is_request(),
-                    "request traffic must use the request event"
+                    intent.is_request() || m.due.is_none(),
+                    "only requests may carry a deadline"
                 );
-                ensure!(m.due.is_none(), "only requests may carry a deadline");
                 ensure!(
                     *intent != MessageIntent::Response || m.reply_to.is_some(),
                     "response has no referenced request"
                 );
                 let destination = envelope.destination.to_string();
-                ensure!(sqlx::query_scalar!("SELECT EXISTS(SELECT 1 FROM relay_capabilities WHERE machine=? AND capability=?)",destination,INTENT_CAPABILITY).fetch_one(&mut **tx).await? != 0,"destination has not negotiated communication intent; synchronize upgraded peers first");
+                ensure!(sqlx::query_scalar!("SELECT EXISTS(SELECT 1 FROM relay_capabilities WHERE machine=? AND capability=?)",destination,CONTEXT_CAPABILITY).fetch_one(&mut **tx).await? != 0,"destination has not negotiated mail context; synchronize upgraded peers first");
             }
+            validate_context_tx(tx, m, context).await?;
             let sender = sqlx::query!(
                 "SELECT remote_machine FROM mailboxes WHERE group_name=? AND name=?",
                 m.group,
@@ -890,12 +902,13 @@ async fn apply_event(
     home: Uuid,
     time: i64,
 ) -> Result<()> {
-    let intent = match &envelope.event {
-        Event::TypedMessage { intent, .. } => *intent,
-        _ => MessageIntent::Request,
-    };
     match &envelope.event {
-        Event::Message(m) | Event::TypedMessage { message: m, .. } => {
+        Event::ContextMessage {
+            message: m,
+            intent,
+            context,
+        } => {
+            let intent = *intent;
             ensure!(
                 intent.is_request() || m.due.is_none(),
                 "only requests may carry a deadline"
@@ -906,6 +919,7 @@ async fn apply_event(
             );
             name(&m.sender)?;
             name(&m.recipient)?;
+            validate_context_tx(tx, m, context).await?;
             bounded(&m.key, 128, "send key")?;
             bounded(&m.summary, SUMMARY_LIMIT, "summary")?;
             bounded(&m.body, BODY_LIMIT, "body")?;
@@ -953,12 +967,13 @@ async fn apply_event(
             } else {
                 serde_json::to_string(&(intent, original))?
             };
-            let existing = sqlx::query!("SELECT id,canonical FROM messages WHERE global_id=?", id)
+            let context_text = serde_json::to_string(context)?;
+            let existing = sqlx::query!("SELECT id,canonical,context AS 'context!: MessageContext' FROM messages WHERE global_id=?", id)
                 .fetch_optional(&mut **tx)
                 .await?;
             let message_id = if let Some(existing) = existing {
                 ensure!(
-                    existing.canonical == canonical,
+                    existing.canonical == canonical && existing.context == *context,
                     "global message ID has different content"
                 );
                 existing.id
@@ -977,9 +992,21 @@ async fn apply_event(
                 if intent == MessageIntent::Response {
                     ensure!(sqlx::query_scalar!("SELECT EXISTS(SELECT 1 FROM messages m JOIN deliveries d ON d.message=m.id WHERE m.id=? AND m.sender=? AND d.recipient=? AND m.intent='request')",reply_to,destination.id,sender_id).fetch_one(&mut **tx).await? != 0,"response does not match the requester and responder");
                 }
+                if let Some(parent) = reply_to {
+                    let stored: String =
+                        sqlx::query_scalar("SELECT context FROM messages WHERE id=?")
+                            .bind(parent)
+                            .fetch_one(&mut **tx)
+                            .await?;
+                    ensure!(
+                        serde_json::from_str::<MessageContext>(&stored)? == *context,
+                        "reply context does not match its parent"
+                    );
+                }
                 let intent = intent.as_str();
-                sqlx::query!("INSERT INTO messages(sender,dedup_key,canonical,summary,body,created,due,reply_to,work_id,global_id,deadline,intent) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    sender_id, key, canonical, m.summary, m.body, m.created, storage_due, reply_to, m.work_id, id, m.due,intent)
+                let parent_global_id = m.reply_to.map(|id| id.to_string());
+                sqlx::query!("INSERT INTO messages(sender,dedup_key,canonical,summary,body,created,due,reply_to,work_id,global_id,deadline,intent,context,parent_global_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    sender_id, key, canonical, m.summary, m.body, m.created, storage_due, reply_to, m.work_id, id, m.due,intent,context_text,parent_global_id)
                     .execute(&mut **tx).await?.last_insert_rowid()
             };
             sqlx::query!(
