@@ -83,6 +83,25 @@ string_enum! {
     }
 }
 string_enum! {
+    /// Explicit communication effect, independent of delivery or task acceptance.
+    #[derive(clap::ValueEnum,Default)]
+    pub enum MessageIntent {
+        /// A recipient owes a business disposition.
+        #[default]
+        Request => "request",
+        /// Information available without a response obligation or interruption.
+        Notice => "notice",
+        /// A final answer to an existing request; no reciprocal request is created.
+        Response => "response",
+    }
+}
+impl MessageIntent {
+    /// Preserve the canonical JSON of requests published before intent existed.
+    pub fn is_request(&self) -> bool {
+        *self == Self::Request
+    }
+}
+string_enum! {
     /// Recipient disposition, independent of transport receipt.
     pub enum MessageState {
         /// Action remains owed.
@@ -104,6 +123,25 @@ string_enum! {
         WorkChanged => "work_changed",
         /// A scheduled attention occurrence, not a business state change.
         AttentionDue => "attention_due",
+    }
+}
+string_enum! {
+    /// Current reason to reconsider a source, separate from its business state.
+    pub enum AttentionReason {
+        /// The current assignment was closed or transferred.
+        StopWork => "stop_work",
+        /// A request has not been observed in this binding.
+        UnreadRequest => "unread_request",
+        /// A final response is available for inspection.
+        ResponseAvailable => "response_available",
+        /// A current assignment revision changed.
+        AssignmentChanged => "assignment_changed",
+        /// A declared prerequisite qualified.
+        DependencyReady => "dependency_ready",
+        /// The decision authority must review overdue work.
+        ReviewDue => "review_due",
+        /// A bounded follow-up is due.
+        ReminderDue => "reminder_due",
     }
 }
 string_enum! {

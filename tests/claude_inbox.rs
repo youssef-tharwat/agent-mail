@@ -50,6 +50,8 @@ async fn socket_write_is_unconfirmed_until_matching_hook_and_cancellation_uses_p
     let store = Store::open(temp.path(), true).await?;
     store.enroll("g", None).await?;
     store.register("g", "worker", false).await?;
+    store.register("g", "writer", false).await?;
+    let writer = store.mailbox("g", "writer").await?;
     let actor = store.mailbox("g", "worker").await?;
     let session = Uuid::new_v4();
     store
@@ -67,7 +69,7 @@ async fn socket_write_is_unconfirmed_until_matching_hook_and_cancellation_uses_p
     let now = agent_mail::now()?;
     store
         .work_create(
-            &actor,
+            &writer,
             WorkDraft {
                 id: "task".into(),
                 scope: "Review".into(),
@@ -177,7 +179,7 @@ async fn socket_write_is_unconfirmed_until_matching_hook_and_cancellation_uses_p
     );
     store
         .update_work(
-            &actor,
+            &writer,
             "task",
             agent_mail::work::WorkUpdate {
                 version: 1,
@@ -220,6 +222,8 @@ async fn lost_hooks_keep_bounded_attempts_across_resume_and_identity_rotation() 
     let store = Store::open(temp.path(), true).await?;
     store.enroll("g", None).await?;
     store.register("g", "worker", false).await?;
+    store.register("g", "writer", false).await?;
+    let writer = store.mailbox("g", "writer").await?;
     let actor = store.mailbox("g", "worker").await?;
     let session = Uuid::new_v4();
     store
@@ -236,7 +240,7 @@ async fn lost_hooks_keep_bounded_attempts_across_resume_and_identity_rotation() 
         .await?;
     store
         .work_create(
-            &actor,
+            &writer,
             WorkDraft {
                 id: "task".into(),
                 scope: "Review".into(),

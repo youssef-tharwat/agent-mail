@@ -26,10 +26,6 @@ pub struct Notification {
     pub version: i64,
 }
 
-pub(crate) struct Delivery {
-    pub text: String,
-}
-
 impl Store {
     // Retrieval receipts stop transport retries, never resolve business requests.
     pub(crate) async fn retrieve_tx(
@@ -40,9 +36,12 @@ impl Store {
         version: i64,
     ) -> Result<()> {
         Self::retrieve_followup_tx(tx, actor, kind, subject, version, crate::now()?).await?;
-        if actor.binding.herdr().is_some() || kind == EventKind::AttentionDue {
+        {
             let kind = kind.as_str();
-            sqlx::query!("INSERT OR IGNORE INTO event_receipts(recipient,binding_version,event) SELECT recipient,?,id FROM coordination_events WHERE recipient=? AND kind=? AND subject=? AND version<=?",actor.binding_version,actor.id,kind,subject,version).execute(&mut **tx).await?;
+            let inserted=sqlx::query!("INSERT OR IGNORE INTO event_receipts(recipient,binding_version,event) SELECT recipient,?,id FROM coordination_events WHERE recipient=? AND kind=? AND subject=? AND version<=?",actor.binding_version,actor.id,kind,subject,version).execute(&mut **tx).await?.rows_affected();
+            if inserted > 0 {
+                sqlx::query!("UPDATE runtime_wakes SET attempts=0,next_attempt=0 WHERE recipient=? AND binding_version=? AND EXISTS(SELECT 1 FROM attention_dispatch d,json_each(d.items,'$.items') i WHERE d.recipient=? AND d.binding_version=? AND json_extract(i.value,'$.kind')=? AND json_extract(i.value,'$.subject')=? AND json_extract(i.value,'$.revision')<=?)",actor.id,actor.binding_version,actor.id,actor.binding_version,kind,subject,version).execute(&mut **tx).await?;
+            }
         }
         Ok(())
     }
@@ -67,16 +66,6 @@ impl Store {
         }
         tx.commit().await?;
         Ok(())
-    }
-
-    pub(crate) async fn herdr_attention(&self, actor: &Mailbox) -> Result<(bool, bool)> {
-        // Filter inside the subquery: a left join materializes the entire event
-        // view for each mailbox instead of using its recipient index.
-        let row = sqlx::query!("SELECT (SELECT MAX(e.id) FROM herdr_wake_events e WHERE e.recipient=b.id) AS 'latest?: i64',b.wake_attempted AS 'wake_attempted!: i64' FROM mailboxes b WHERE b.id=? AND b.binding_version=?",actor.id,actor.binding_version).fetch_one(self.pool()).await?;
-        Ok((
-            row.latest.is_some(),
-            row.latest.is_some_and(|id| id > row.wake_attempted),
-        ))
     }
 
     /// Replay a bounded page of unacknowledged events for this binding.
@@ -110,7 +99,7 @@ impl Store {
         Ok(rows)
     }
 
-    /// Report outstanding notifications and persisted hook emission budgets.
+    /// Report outstanding notifications and restored recovery epochs.
     ///
     /// # Errors
     /// The database queries fail.
@@ -122,9 +111,9 @@ impl Store {
     /// Database queries fail.
     pub async fn notification_status_for(&self, group: Option<&str>) -> Result<serde_json::Value> {
         let rows = sqlx::query!("SELECT b.group_name,b.name,b.binding_version,COUNT(e.id) AS count FROM mailboxes b JOIN coordination_events e ON e.recipient=b.id WHERE (? IS NULL OR b.group_name=?) AND b.remote_machine IS NULL AND NOT EXISTS(SELECT 1 FROM event_receipts r WHERE r.recipient=b.id AND r.binding_version=b.binding_version AND r.event=e.id) GROUP BY b.id ORDER BY b.id",group,group).fetch_all(self.pool()).await?;
-        let emissions = sqlx::query!("SELECT b.group_name,b.name,h.attempts,h.next_attempt,h.stop_used FROM hook_emissions h JOIN mailboxes b ON b.id=h.recipient AND b.binding_version=h.binding_version WHERE (? IS NULL OR b.group_name=?) ORDER BY h.next_attempt DESC LIMIT 20",group,group).fetch_all(self.pool()).await?;
+        let emissions = sqlx::query!("SELECT b.group_name,b.name FROM recovery_emissions h JOIN mailboxes b ON b.id=h.recipient AND b.binding_version=h.binding_version WHERE (? IS NULL OR b.group_name=?) ORDER BY b.id LIMIT 20",group,group).fetch_all(self.pool()).await?;
         Ok(
-            serde_json::json!({"unacknowledged":rows.into_iter().map(|r|serde_json::json!({"group":r.group_name,"participant":r.name,"binding_version":r.binding_version,"count":r.count})).collect::<Vec<_>>(),"hook_attempts":emissions.into_iter().map(|r|serde_json::json!({"group":r.group_name,"participant":r.name,"attempts":r.attempts,"next_attempt":r.next_attempt,"stop_used":r.stop_used,"delivery_confirmed":false})).collect::<Vec<_>>()}),
+            serde_json::json!({"unacknowledged":rows.into_iter().map(|r|serde_json::json!({"group":r.group_name,"participant":r.name,"binding_version":r.binding_version,"count":r.count})).collect::<Vec<_>>(),"recovery_epochs":emissions.into_iter().map(|r|serde_json::json!({"group":r.group_name,"participant":r.name,"delivery_confirmed":false})).collect::<Vec<_>>()}),
         )
     }
 
@@ -169,190 +158,37 @@ impl Store {
         ensure!(!session.is_empty(), "hook requires a client session ID");
         let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
-        sqlx::query!("DELETE FROM hook_emissions WHERE recipient=? AND binding_version=? AND client_session=?",actor.id,actor.binding_version,session).execute(&mut *tx).await?;
+        sqlx::query!("DELETE FROM recovery_emissions WHERE recipient=? AND binding_version=? AND client_session=?",actor.id,actor.binding_version,session).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
     }
 
     /// Whether this recovery epoch still needs the bundled operating instructions.
     pub async fn hook_needs_instructions(&self, actor: &Mailbox, session: &str) -> Result<bool> {
-        Ok(sqlx::query!("SELECT recipient FROM hook_emissions WHERE recipient=? AND binding_version=? AND client_session=?",actor.id,actor.binding_version,session).fetch_optional(self.pool()).await?.is_none())
+        Ok(sqlx::query!("SELECT recipient FROM recovery_emissions WHERE recipient=? AND binding_version=? AND client_session=?",actor.id,actor.binding_version,session).fetch_optional(self.pool()).await?.is_none())
     }
 
-    /// Reserve a bounded hook emission at the supplied Unix timestamp.
-    /// SessionStart always restores state, including after an ambiguous previous emission.
-    ///
-    /// # Errors
-    /// The session is invalid, the actor is stale, time overflows, or persistence fails.
-    pub async fn reserve_hook(
+    pub(crate) async fn reserve_recovery(
         &self,
         actor: &Mailbox,
-        session: &str,
+        session: &crate::names::SessionId,
         reset: bool,
-        stop: bool,
-        now: i64,
     ) -> Result<bool> {
-        bounded(session, 160, "client session")?;
-        ensure!(!session.is_empty(), "hook requires a client session ID");
+        let session = session.as_str();
         let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
-        sqlx::query!("INSERT OR IGNORE INTO hook_emissions(recipient,binding_version,client_session) VALUES(?,?,?)",actor.id,actor.binding_version,session)
-            .execute(&mut *tx).await?;
-        let latest = sqlx::query!(
-            "SELECT COALESCE(MAX(id),0) AS 'id!: i64' FROM coordination_events WHERE recipient=?",
-            actor.id
-        )
-        .fetch_one(&mut *tx)
-        .await?
-        .id;
-        let row = sqlx::query!("SELECT last_event,attempts,next_attempt,stop_used FROM hook_emissions WHERE recipient=? AND binding_version=? AND client_session=?",actor.id,actor.binding_version,session)
-            .fetch_one(&mut *tx).await?;
-        let changed = latest > row.last_event;
-        // One Stop continuation per recovery epoch, even if events keep arriving.
-        let actionable = sqlx::query!(
-            "SELECT id FROM wake_events WHERE recipient=? AND id>? LIMIT 1",
-            actor.id,
-            row.last_event
-        )
-        .fetch_optional(&mut *tx)
-        .await?
-        .is_some();
-        let emit = reset
-            || (stop && row.stop_used == 0 && actionable)
-            || (!stop && (changed || (row.attempts < 3 && now >= row.next_attempt)));
-        if emit {
-            let attempts = if reset || changed {
-                1
-            } else {
-                row.attempts + 1
-            };
-            let stop_used = if reset {
-                0
-            } else if stop {
-                1
-            } else {
-                row.stop_used
-            };
-            let next = now
-                .checked_add(300)
-                .ok_or_else(|| anyhow::anyhow!("clock overflow"))?;
-            sqlx::query!("UPDATE hook_emissions SET last_event=?,attempts=?,next_attempt=?,stop_used=? WHERE recipient=? AND binding_version=? AND client_session=?",latest,attempts,next,stop_used,actor.id,actor.binding_version,session)
-                .execute(&mut *tx).await?;
-        }
+        let inserted=sqlx::query!("INSERT OR IGNORE INTO recovery_emissions(recipient,binding_version,client_session) VALUES(?,?,?)",actor.id,actor.binding_version,session).execute(&mut *tx).await?.rows_affected();
         tx.commit().await?;
-        Ok(emit)
+        Ok(reset || inserted != 0)
     }
 }
 
 impl Store {
-    pub(crate) async fn needs_cancellation(&self, actor: &Mailbox, after: i64) -> Result<bool> {
-        Ok(sqlx::query!(
-            "SELECT id FROM cancellation_events WHERE recipient=? AND id>? LIMIT 1",
-            actor.id,
-            after
-        )
-        .fetch_optional(self.pool())
-        .await?
-        .is_some())
-    }
-    pub(crate) async fn needs_wake(&self, actor: &Mailbox, after: i64) -> Result<bool> {
-        Ok(sqlx::query!(
-            "SELECT id FROM wake_events WHERE recipient=? AND id>? LIMIT 1",
-            actor.id,
-            after
-        )
-        .fetch_optional(self.pool())
-        .await?
-        .is_some())
-    }
     pub(crate) async fn scan_passive(&self, actor: &Mailbox, through: i64) -> Result<()> {
         let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
         sqlx::query!("UPDATE runtime_wakes SET scanned=MAX(scanned,?) WHERE recipient=? AND binding_version=? AND NOT EXISTS(SELECT 1 FROM wake_events WHERE recipient=? AND id>scanned AND id<=?)",through,actor.id,actor.binding_version,actor.id,through).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
-    }
-}
-
-impl Store {
-    pub(crate) async fn delivery(
-        &self,
-        actor: &Mailbox,
-        challenge: Option<&str>,
-        after: i64,
-    ) -> Result<Delivery> {
-        Self::notification_text(
-            actor,
-            challenge,
-            self.latest_changes_since(actor, after).await?,
-            6000,
-        )
-    }
-
-    pub(crate) async fn herdr_notification_text(
-        &self,
-        actor: &Mailbox,
-        challenge: Option<&str>,
-    ) -> Result<String> {
-        let mut tx = self.pool().begin().await?;
-        Self::check_actor(&mut tx, actor).await?;
-        let events = sqlx::query_as!(Notification,"SELECT id,kind AS 'kind: EventKind',subject,version FROM herdr_wake_events WHERE recipient=? ORDER BY id DESC LIMIT 6",actor.id).fetch_all(&mut *tx).await?;
-        tx.commit().await?;
-        Ok(Self::notification_text(actor, challenge, events, 480)?.text)
-    }
-
-    fn notification_text(
-        actor: &Mailbox,
-        challenge: Option<&str>,
-        events: Vec<Notification>,
-        limit: usize,
-    ) -> Result<Delivery> {
-        let mut visible = events
-            .iter()
-            .rev()
-            .take(5)
-            .rev()
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut more = events.len() > visible.len();
-        loop {
-            let changes = crate::watch::Changes::collect(
-                visible
-                    .iter()
-                    .map(|event| (event.kind, event.subject.clone(), event.version)),
-            );
-            let payload = serde_json::json!({"new_mail":changes.new_mail,"mail_updates":changes.mail_updates,"tasks":changes.tasks,"followups":changes.followups,"more":more});
-            let instruction = "Agent Mail changes: fetch task/mail/attention IDs with show; act or checkpoint. More: context.\n";
-            let mut text = if limit > 480 {
-                format!(
-                    "{instruction}Stop only assignments that are closed or reassigned. Group: {}.\n{payload}",
-                    actor.group_name
-                )
-            } else {
-                format!("{instruction}{payload}")
-            };
-            if let Some(nonce) = challenge {
-                text.push('\n');
-                text.push_str(&crate::verification::challenge(actor, nonce));
-            }
-            if text.len() <= limit {
-                return Ok(Delivery { text });
-            }
-            if visible.is_empty() {
-                let mut recovery = String::from(
-                    "Agent Mail changes: run agent-mail context and attention list; fetch records, act or checkpoint.\n",
-                );
-                if let Some(nonce) = challenge {
-                    recovery.push_str(&crate::verification::challenge(actor, nonce));
-                }
-                ensure!(
-                    recovery.len() <= limit,
-                    "notification recovery instruction exceeds transport limit"
-                );
-                return Ok(Delivery { text: recovery });
-            }
-            visible.remove(0);
-            more = true;
-        }
     }
 }

@@ -34,11 +34,15 @@ fn server(listener: UnixListener, thread: Uuid) -> Server {
     let active = Arc::new(AtomicBool::new(false));
     let unloaded = Arc::new(AtomicBool::new(false));
     let absent = unloaded.clone();
+    let queued_ids = Arc::new(std::sync::Mutex::new(
+        std::collections::HashSet::<String>::new(),
+    ));
     let (count, loss, busy) = (received.clone(), lose.clone(), active.clone());
     let task = tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let absent = absent.clone();
             let loaded = loaded_response.clone();
+            let queued_ids = queued_ids.clone();
             let (count, loss, busy) = (count.clone(), loss.clone(), busy.clone());
             tokio::spawn(async move {
                 let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
@@ -74,6 +78,17 @@ fn server(listener: UnixListener, thread: Uuid) -> Server {
                                     .is_some_and(|id| id.starts_with("agent-mail-"))
                             );
                             assert_eq!(r["params"]["threadId"], thread.to_string());
+                            let message_id = r["params"]["clientUserMessageId"].as_str().unwrap();
+                            if !queued_ids.lock().unwrap().insert(message_id.to_owned()) {
+                                ws.send(Message::Text(
+                                    json!({"id":id,"result":{"queuedSubmission":{"id":"receipt"}}})
+                                        .to_string()
+                                        .into(),
+                                ))
+                                .await
+                                .unwrap();
+                                continue;
+                            }
                             let text = r["params"]["input"][0]["text"].as_str().unwrap();
                             assert!(
                                 text.len() <= 6000
@@ -120,6 +135,62 @@ fn server(listener: UnixListener, thread: Uuid) -> Server {
 }
 
 #[tokio::test]
+async fn distinct_attention_pages_use_distinct_runtime_queue_identities() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let socket = dir.path().join("codex.sock");
+    let thread = Uuid::new_v4();
+    let server = server(UnixListener::bind(&socket)?, thread);
+    let store = Store::open(dir.path(), true).await?;
+    store.enroll("g", None).await?;
+    store.register("g", "writer", false).await?;
+    store.register("g", "worker", false).await?;
+    let writer = store.mailbox("g", "writer").await?;
+    let worker = store.mailbox("g", "worker").await?;
+    store.attach_codex(&worker, &socket, thread).await?;
+    for i in 0..8 {
+        store
+            .work_create(
+                &writer,
+                WorkDraft {
+                    id: format!("task-{i}"),
+                    scope: "Review".into(),
+                    owner: "worker".into(),
+                    state: agent_mail::states::TaskState::Active,
+                    next_action: "Inspect evidence".into(),
+                    deadline: None,
+                    evidence: vec![],
+                },
+                1000,
+            )
+            .await?;
+    }
+    service::tick(&store, 1000).await?;
+    assert_eq!(server.received.load(Ordering::SeqCst), 1);
+    let prompt = server.loaded.lock().unwrap()["challenge"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let token = prompt
+        .split("attention acknowledge ")
+        .nth(1)
+        .unwrap()
+        .split('`')
+        .next()
+        .unwrap();
+    store.acknowledge_attention(&worker, token).await?;
+    assert_eq!(store.attention_snapshot(&worker).await?.items.len(), 3);
+    // No new coordination event arrives between these pages. A runtime deduplicates
+    // queue submissions by clientUserMessageId, so the reservation must identify it.
+    service::tick(&store, 1001).await?;
+    assert_eq!(
+        server.received.load(Ordering::SeqCst),
+        2,
+        "the second page must reach a deduplicating runtime"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn delivery_survives_restart_and_never_accepts_work_or_targets_a_replacement() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let socket = dir.path().join("codex.sock");
@@ -128,11 +199,13 @@ async fn delivery_survives_restart_and_never_accepts_work_or_targets_a_replaceme
     let store = Store::open(dir.path(), true).await?;
     store.enroll("g", None).await?;
     store.register("g", "worker", false).await?;
+    store.register("g", "writer", false).await?;
+    let writer = store.mailbox("g", "writer").await?;
     let actor = store.mailbox("g", "worker").await?;
     store.attach_codex(&actor, &socket, thread).await?;
     store
         .work_create(
-            &actor,
+            &writer,
             WorkDraft {
                 id: "task".into(),
                 scope: "Review".into(),
@@ -172,6 +245,18 @@ async fn delivery_survives_restart_and_never_accepts_work_or_targets_a_replaceme
     store.acknowledge_delivery(&actor, nonce, 1001).await?;
     agent_mail::verification::reconcile(&store, 1002).await?;
     assert_eq!(server.received.load(Ordering::SeqCst), 1);
+    assert!(
+        !store.notifications(&actor, 0).await?.is_empty(),
+        "queue acceptance and a route challenge do not receipt a batch"
+    );
+    let token = prompt
+        .split("attention acknowledge ")
+        .nth(1)
+        .unwrap()
+        .split('`')
+        .next()
+        .unwrap();
+    store.acknowledge_attention(&actor, token).await?;
     assert!(store.notifications(&actor, 0).await?.is_empty());
     assert!(store.work_show(&actor, "task").await?.state.is_open());
     store.close().await;
@@ -199,11 +284,13 @@ async fn lost_receipts_use_durable_bounded_retries_and_pause_is_respected() -> R
     let store = Store::open(dir.path(), true).await?;
     store.enroll("g", None).await?;
     store.register("g", "worker", false).await?;
+    store.register("g", "writer", false).await?;
+    let writer = store.mailbox("g", "writer").await?;
     let actor = store.mailbox("g", "worker").await?;
     store.attach_codex(&actor, &socket, thread).await?;
     store
         .work_create(
-            &actor,
+            &writer,
             WorkDraft {
                 id: "task".into(),
                 scope: "Review".into(),
@@ -225,17 +312,28 @@ async fn lost_receipts_use_durable_bounded_retries_and_pause_is_respected() -> R
     }
     assert_eq!(server.received.load(Ordering::SeqCst), 3);
     assert!(!store.notifications(&actor, 0).await?.is_empty());
-    assert!(store.work_show(&actor, "task").await?.state.is_open());
     store.rearm("g", "worker").await?;
     server.lose.store(false, Ordering::SeqCst);
     service::tick(&store, 2000).await?;
     assert_eq!(server.received.load(Ordering::SeqCst), 4);
+    let prompt = server.loaded.lock().unwrap()["challenge"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let token = prompt
+        .split("attention acknowledge ")
+        .nth(1)
+        .unwrap()
+        .split('`')
+        .next()
+        .unwrap();
+    store.acknowledge_attention(&actor, token).await?;
     assert!(store.notifications(&actor, 0).await?.is_empty());
     // A new revision preserves an older uncertain attempt's cooldown.
     server.lose.store(true, Ordering::SeqCst);
     store
         .update_work(
-            &actor,
+            &writer,
             "task",
             agent_mail::work::WorkUpdate {
                 version: 1,
@@ -253,7 +351,7 @@ async fn lost_receipts_use_durable_bounded_retries_and_pause_is_respected() -> R
     assert_eq!(server.received.load(Ordering::SeqCst), 5);
     store
         .update_work(
-            &actor,
+            &writer,
             "task",
             agent_mail::work::WorkUpdate {
                 version: 2,
@@ -617,6 +715,15 @@ async fn duplicate_and_fresh_wakes_preserve_uncertainty_and_escalate_to_coordina
     }
     // The fresh event starts a new bounded budget after the original reservation expires.
     assert_eq!(server.received.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        store.attention_list(&writer, 0).await?["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "the fresh batch still has its final receipt window"
+    );
+    service::tick(&store, 2200).await?;
     let escalations = store.attention_list(&writer, 0).await?;
     assert_eq!(escalations["items"].as_array().unwrap().len(), 2);
     assert_eq!(

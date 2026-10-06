@@ -108,6 +108,18 @@ async fn claude_uses_shared_delivery_recovery_cancellation_and_retry_rules() -> 
         .context("Claude wake challenge nonce missing")?
         .parse()?;
     store.acknowledge_delivery(&owner, nonce, 1002).await?;
+    assert!(
+        !store.attention_snapshot(&owner).await?.items.is_empty(),
+        "queue acceptance is not ingestion"
+    );
+    let token = prompt
+        .split("attention acknowledge ")
+        .nth(1)
+        .context("batch receipt instruction missing")?
+        .split('`')
+        .next()
+        .unwrap();
+    store.acknowledge_attention(&owner, token).await?;
     assert!(store.work_show(&owner, "task").await?.state.is_open());
     assert!(store.notifications(&owner, 0).await?.is_empty());
     store.close().await;

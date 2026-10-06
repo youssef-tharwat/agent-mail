@@ -140,6 +140,7 @@ async fn successor_recovers_pinned_contract_without_mailbox_impersonation() -> R
         .publish(
             &writer,
             Publish {
+                intent: agent_mail::states::MessageIntent::Request,
                 recipients: vec!["old-owner".into()],
                 key: "private".into(),
                 summary: "Private".into(),
@@ -252,6 +253,7 @@ async fn remote_successor_reads_pinned_revision_and_rejects_forged_snapshot() ->
         .exchange(
             home_id,
             Exchange {
+                capabilities: agent_mail::relay::capabilities(),
                 incoming: events.clone(),
                 ack: vec![],
             },
@@ -262,6 +264,7 @@ async fn remote_successor_reads_pinned_revision_and_rejects_forged_snapshot() ->
         .exchange(
             home_id,
             Exchange {
+                capabilities: agent_mail::relay::capabilities(),
                 incoming: events.clone(),
                 ack: vec![],
             },
@@ -298,6 +301,7 @@ async fn remote_successor_reads_pinned_revision_and_rejects_forged_snapshot() ->
         home.exchange(
             remote_id,
             Exchange {
+                capabilities: agent_mail::relay::capabilities(),
                 incoming: vec![forged],
                 ack: vec![]
             },
@@ -369,6 +373,7 @@ async fn multiple_maximum_size_snapshots_drain_within_wire_budget() -> Result<()
         assert!(events.len() < 8);
         assert!(
             serde_json::to_vec(&Exchange {
+                capabilities: agent_mail::relay::capabilities(),
                 incoming: home.export().await?,
                 ack: vec![uuid::Uuid::new_v4(); 16]
             })?
@@ -376,6 +381,7 @@ async fn multiple_maximum_size_snapshots_drain_within_wire_budget() -> Result<()
                 <= 256 * 1024
         );
         let request = Exchange {
+            capabilities: agent_mail::relay::capabilities(),
             incoming: events.clone(),
             ack: vec![],
         };
@@ -385,6 +391,7 @@ async fn multiple_maximum_size_snapshots_drain_within_wire_budget() -> Result<()
         home.exchange(
             remote_id,
             Exchange {
+                capabilities: agent_mail::relay::capabilities(),
                 incoming: vec![],
                 ack: receipt.ack,
             },

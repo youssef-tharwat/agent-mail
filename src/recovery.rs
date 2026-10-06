@@ -58,6 +58,9 @@ impl Store {
             checkpoints.push(json!({"task":item.id,"version":plan["version"],"next_check_at":plan["next_check"],"checkpoint_recorded":!plan["checkpoint"].is_null(),"coordination":self.task_coordination_context(actor, &item.id).await?,"details":"task show"}));
         }
         for item in &mails {
+            if !item.intent.is_request() {
+                continue;
+            }
             let plan = self.source_followup(actor, None, Some(item.id)).await?;
             checkpoints.push(json!({"mail":item.id,"version":plan["version"],"next_check_at":plan["next_check"],"checkpoint_recorded":!plan["checkpoint"].is_null(),"details":"mail show"}));
         }

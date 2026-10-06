@@ -12,7 +12,7 @@ use crate::{
     now,
     store::{Group, Pending, Store},
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -178,7 +178,8 @@ async fn session_tick_inner(
                 continue;
             }
             let binding = store.mailbox(&group.name, &item.name).await?;
-            let (attention, fresh) = store.herdr_attention(&binding).await?;
+            let attention = store.attention_snapshot(&binding).await?;
+            let candidates = store.attention_candidates(&binding, time).await?;
             let mut detail = None;
             let state = if let Some(agent) = agents.iter().find(|a| {
                 binding
@@ -186,16 +187,16 @@ async fn session_tick_inner(
                     .herdr()
                     .is_some_and(|bound| a.pane_id == bound.pane)
             }) {
-                if !attention {
+                if attention.items.is_empty() {
                     DeliveryState::Settled
                 } else if !agent.matches(&binding) {
                     DeliveryState::BindingMismatch
                 } else if let Some(reason) = agent.readiness_reason() {
                     detail = Some(reason.into());
                     DeliveryState::Busy
-                } else if item.attempts >= 3 && !fresh {
+                } else if candidates.is_empty() && item.attempts >= 3 && item.next_wake <= time {
                     DeliveryState::Exhausted
-                } else if item.next_wake > time {
+                } else if candidates.is_empty() {
                     DeliveryState::Waiting
                 } else {
                     wake(store, socket, &binding, time)
@@ -249,9 +250,12 @@ async fn wake(
     if !herdr::plugin_enabled(socket).await? {
         return Ok(DeliveryState::PluginDisabled);
     }
-    if !store.reserve(binding, time).await? {
+    let Some(batch) = store
+        .claim_attention(binding, crate::names::DeliveryConsumer::Herdr, time)
+        .await?
+    else {
         return Ok(DeliveryState::Ineligible);
-    }
+    };
     let challenge = match store.reserve_delivery_challenge(binding, time).await {
         Ok(challenge) => challenge,
         Err(error) => {
@@ -262,15 +266,36 @@ async fn wake(
             None
         }
     };
-    let text = store
-        .herdr_notification_text(binding, challenge.as_deref())
-        .await?;
+    let mut text = Store::attention_text(&batch, true)?;
+    if let Some(nonce) = challenge.as_deref() {
+        text.push('\n');
+        text.push_str(&crate::verification::challenge(binding, nonce));
+    }
+    ensure!(
+        text.len() <= 480,
+        "Herdr attention exceeds terminal prompt budget"
+    );
+    let mut tx = store.pool().begin().await?;
+    Store::lock_actor(&mut tx, binding).await?;
+    if sqlx::query_scalar!(
+        "SELECT paused<>0 OR auto_prompt=0 AS 'held!: i64' FROM groups WHERE name=?",
+        binding.group_name
+    )
+    .fetch_one(&mut *tx)
+    .await?
+        != 0
+        || !Store::validate_attention_tx(&mut tx, binding, &batch).await?
+    {
+        tx.commit().await?;
+        return Ok(DeliveryState::StateChanged);
+    }
     herdr::call(
         socket,
         "agent.prompt",
         json!({"target": target.pane, "text": text}),
     )
     .await?;
+    tx.commit().await?;
     let recorded = if let Some(nonce) = challenge.as_deref() {
         store.record_delivery_challenge(binding, nonce, time).await
     } else {
@@ -406,8 +431,22 @@ pub async fn run(store: &Store, once: bool) -> Result<()> {
     let mut relay_jobs = JoinSet::<Result<Vec<Value>>>::new();
     let mut relay_report = Vec::new();
     let mut verification_jobs = JoinSet::new();
+    let mut external_jobs = JoinSet::new();
     loop {
         let time = now()?;
+        while let Some(job) = external_jobs.try_join_next() {
+            match job {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("agent-mail: external conditions: {error:#}"),
+                Err(error) => eprintln!("agent-mail: external conditions task: {error}"),
+            }
+        }
+        if once {
+            crate::external::refresh(store, time).await?;
+        } else if external_jobs.is_empty() {
+            let state = store.clone();
+            external_jobs.spawn(async move { crate::external::refresh(&state, time).await });
+        }
         while verification_jobs.try_join_next().is_some() {}
         if verification_jobs.is_empty() {
             let state = store.clone();
@@ -490,6 +529,8 @@ pub async fn run(store: &Store, once: bool) -> Result<()> {
     }
     verification_jobs.abort_all();
     while verification_jobs.join_next().await.is_some() {}
+    external_jobs.abort_all();
+    while external_jobs.join_next().await.is_some() {}
     relay_jobs.abort_all();
     while relay_jobs.join_next().await.is_some() {}
     if let Some(server) = stream {

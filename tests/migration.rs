@@ -9,6 +9,105 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::fs;
 
 #[tokio::test]
+async fn version_twenty_three_preserves_pending_replies_and_consumed_budgets() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("state");
+    let migrations = temp.path().join("old-migrations");
+    fs::create_dir_all(&root)?;
+    fs::create_dir_all(&migrations)?;
+    for entry in fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let name = filename.to_str().unwrap();
+        if name.ends_with(".sql") && name[..4].parse::<u32>()? <= 23 {
+            fs::copy(entry.path(), migrations.join(name))?;
+        }
+    }
+    let pool = SqlitePoolOptions::new()
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(root.join("mail.db"))
+                .create_if_missing(true),
+        )
+        .await?;
+    sqlx::migrate::Migrator::new(migrations.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+    sqlx::raw_sql(r#"
+        INSERT INTO node VALUES ('00000000-0000-4000-8000-000000000001');
+        INSERT INTO groups(name,socket,home_machine) VALUES ('g','','00000000-0000-4000-8000-000000000001');
+        INSERT INTO mailboxes(id,group_name,name,binding) VALUES
+          (1,'g','requester','{"runtime":"standalone","session":"00000000-0000-4000-8000-000000000002"}'),
+          (2,'g','responder','{"runtime":"standalone","session":"00000000-0000-4000-8000-000000000003"}');
+        INSERT INTO messages(id,sender,dedup_key,canonical,summary,body,created,due) VALUES (1,1,'request','stored-request','Request','Original',100,100);
+        INSERT INTO deliveries(message,recipient) VALUES (1,2);
+        INSERT INTO messages(id,sender,dedup_key,canonical,summary,body,created,due,reply_to) VALUES (2,2,'reply','stored-reply','Reply','Answer',101,101,1);
+        INSERT INTO deliveries(message,recipient) VALUES (2,1);
+        UPDATE deliveries SET state='resolved',reply_id=2,resolution='answered' WHERE message=1;
+        UPDATE mailboxes SET attempts=3,next_wake=400,wake_attempted=(SELECT MAX(id) FROM herdr_wake_events WHERE recipient=1) WHERE id=1;
+        INSERT INTO runtime_wakes(recipient,binding_version,socket,thread,runtime,attempted,attempts,next_attempt)
+          SELECT 1,1,'/tmp/unused-runtime.sock','00000000-0000-4000-8000-000000000004','claude',MAX(id),3,400 FROM herdr_wake_events WHERE recipient=1;
+        INSERT INTO claude_inboxes(recipient,token,socket_identity,activity,pending_id,pending_event) VALUES (1,'fixture','fixture','idle','queued-before-batches',1);
+        INSERT INTO hook_emissions(recipient,binding_version,client_session) VALUES (1,1,'old-session');
+    "#).execute(&pool).await?;
+    pool.close().await;
+    let store = upgrade::open(&root, OpenMode::Existing).await?;
+    let pool = support::pool(&store).await?;
+    let actor = store.mailbox("g", "requester").await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT canonical FROM messages WHERE id=2")
+            .fetch_one(&pool)
+            .await?,
+        "stored-reply"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE intent='request'")
+            .fetch_one(&pool)
+            .await?,
+        2,
+        "stored replies retain their recorded obligations"
+    );
+    assert_eq!(store.inbox(&actor, 0).await?[0].id, 2);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT attempts FROM attention_attempts WHERE recipient=1")
+            .fetch_one(&pool)
+            .await?,
+        3
+    );
+    assert!(
+        store
+            .claim_attention(&actor, agent_mail::names::DeliveryConsumer::Native, 1000)
+            .await?
+            .is_none(),
+        "migration cannot restart exhausted work"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT pending_id FROM claude_inboxes WHERE recipient=1"
+        )
+        .fetch_one(&pool)
+        .await?,
+        None
+    );
+    assert!(store.hook_needs_instructions(&actor, "old-session").await?);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM event_receipts")
+            .fetch_one(&pool)
+            .await?,
+        0,
+        "migration cannot fabricate receipt evidence"
+    );
+    assert!(
+        sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn version_twenty_two_adds_wake_indexes_without_changing_events_or_receipts() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path().join("state");
@@ -98,7 +197,7 @@ async fn version_twenty_two_adds_wake_indexes_without_changing_events_or_receipt
         sqlx::query_scalar::<_, i64>("PRAGMA user_version")
             .fetch_one(&pool)
             .await?,
-        23
+        24
     );
     assert!(
         sqlx::query("PRAGMA foreign_key_check")
@@ -147,7 +246,7 @@ async fn existing_version_four_state_upgrades_to_opt_in_sync() -> Result<()> {
     let version = sqlx::query!("PRAGMA user_version")
         .fetch_one(&support::pool(&store).await?)
         .await?;
-    assert_eq!(version.user_version, Some(23));
+    assert_eq!(version.user_version, Some(24));
     let peer = uuid::Uuid::new_v4();
     store.add_peer(peer, "test-host").await?;
     assert!(!store.peers_status().await?[0].auto_sync);
@@ -486,7 +585,7 @@ async fn version_sixteen_upgrades_without_changing_business_or_legacy_budgets() 
             .fetch_one(&pool)
             .await?
             .user_version,
-        Some(23)
+        Some(24)
     );
     Ok(())
 }
@@ -545,7 +644,7 @@ async fn automatic_open_never_initializes_missing_state_or_downgrades() -> Resul
     let pool = SqlitePoolOptions::new()
         .connect_with(SqliteConnectOptions::new().filename(root.join("mail.db")))
         .await?;
-    sqlx::query!("PRAGMA user_version=24")
+    sqlx::query!("PRAGMA user_version=25")
         .execute(&pool)
         .await?;
     pool.close().await;

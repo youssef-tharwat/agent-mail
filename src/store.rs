@@ -169,6 +169,12 @@ impl Drop for DatabaseGuard {
 /// Message content, recipients, and associations validated when publishing.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Publish {
+    /// Explicit effect; omission retains legacy request behavior.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::states::MessageIntent::is_request"
+    )]
+    pub intent: crate::states::MessageIntent,
     /// Participant names receiving this message.
     pub recipients: Vec<String>,
     /// Caller-supplied idempotency key; retries must preserve their original content.
@@ -191,6 +197,14 @@ impl Publish {
     /// # Errors
     /// Recipients, payload lengths, reply timing, or identifiers are invalid.
     pub fn normalize(&mut self) -> Result<()> {
+        ensure!(
+            self.intent.is_request() || self.due_after.is_none(),
+            "only requests may have a business deadline"
+        );
+        ensure!(
+            self.intent != crate::states::MessageIntent::Response || self.reply_to.is_some(),
+            "a response must reference its request"
+        );
         self.recipients.sort();
         self.recipients.dedup();
         ensure!(
@@ -220,6 +234,8 @@ impl Publish {
 /// A message summary for an unresolved inbox delivery.
 #[derive(Debug, Serialize)]
 pub struct InboxItem {
+    /// Whether this communication creates a response obligation.
+    pub intent: crate::states::MessageIntent,
     /// Persistent identifier for this record.
     pub id: i64,
     /// Name of the participant that published this message.
@@ -237,6 +253,8 @@ pub struct InboxItem {
 /// Message content and the recipient’s current delivery disposition.
 #[derive(Debug, Serialize)]
 pub struct Message {
+    /// Whether this communication creates a response obligation.
+    pub intent: crate::states::MessageIntent,
     /// Persistent identifier for this record.
     pub id: i64,
     /// Name of the participant that published this message.
@@ -281,7 +299,7 @@ pub struct Pending {
 }
 
 /// Schema understood by this binary.
-pub(crate) const SCHEMA_VERSION: i64 = 23;
+pub(crate) const SCHEMA_VERSION: i64 = 24;
 
 impl Store {
     /// Open a database, optionally creating and migrating its schema.
@@ -713,6 +731,14 @@ impl Store {
             );
             return Ok(existing.id);
         }
+        if publish.intent == crate::states::MessageIntent::Response {
+            let parent = sqlx::query!("SELECT m.sender,b.name FROM messages m JOIN mailboxes b ON b.id=m.sender JOIN deliveries d ON d.message=m.id WHERE m.id=? AND d.recipient=? AND m.intent='request'",publish.reply_to,actor.id)
+                .fetch_optional(&mut **tx).await?.context("response requires a request addressed to this agent")?;
+            ensure!(
+                publish.recipients == [parent.name],
+                "a response must address the original requester"
+            );
+        }
         let mut recipient_ids = Vec::new();
         if let Some(work_id) = &publish.work_id {
             ensure!(
@@ -752,8 +778,9 @@ impl Store {
             .transpose()?;
         let legacy_due = due.unwrap_or(now);
         let global_id = uuid::Uuid::new_v4().to_string();
-        let result = sqlx::query!("INSERT INTO messages(sender,dedup_key,canonical,summary,body,created,due,reply_to,work_id,global_id,deadline) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            actor.id, publish.key, canonical, publish.summary, publish.body, now, legacy_due, publish.reply_to, publish.work_id, global_id, due).execute(&mut **tx).await?;
+        let intent = publish.intent.as_str();
+        let result = sqlx::query!("INSERT INTO messages(sender,dedup_key,canonical,summary,body,created,due,reply_to,work_id,global_id,deadline,intent) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            actor.id, publish.key, canonical, publish.summary, publish.body, now, legacy_due, publish.reply_to, publish.work_id, global_id, due,intent).execute(&mut **tx).await?;
         let id = result.last_insert_rowid();
         for recipient in recipient_ids {
             sqlx::query!(
@@ -789,8 +816,8 @@ impl Store {
         let mut tx = self.pool().begin().await?;
         Self::check_actor(&mut tx, actor).await?;
         let items = sqlx::query_as!(InboxItem,
-            "SELECT m.id, b.name AS sender, m.summary, m.created, m.deadline AS due, m.work_id FROM deliveries d JOIN messages m ON m.id=d.message JOIN mailboxes b ON b.id=m.sender WHERE d.recipient=? AND d.state='pending' AND m.id>? ORDER BY m.id LIMIT 6",
-            actor.id, after).fetch_all(&mut *tx).await?;
+            "SELECT m.intent AS 'intent: crate::states::MessageIntent',m.id, b.name AS sender, m.summary, m.created, m.deadline AS due, m.work_id FROM deliveries d JOIN messages m ON m.id=d.message JOIN mailboxes b ON b.id=m.sender WHERE d.recipient=? AND d.state='pending' AND m.id>? AND (m.intent='request' OR NOT EXISTS(SELECT 1 FROM message_observations o WHERE o.message=m.id AND o.recipient=d.recipient AND o.binding_version=?)) ORDER BY m.id LIMIT 6",
+            actor.id, after,actor.binding_version).fetch_all(&mut *tx).await?;
         tx.commit().await?;
         Ok(items)
     }
@@ -803,7 +830,7 @@ impl Store {
         let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
         let item = sqlx::query_as!(Message,
-            "SELECT m.id,b.name AS sender,m.summary,m.body,m.created,m.deadline AS due,d.state AS 'state: MessageState',d.reply_id,m.work_id FROM messages m JOIN deliveries d ON d.message=m.id JOIN mailboxes b ON b.id=m.sender WHERE m.id=? AND d.recipient=?",
+            "SELECT m.intent AS 'intent: crate::states::MessageIntent',m.id,b.name AS sender,m.summary,m.body,m.created,m.deadline AS due,d.state AS 'state: MessageState',d.reply_id,m.work_id FROM messages m JOIN deliveries d ON d.message=m.id JOIN mailboxes b ON b.id=m.sender WHERE m.id=? AND d.recipient=?",
             id, actor.id).fetch_optional(&mut *tx).await?.context("message is not in this inbox")?;
         Self::retrieve_tx(
             &mut tx,
@@ -813,6 +840,7 @@ impl Store {
             0,
         )
         .await?;
+        sqlx::query!("INSERT OR IGNORE INTO message_observations(message,recipient,binding_version) VALUES(?,?,?)",id,actor.id,actor.binding_version).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(item)
     }
@@ -848,18 +876,30 @@ impl Store {
         bounded(note, SUMMARY_LIMIT, "resolution")?;
         let resolution = serde_json::to_string(&(note, &reply))?;
         let d = sqlx::query!(
-            "SELECT state AS 'state: MessageState',resolution,reply_id FROM deliveries WHERE message=? AND recipient=?",
+            "SELECT d.state AS 'state: MessageState',d.resolution,d.reply_id,m.intent AS 'intent: crate::states::MessageIntent' FROM deliveries d JOIN messages m ON m.id=d.message WHERE d.message=? AND d.recipient=?",
             id,
             actor.id
         )
         .fetch_optional(&mut **tx)
         .await?
         .context("message is not in this inbox")?;
+        ensure!(
+            d.intent.is_request(),
+            "notices and responses have no business disposition; use mail show to record observation"
+        );
         if d.state == MessageState::Resolved {
             ensure!(
                 d.resolution.as_deref() == Some(resolution.as_str()),
                 "message already resolved with a different disposition"
             );
+            Self::retrieve_tx(
+                tx,
+                actor,
+                crate::states::EventKind::MailPending,
+                &id.to_string(),
+                0,
+            )
+            .await?;
             return Ok(d.reply_id);
         }
         ensure!(
@@ -878,6 +918,7 @@ impl Store {
                 summary.pop();
             }
             let mut p = Publish {
+                intent: crate::states::MessageIntent::Response,
                 recipients: vec![sender.name],
                 key,
                 summary,
@@ -888,7 +929,7 @@ impl Store {
             };
             Some(Self::publish_tx(tx, actor, &mut p, now).await?)
         } else {
-            None
+            d.reply_id
         };
         sqlx::query!("UPDATE deliveries SET state='resolved',resolution=?,reply_id=? WHERE message=? AND recipient=?",
             resolution, reply_id, id, actor.id).execute(&mut **tx).await?;
@@ -913,6 +954,14 @@ impl Store {
             )
             .await?;
         }
+        Self::retrieve_tx(
+            tx,
+            actor,
+            crate::states::EventKind::MailPending,
+            &id.to_string(),
+            0,
+        )
+        .await?;
         Self::reset_empty(tx, &actor.group_name).await?;
         Ok(reply_id)
     }
@@ -966,7 +1015,7 @@ impl Store {
     }
 
     pub(crate) async fn reset_empty(tx: &mut Transaction<'_, Sqlite>, group: &str) -> Result<()> {
-        sqlx::query!("UPDATE mailboxes SET attempts=0,next_wake=0,alerted=0 WHERE group_name=? AND NOT EXISTS(SELECT 1 FROM deliveries WHERE recipient=mailboxes.id AND state='pending') AND NOT EXISTS(SELECT 1 FROM pending_work_events WHERE recipient=mailboxes.id)", group)
+        sqlx::query!("UPDATE mailboxes SET attempts=0,next_wake=0,alerted=0 WHERE group_name=? AND NOT EXISTS(SELECT 1 FROM deliveries d JOIN messages m ON m.id=d.message WHERE d.recipient=mailboxes.id AND m.intent='request' AND d.state='pending') AND NOT EXISTS(SELECT 1 FROM pending_work_events WHERE recipient=mailboxes.id)", group)
             .execute(&mut **tx).await?;
         Ok(())
     }
@@ -977,19 +1026,8 @@ impl Store {
     /// The database query fails.
     pub async fn pending(&self) -> Result<Vec<Pending>> {
         Ok(sqlx::query_as!(Pending,
-            "SELECT b.id AS 'id!: i64',b.group_name AS 'group_name!: String',b.name AS 'name!: String',COUNT(*) AS 'pending!: i64',MIN(m.created) AS 'oldest!: i64',MIN(m.due) AS 'due?: i64',b.attempts AS 'attempts!: i64',b.next_wake AS 'next_wake!: i64',b.alerted AS 'alerted!: i64' FROM mailboxes b JOIN (SELECT d.recipient,m.created,m.deadline AS due FROM deliveries d JOIN messages m ON m.id=d.message WHERE d.state='pending' UNION ALL SELECT recipient,created,created+900 AS due FROM pending_work_events) m ON m.recipient=b.id WHERE b.remote_machine IS NULL AND b.agent_state='registered' GROUP BY b.id ORDER BY b.group_name,b.id")
+            "SELECT b.id AS 'id!: i64',b.group_name AS 'group_name!: String',b.name AS 'name!: String',COUNT(*) AS 'pending!: i64',MIN(m.created) AS 'oldest!: i64',MIN(m.due) AS 'due?: i64',b.attempts AS 'attempts!: i64',b.next_wake AS 'next_wake!: i64',b.alerted AS 'alerted!: i64' FROM mailboxes b JOIN (SELECT d.recipient,m.created,m.deadline AS due FROM deliveries d JOIN messages m ON m.id=d.message WHERE d.state='pending' AND (m.intent='request' OR (m.intent='response' AND NOT EXISTS(SELECT 1 FROM event_receipts r JOIN coordination_events e ON e.id=r.event JOIN mailboxes recipient ON recipient.id=d.recipient WHERE r.recipient=d.recipient AND r.binding_version=recipient.binding_version AND e.kind='mail_pending' AND e.subject=CAST(m.id AS TEXT)))) UNION ALL SELECT recipient,created,created+900 AS due FROM pending_work_events UNION ALL SELECT recipient,created,NULL AS due FROM attention_events WHERE reason='stop_work') m ON m.recipient=b.id WHERE b.remote_machine IS NULL AND b.agent_state='registered' GROUP BY b.id ORDER BY b.group_name,b.id")
             .fetch_all(self.pool()).await?)
-    }
-
-    /// Reserve a reminder attempt at the supplied Unix timestamp.
-    ///
-    /// # Errors
-    /// The database update fails; an ineligible reservation returns false.
-    pub async fn reserve(&self, actor: &Mailbox, now: i64) -> Result<bool> {
-        let next = now.checked_add(300).context("clock overflow")?;
-        let result = sqlx::query!("UPDATE mailboxes SET attempts=CASE WHEN wake_attempted<(SELECT MAX(id) FROM herdr_wake_events WHERE recipient=mailboxes.id) THEN 1 ELSE attempts+1 END,wake_attempted=MAX(wake_attempted,(SELECT MAX(id) FROM herdr_wake_events WHERE recipient=mailboxes.id)),next_wake=?,alerted=CASE WHEN wake_attempted=(SELECT MAX(id) FROM herdr_wake_events WHERE recipient=mailboxes.id) THEN alerted ELSE 0 END WHERE id=? AND binding_version=? AND agent_state='registered' AND pane IS NOT NULL AND (attempts<3 OR wake_attempted<(SELECT MAX(id) FROM herdr_wake_events WHERE recipient=mailboxes.id)) AND next_wake<=? AND EXISTS(SELECT 1 FROM groups WHERE name=mailboxes.group_name AND paused=0 AND auto_prompt=1) AND EXISTS(SELECT 1 FROM herdr_wake_events WHERE recipient=mailboxes.id)",
-            next, actor.id, actor.binding_version, now).execute(self.pool()).await?;
-        Ok(result.rows_affected() == 1)
     }
 
     /// Reserve an operator alert for overdue or exhausted delivery attempts.
@@ -997,8 +1035,13 @@ impl Store {
     /// # Errors
     /// The database update fails; an already reserved or ineligible alert returns false.
     pub async fn reserve_alert(&self, id: i64, now: i64) -> Result<bool> {
-        let result = sqlx::query!("UPDATE mailboxes SET alerted=1 WHERE id=? AND alerted=0 AND (EXISTS(SELECT 1 FROM deliveries d JOIN messages m ON m.id=d.message WHERE d.recipient=mailboxes.id AND d.state='pending' AND (m.deadline<=? OR (mailboxes.attempts>=3 AND mailboxes.wake_attempted>=(SELECT MAX(id) FROM herdr_wake_events WHERE recipient=mailboxes.id)))) OR EXISTS(SELECT 1 FROM pending_work_events WHERE recipient=mailboxes.id AND (created+900<=? OR (mailboxes.attempts>=3 AND mailboxes.wake_attempted>=(SELECT MAX(id) FROM herdr_wake_events WHERE recipient=mailboxes.id)))))", id, now, now).execute(self.pool()).await?;
-        Ok(result.rows_affected() == 1)
+        let mut tx = self.pool().begin().await?;
+        let result = sqlx::query!("UPDATE mailboxes SET alerted=1 WHERE id=? AND ((alerted=0 AND (EXISTS(SELECT 1 FROM deliveries d JOIN messages m ON m.id=d.message WHERE d.recipient=mailboxes.id AND d.state='pending' AND m.intent='request' AND m.deadline<=?) OR EXISTS(SELECT 1 FROM pending_work_events WHERE recipient=mailboxes.id AND created+900<=?))) OR EXISTS(SELECT 1 FROM attention_events e JOIN attention_attempts a ON a.recipient=e.recipient AND a.binding_version=mailboxes.binding_version AND a.event=e.id WHERE e.recipient=mailboxes.id AND a.attempts>=3 AND a.next_attempt<=? AND a.alerted=0))", id, now, now,now).execute(&mut *tx).await?;
+        if result.rows_affected() != 0 {
+            sqlx::query!("UPDATE attention_attempts SET alerted=1 WHERE recipient=? AND binding_version=(SELECT binding_version FROM mailboxes WHERE id=?) AND attempts>=3 AND next_attempt<=? AND EXISTS(SELECT 1 FROM attention_events e WHERE e.id=attention_attempts.event AND e.recipient=attention_attempts.recipient)",id,id,now).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(result.rows_affected() != 0)
     }
 
     /// Reset notification and verification budgets without changing identity, policy or work.
@@ -1009,6 +1052,12 @@ impl Store {
         let actor = self.mailbox(group, participant).await?;
         let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, &actor).await?;
+        sqlx::query!("DELETE FROM attention_dispatch WHERE recipient=?", actor.id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query!("DELETE FROM attention_attempts WHERE recipient=?", actor.id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query!(
             "UPDATE mailboxes SET attempts=0,next_wake=0,alerted=0 WHERE id=?",
             actor.id

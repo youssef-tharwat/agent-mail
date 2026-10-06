@@ -63,6 +63,7 @@ async fn overlapping_names_and_large_fleets_do_not_mix_context_or_status() -> Re
         .publish(
             &a,
             Publish {
+                intent: agent_mail::states::MessageIntent::Request,
                 recipients: vec!["worker".into()],
                 key: "one".into(),
                 summary: "private-awp".into(),

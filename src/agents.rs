@@ -113,7 +113,7 @@ impl Store {
                 work.count == 0 && snapshots.count == 0,
                 "agent has open tasks; close or transfer obligations first"
             );
-            let mail=sqlx::query!("SELECT COUNT(*) AS count FROM deliveries d JOIN messages m ON m.id=d.message WHERE d.state='pending' AND (d.recipient=? OR m.sender=?)",row.id,row.id).fetch_one(&mut *tx).await?;
+            let mail=sqlx::query!("SELECT COUNT(*) AS count FROM deliveries d JOIN messages m ON m.id=d.message WHERE m.intent='request' AND d.state='pending' AND (d.recipient=? OR m.sender=?)",row.id,row.id).fetch_one(&mut *tx).await?;
             ensure!(
                 mail.count == 0,
                 "agent has pending mail; resolve or withdraw it first"

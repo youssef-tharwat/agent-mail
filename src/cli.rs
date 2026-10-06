@@ -72,6 +72,12 @@ enum Action {
         /// Exclusive resume cursor from watch output. Omit to start now.
         #[arg(long)]
         after: Option<String>,
+        /// Observe outstanding attention instead of full audit changes.
+        #[arg(long, conflicts_with = "after")]
+        attention: bool,
+        /// Claim model delivery; acknowledge its token only after ingestion.
+        #[arg(long, requires = "attention")]
+        consumer: Option<String>,
     },
     /// Send, read and resolve durable requests.
     #[command(subcommand)]
@@ -115,6 +121,14 @@ enum Action {
     #[command(subcommand, hide = true)]
     Adapter(Adapter),
 }
+fn parse_send_intent(value: &str) -> Result<agent_mail::states::MessageIntent> {
+    let intent: agent_mail::states::MessageIntent = value.parse()?;
+    anyhow::ensure!(
+        intent != agent_mail::states::MessageIntent::Response,
+        "use mail reply to publish a final response"
+    );
+    Ok(intent)
+}
 #[derive(Subcommand)]
 enum Mail {
     /// Record a next step or waiting condition without resolving work.
@@ -126,8 +140,11 @@ enum Mail {
         file: PathBuf,
     },
 
-    /// Send a new request. Reuse the key only for an identical retry.
+    /// Send a request or quiet notice. Reuse the key only for an identical retry.
     Send {
+        /// Request a disposition, or publish a quiet informational notice.
+        #[arg(long, value_parser=parse_send_intent, default_value_t=agent_mail::states::MessageIntent::Request)]
+        intent: agent_mail::states::MessageIntent,
         /// Primary recipient in this group.
         recipient: String,
         /// Short request summary.
@@ -156,6 +173,9 @@ enum Mail {
     /// Wait for all recipients to settle a sent request, or its deadline.
     Wait {
         id: i64,
+        /// Required business outcome; defaults to first reply or all settled.
+        #[arg(long="until",value_enum,default_value_t=agent_mail::followup::MailPredicate::FirstReplyOrAllSettled)]
+        predicate: agent_mail::followup::MailPredicate,
         /// Stop earlier than the request deadline, e.g. 30s or 5m.
         #[arg(long,value_parser=parse_duration)]
         timeout: Option<i64>,
@@ -280,6 +300,10 @@ enum Task {
 }
 #[derive(Subcommand)]
 enum Attention {
+    /// Inspect current reasons without recording delivery or retrieval.
+    Snapshot,
+    /// Confirm that the current runtime consumed this exact claimed batch.
+    Acknowledge { token: String },
     /// Record a next step for an addressed occurrence; authority may extend its review time.
     Checkpoint {
         id: i64,
@@ -776,6 +800,8 @@ impl Cli {
             },
             Action::Service(s) => Command::Service(s),
             Action::Attention(attention) => match attention {
+                Attention::Snapshot => Command::AttentionSnapshot { group },
+                Attention::Acknowledge { token } => Command::AttentionAcknowledge { group, token },
                 Attention::Checkpoint { id, key, file } => Command::Checkpoint {
                     group,
                     source: agent_mail::followup::Source::Attention { id },
@@ -839,7 +865,16 @@ impl Cli {
                     replace,
                 },
             },
-            Action::Watch { after } => Command::WatchChanges { group, after },
+            Action::Watch {
+                after,
+                attention,
+                consumer,
+            } => Command::WatchChanges {
+                group,
+                after,
+                attention,
+                consumer,
+            },
             Action::Mail(mail) => match mail {
                 Mail::Checkpoint { id, key, file } => Command::Checkpoint {
                     group,
@@ -847,8 +882,18 @@ impl Cli {
                     key,
                     report: serde_json::from_str(&read_body(&file)?)?,
                 },
-                Mail::Wait { id, timeout } => Command::WaitMail { group, id, timeout },
+                Mail::Wait {
+                    id,
+                    timeout,
+                    predicate,
+                } => Command::WaitMail {
+                    group,
+                    id,
+                    timeout,
+                    predicate,
+                },
                 Mail::Send {
+                    intent,
                     recipient,
                     summary,
                     key,
@@ -859,6 +904,7 @@ impl Cli {
                 } => {
                     to.push(recipient);
                     Command::Send {
+                        intent,
                         group,
                         recipients: to,
                         summary,

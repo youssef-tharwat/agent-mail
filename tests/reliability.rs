@@ -188,6 +188,7 @@ impl Fixture {
 
 fn message(key: &str) -> Publish {
     Publish {
+        intent: agent_mail::states::MessageIntent::Request,
         recipients: vec!["b".into()],
         key: key.into(),
         summary: "Inspect the contract".into(),
@@ -356,7 +357,10 @@ async fn bursts_batch_and_retry_budget_survives_restarts() -> Result<()> {
             .iter()
             .all(|p| p.len() <= 480 && !p.contains("Durable body"))
     );
-    assert_eq!(host.notifications, 2);
+    assert_eq!(
+        host.notifications, 1,
+        "exhaustion waits for the final receipt window and alerts once"
+    );
     drop(host);
     reopened.close().await;
     Ok(())
@@ -951,20 +955,31 @@ async fn retrieved_mail_stays_pending_without_repeated_wakes() -> Result<()> {
 }
 
 #[tokio::test]
-async fn new_events_keep_cooldown_and_context_receipts_cover_only_visible_records() -> Result<()> {
+async fn fresh_events_keep_uncertainty_and_context_receipts_release_only_the_delivered_page()
+-> Result<()> {
     let f = Fixture::new().await?;
     for i in 0..8 {
         f.send(&format!("page-{i}")).await?;
     }
     service::tick(&f.store, 1000).await?;
+    f.send("arrived-during-cooldown").await?;
+    service::tick(&f.store, 1001).await?;
+    assert_eq!(
+        f.host.lock().await.prompts.len(),
+        1,
+        "a fresh event cannot bypass an unconfirmed lease"
+    );
     let context = f.store.context_value(&f.b, String::new(), 0).await?;
     let visible = context["mail"].as_array().unwrap();
     assert_eq!(visible.len(), 5);
     let notices = f.store.notifications(&f.b, 0).await?;
-    assert_eq!(notices.len(), 3, "hidden page records remain unreceived");
-    f.send("arrived-during-cooldown").await?;
-    service::tick(&f.store, 1001).await?;
-    assert_eq!(f.host.lock().await.prompts.len(), 1);
+    assert_eq!(notices.len(), 4, "hidden page records remain unreceived");
+    service::tick(&f.store, 1002).await?;
+    assert_eq!(
+        f.host.lock().await.prompts.len(),
+        2,
+        "retrieving the delivered source releases its lease for omitted records"
+    );
     service::tick(&f.store, 1300).await?;
     assert_eq!(f.host.lock().await.prompts.len(), 2);
     assert_eq!(f.store.mailbox("g", "b").await?.attempts, 1);

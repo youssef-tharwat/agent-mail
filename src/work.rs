@@ -343,6 +343,14 @@ impl Store {
             .execute(&mut *tx).await?;
         sqlx::query!("INSERT INTO work_creations(group_name,work_id,actor,canonical,result) VALUES(?,?,?,?,?)",actor.group_name,item.id,actor.id,canonical,snapshot).execute(&mut *tx).await?;
         relay::enqueue_snapshot(&mut tx, &item, None, now).await?;
+        Self::retrieve_tx(
+            &mut tx,
+            actor,
+            crate::states::EventKind::WorkChanged,
+            &item.id,
+            item.version,
+        )
+        .await?;
         tx.commit().await?;
         crate::stream::hint(self.root()).await;
         Ok(item)
@@ -585,6 +593,14 @@ impl Store {
             item.group_name, item.id, item.version, actor.name, reason, snapshot, now)
             .execute(&mut *tx).await?;
         relay::enqueue_snapshot(&mut tx, &item, Some(&previous_owner), now).await?;
+        Self::retrieve_tx(
+            &mut tx,
+            actor,
+            crate::states::EventKind::WorkChanged,
+            &item.id,
+            item.version,
+        )
+        .await?;
 
         if let Some(message) = resolve_message {
             let linked = sqlx::query!("SELECT work_id FROM messages WHERE id=?", message)

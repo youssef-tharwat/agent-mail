@@ -31,8 +31,13 @@
 pub mod agents;
 /// Typed resource references and managed content-addressed evidence.
 pub mod artifacts;
+pub mod external;
 pub mod herdr;
 pub mod identity;
+/// Validated coordination and delivery identities.
+pub mod names;
+/// Outstanding attention and shared model-delivery reservations.
+pub mod notification;
 /// Shared immutable document revisions.
 pub mod records;
 /// Explicit task relationships and dependency facts.

@@ -433,6 +433,7 @@ async fn linked_message_paging_never_exposes_private_payloads() -> Result<()> {
             .publish(
                 &writer,
                 Publish {
+                    intent: agent_mail::states::MessageIntent::Request,
                     recipients: vec!["recipient".into()],
                     key: format!("msg{i}"),
                     summary: "private summary".into(),

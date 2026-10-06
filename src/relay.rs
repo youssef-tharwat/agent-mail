@@ -5,7 +5,7 @@
 //! Both subprocess output streams are bounded while reading, and exchange failures
 //! kill and reap the child. Business operations accept Unix seconds from their caller.
 
-use crate::states::MessageState;
+use crate::states::{MessageIntent, MessageState};
 use crate::{BODY_LIMIT, SUMMARY_LIMIT, bounded, name, store::Store, work::WorkItem};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,12 @@ use uuid::Uuid;
 
 // Keep each exchange small enough to fit the wire budget and avoid starving peers.
 const BATCH_LIMIT: usize = 16;
+const INTENT_CAPABILITY: &str = "communication_intent_v1";
+
+/// Capabilities advertised by this relay implementation.
+pub fn capabilities() -> Vec<String> {
+    vec![INTENT_CAPABILITY.into()]
+}
 // Shared by encoding and streaming reads; changing this changes the relay wire contract.
 const WIRE_LIMIT: usize = 256 * 1024;
 // Diagnostics need only a short tail-sized budget, independent of message payloads.
@@ -48,6 +54,13 @@ pub struct Envelope {
 pub enum Event {
     /// A message to deliver to the destination participant.
     Message(WireMessage),
+    /// Typed communication; older relays reject this variant instead of downgrading it.
+    TypedMessage {
+        /// Explicit communication meaning.
+        intent: MessageIntent,
+        /// Original message content and request reference.
+        message: WireMessage,
+    },
     /// An explicit resolution of a received message.
     Resolution {
         /// Group owning the referenced message.
@@ -108,6 +121,9 @@ pub struct WireMessage {
 /// Incoming envelopes and acknowledgements submitted atomically by a peer.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Exchange {
+    /// Sender capabilities; legacy exchanges advertise none.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     /// Bounded batch of envelopes to validate and apply.
     pub incoming: Vec<Envelope>,
     /// UUIDs of envelopes confirmed as received.
@@ -117,6 +133,9 @@ pub struct Exchange {
 /// The UUIDs accepted by a relay exchange.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Receipt {
+    /// Receiver capabilities for subsequent typed traffic.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     /// UUIDs of envelopes confirmed as received.
     pub ack: Vec<Uuid>,
 }
@@ -197,7 +216,7 @@ pub(crate) async fn enqueue_message(
     created: i64,
 ) -> Result<()> {
     let row = sqlx::query!(
-        "SELECT m.global_id,m.dedup_key,m.summary,m.body,m.created,m.deadline AS due,m.work_id,m.reply_to,s.name AS sender,s.group_name,r.name AS recipient,r.remote_machine FROM messages m JOIN mailboxes s ON s.id=m.sender JOIN mailboxes r ON r.id=? WHERE m.id=?",
+        "SELECT m.intent AS 'intent: MessageIntent',m.global_id,m.dedup_key,m.summary,m.body,m.created,m.deadline AS due,m.work_id,m.reply_to,s.name AS sender,s.group_name,r.name AS recipient,r.remote_machine FROM messages m JOIN mailboxes s ON s.id=m.sender JOIN mailboxes r ON r.id=? WHERE m.id=?",
         recipient_id,
         message_id
     )
@@ -206,6 +225,30 @@ pub(crate) async fn enqueue_message(
     let Some(machine) = row.remote_machine else {
         return Ok(());
     };
+    if !row.intent.is_request() {
+        let home = sqlx::query_scalar!(
+            "SELECT home_machine FROM groups WHERE name=?",
+            row.group_name
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        let next_hop = if home == local_id(tx).await?.to_string() {
+            machine.clone()
+        } else {
+            home
+        };
+        ensure!(
+            sqlx::query_scalar!(
+                "SELECT EXISTS(SELECT 1 FROM relay_capabilities WHERE machine=? AND capability=?)",
+                next_hop,
+                INTENT_CAPABILITY
+            )
+            .fetch_one(&mut **tx)
+            .await?
+                != 0,
+            "next relay hop has not advertised communication intent support; sync the upgraded peer first"
+        );
+    }
     let reply_to = if let Some(id) = row.reply_to {
         sqlx::query!("SELECT global_id FROM messages WHERE id=?", id)
             .fetch_optional(&mut **tx)
@@ -216,29 +259,32 @@ pub(crate) async fn enqueue_message(
     } else {
         None
     };
-    enqueue(
-        tx,
-        parse_id(&machine)?,
-        Event::Message(WireMessage {
-            id: parse_id(
-                row.global_id
-                    .as_deref()
-                    .context("message has no global ID")?,
-            )?,
-            group: row.group_name,
-            sender: row.sender,
-            recipient: row.recipient,
-            key: row.dedup_key,
-            summary: row.summary,
-            body: row.body,
-            created: row.created,
-            due: row.due,
-            work_id: row.work_id,
-            reply_to,
-        }),
-        created,
-    )
-    .await
+    let message = WireMessage {
+        id: parse_id(
+            row.global_id
+                .as_deref()
+                .context("message has no global ID")?,
+        )?,
+        group: row.group_name,
+        sender: row.sender,
+        recipient: row.recipient,
+        key: row.dedup_key,
+        summary: row.summary,
+        body: row.body,
+        created: row.created,
+        due: row.due,
+        work_id: row.work_id,
+        reply_to,
+    };
+    let event = if row.intent.is_request() {
+        Event::Message(message)
+    } else {
+        Event::TypedMessage {
+            intent: row.intent,
+            message,
+        }
+    };
+    enqueue(tx, parse_id(&machine)?, event, created).await
 }
 
 pub(crate) async fn enqueue_snapshot(
@@ -511,6 +557,24 @@ impl Store {
         let local = parse_id(&self.machine_id().await?)?;
         let mut tx = self.pool().begin().await?;
         let mut accepted = Vec::new();
+        ensure!(
+            exchange.capabilities.len() <= 16
+                && exchange.capabilities.iter().all(|c| c.len() <= 128),
+            "invalid relay capabilities"
+        );
+        let source_id = source.to_string();
+        sqlx::query!("DELETE FROM relay_capabilities WHERE machine=?", source_id)
+            .execute(&mut *tx)
+            .await?;
+        if exchange.capabilities.iter().any(|c| c == INTENT_CAPABILITY) {
+            sqlx::query!(
+                "INSERT INTO relay_capabilities(machine,capability) VALUES(?,?)",
+                source_id,
+                INTENT_CAPABILITY
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
         for envelope in &exchange.incoming {
             ensure!(
                 envelope.origin != local && envelope.destination != envelope.origin,
@@ -586,7 +650,10 @@ impl Store {
         }
         tx.commit().await?;
         crate::stream::hint(self.root()).await;
-        Ok(Receipt { ack: accepted })
+        Ok(Receipt {
+            ack: accepted,
+            capabilities: capabilities(),
+        })
     }
 
     /// Synchronize one configured peer using the supplied Unix timestamp.
@@ -633,6 +700,29 @@ impl Store {
         target: &str,
         time: i64,
     ) -> Result<usize> {
+        // Negotiate against the actual peer before importing or exporting typed traffic.
+        let handshake = serde_json::to_vec(&Exchange {
+            capabilities: capabilities(),
+            incoming: vec![],
+            ack: vec![],
+        })?;
+        let bytes = ssh(
+            target,
+            &[
+                "adapter",
+                "bridge",
+                "exchange",
+                "--source",
+                &local.to_string(),
+            ],
+            Some(&handshake),
+        )
+        .await?;
+        let support: Receipt = serde_json::from_slice(&bytes)?;
+        ensure!(
+            support.ack.is_empty(),
+            "peer acknowledged an unsent event during negotiation"
+        );
         // The remote command is fixed; SSH aliases are restricted to plain names.
         let bytes = ssh(target, &["adapter", "bridge", "export"], None).await?;
         let remote: Vec<Envelope> = serde_json::from_slice(&bytes)?;
@@ -644,6 +734,7 @@ impl Store {
             .exchange(
                 peer,
                 Exchange {
+                    capabilities: support.capabilities,
                     incoming: remote,
                     ack: vec![],
                 },
@@ -655,6 +746,7 @@ impl Store {
         let sent_ids: std::collections::HashSet<_> =
             outgoing.iter().map(|event| event.event_id).collect();
         let request = Exchange {
+            capabilities: capabilities(),
             incoming: outgoing,
             ack: received.ack,
         };
@@ -687,6 +779,7 @@ impl Store {
         self.exchange(
             peer,
             Exchange {
+                capabilities: receipt.capabilities,
                 incoming: vec![],
                 ack: receipt.ack,
             },
@@ -699,7 +792,7 @@ impl Store {
 
 fn event_group(event: &Event) -> &str {
     match event {
-        Event::Message(m) => &m.group,
+        Event::Message(m) | Event::TypedMessage { message: m, .. } => &m.group,
         Event::Resolution { group, .. } | Event::Withdrawal { group, .. } => group,
         Event::WorkSnapshot(item) => &item.group_name,
         Event::RecordSnapshot(item) => &item.record.group_name,
@@ -710,10 +803,23 @@ fn event_group(event: &Event) -> &str {
 
 async fn validate_forward(tx: &mut Transaction<'_, Sqlite>, envelope: &Envelope) -> Result<()> {
     match &envelope.event {
-        Event::Message(m) => {
+        Event::Message(m) | Event::TypedMessage { message: m, .. } => {
             name(&m.group)?;
             name(&m.sender)?;
             name(&m.recipient)?;
+            if let Event::TypedMessage { intent, .. } = &envelope.event {
+                ensure!(
+                    !intent.is_request(),
+                    "request traffic must use the request event"
+                );
+                ensure!(m.due.is_none(), "only requests may carry a deadline");
+                ensure!(
+                    *intent != MessageIntent::Response || m.reply_to.is_some(),
+                    "response has no referenced request"
+                );
+                let destination = envelope.destination.to_string();
+                ensure!(sqlx::query_scalar!("SELECT EXISTS(SELECT 1 FROM relay_capabilities WHERE machine=? AND capability=?)",destination,INTENT_CAPABILITY).fetch_one(&mut **tx).await? != 0,"destination has not negotiated communication intent; synchronize upgraded peers first");
+            }
             let sender = sqlx::query!(
                 "SELECT remote_machine FROM mailboxes WHERE group_name=? AND name=?",
                 m.group,
@@ -784,8 +890,20 @@ async fn apply_event(
     home: Uuid,
     time: i64,
 ) -> Result<()> {
+    let intent = match &envelope.event {
+        Event::TypedMessage { intent, .. } => *intent,
+        _ => MessageIntent::Request,
+    };
     match &envelope.event {
-        Event::Message(m) => {
+        Event::Message(m) | Event::TypedMessage { message: m, .. } => {
+            ensure!(
+                intent.is_request() || m.due.is_none(),
+                "only requests may carry a deadline"
+            );
+            ensure!(
+                intent != MessageIntent::Response || m.reply_to.is_some(),
+                "response has no referenced request"
+            );
             name(&m.sender)?;
             name(&m.recipient)?;
             bounded(&m.key, 128, "send key")?;
@@ -826,10 +944,15 @@ async fn apply_event(
                     m.group, m.sender, machine).execute(&mut **tx).await?.last_insert_rowid()
             };
             let id = m.id.to_string();
-            let canonical = serde_json::to_string(&(
+            let original = (
                 m.id, &m.group, &m.sender, &m.key, &m.summary, &m.body, m.created, m.due,
                 &m.work_id, m.reply_to,
-            ))?;
+            );
+            let canonical = if intent.is_request() {
+                serde_json::to_string(&original)?
+            } else {
+                serde_json::to_string(&(intent, original))?
+            };
             let existing = sqlx::query!("SELECT id,canonical FROM messages WHERE global_id=?", id)
                 .fetch_optional(&mut **tx)
                 .await?;
@@ -850,9 +973,13 @@ async fn apply_event(
                     None
                 };
                 let key = format!("relay:{id}");
-                let legacy_due = m.due.unwrap_or(m.created);
-                sqlx::query!("INSERT INTO messages(sender,dedup_key,canonical,summary,body,created,due,reply_to,work_id,global_id,deadline) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                    sender_id, key, canonical, m.summary, m.body, m.created, legacy_due, reply_to, m.work_id, id, m.due)
+                let storage_due = m.due.unwrap_or(m.created);
+                if intent == MessageIntent::Response {
+                    ensure!(sqlx::query_scalar!("SELECT EXISTS(SELECT 1 FROM messages m JOIN deliveries d ON d.message=m.id WHERE m.id=? AND m.sender=? AND d.recipient=? AND m.intent='request')",reply_to,destination.id,sender_id).fetch_one(&mut **tx).await? != 0,"response does not match the requester and responder");
+                }
+                let intent = intent.as_str();
+                sqlx::query!("INSERT INTO messages(sender,dedup_key,canonical,summary,body,created,due,reply_to,work_id,global_id,deadline,intent) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    sender_id, key, canonical, m.summary, m.body, m.created, storage_due, reply_to, m.work_id, id, m.due,intent)
                     .execute(&mut **tx).await?.last_insert_rowid()
             };
             sqlx::query!(

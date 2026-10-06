@@ -93,6 +93,7 @@ impl Node {
 
 fn message(to: &str, key: &str, work_id: Option<&str>) -> Publish {
     Publish {
+        intent: agent_mail::states::MessageIntent::Request,
         recipients: vec![to.into()],
         key: key.into(),
         summary: "A bounded request".into(),
@@ -114,6 +115,7 @@ async fn transfer(from: &Node, to: &Node, at: i64) -> Result<()> {
         .exchange(
             from.id().await?,
             Exchange {
+                capabilities: agent_mail::relay::capabilities(),
                 incoming: outgoing.clone(),
                 ack: vec![],
             },
@@ -126,6 +128,7 @@ async fn transfer(from: &Node, to: &Node, at: i64) -> Result<()> {
         .exchange(
             from.id().await?,
             Exchange {
+                capabilities: agent_mail::relay::capabilities(),
                 incoming: outgoing,
                 ack: vec![],
             },
@@ -137,12 +140,117 @@ async fn transfer(from: &Node, to: &Node, at: i64) -> Result<()> {
         .exchange(
             to.id().await?,
             Exchange {
+                capabilities: agent_mail::relay::capabilities(),
                 incoming: vec![],
                 ack: replay.ack,
             },
             at + 2,
         )
         .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn intent_requires_negotiated_support_and_preserves_notice_and_final_response() -> Result<()>
+{
+    use agent_mail::states::MessageIntent;
+    let home = Node::new("home", "coordinator").await?;
+    let remote = Node::new("remote", "worker").await?;
+    remote.store.set_home("g", home.id().await?).await?;
+    home.store
+        .route("g", "worker", remote.id().await?, 100)
+        .await?;
+    let coordinator = home.store.mailbox("g", "coordinator").await?;
+    let worker = remote.store.mailbox("g", "worker").await?;
+    let mut notice = message("worker", "notice", None);
+    notice.intent = MessageIntent::Notice;
+    notice.due_after = None;
+    assert!(
+        home.store
+            .publish(&coordinator, notice.clone(), 100)
+            .await
+            .is_err()
+    );
+    let pool = support::pool(&home.store).await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages")
+            .fetch_one(&pool)
+            .await?,
+        0,
+        "unsupported traffic must roll back"
+    );
+    home.store
+        .exchange(
+            remote.id().await?,
+            Exchange {
+                capabilities: agent_mail::relay::capabilities(),
+                incoming: vec![],
+                ack: vec![],
+            },
+            101,
+        )
+        .await?;
+    home.store.publish(&coordinator, notice, 102).await?;
+    transfer(&home, &remote, 103).await?;
+    assert!(
+        remote
+            .store
+            .attention_snapshot(&worker)
+            .await?
+            .items
+            .is_empty()
+    );
+    let note = remote.store.inbox(&worker, 0).await?.remove(0);
+    assert_eq!(
+        remote.store.message(&worker, note.id).await?.intent,
+        MessageIntent::Notice
+    );
+    let request = home
+        .store
+        .publish(&coordinator, message("worker", "request", None), 110)
+        .await?;
+    transfer(&home, &remote, 111).await?;
+    let incoming = remote.store.inbox(&worker, 0).await?.remove(0);
+    remote
+        .store
+        .resolve(
+            &worker,
+            incoming.id,
+            "answer",
+            Some(("Ready".into(), "Evidence supplied".into())),
+            112,
+        )
+        .await?;
+    transfer(&remote, &home, 113).await?;
+    let answer = home.store.inbox(&coordinator, 0).await?.remove(0);
+    assert_eq!(
+        home.store.message(&coordinator, answer.id).await?.intent,
+        MessageIntent::Response
+    );
+    assert!(
+        home.store
+            .resolve(&coordinator, answer.id, "ack", None, 114)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        home.store
+            .wait_mail(&coordinator, request, None)
+            .await?
+            .pending,
+        0
+    );
+    let first_reply = home
+        .store
+        .wait_mail_for(
+            &coordinator,
+            request,
+            None,
+            agent_mail::followup::MailPredicate::FirstReply,
+        )
+        .await?;
+    assert_eq!(first_reply.outcome, agent_mail::watch::WaitOutcome::Reply);
+    assert_eq!(first_reply.replies, 1);
     Ok(())
 }
 
@@ -336,6 +444,7 @@ async fn bridge_commands_exchange_json_across_processes() -> Result<()> {
     let incoming: Vec<Envelope> = serde_json::from_slice(&export.stdout)?;
     assert_eq!(incoming.len(), 1);
     let input = serde_json::to_vec(&Exchange {
+        capabilities: agent_mail::relay::capabilities(),
         incoming,
         ack: vec![],
     })?;

@@ -84,6 +84,7 @@ impl Fixture {
             .publish(
                 &self.writer,
                 Publish {
+                    intent: agent_mail::states::MessageIntent::Request,
                     recipients: vec!["owner".into()],
                     key: key.into(),
                     summary: "Decision needed".into(),
@@ -283,6 +284,7 @@ async fn turn_boundaries_leave_task_deadlines_pending_and_restart_recovers_them(
         .publish(
             &f.owner,
             Publish {
+                intent: agent_mail::states::MessageIntent::Request,
                 recipients: vec!["writer".into()],
                 key: "status".into(),
                 summary: "Partial progress".into(),
@@ -521,6 +523,7 @@ async fn self_escalation_receipts_only_the_mail_actually_returned() -> Result<()
         .publish(
             &f.owner,
             Publish {
+                intent: agent_mail::states::MessageIntent::Request,
                 recipients: vec!["owner".into()],
                 key: "self".into(),
                 summary: "Own decision".into(),
@@ -789,15 +792,48 @@ async fn unseen_pages_and_operator_reads_never_claim_retrieval() -> Result<()> {
 #[tokio::test]
 async fn exhausted_unretrieved_source_escalates_without_new_owner_budget() -> Result<()> {
     let f = Fixture::new().await?;
+    f.store
+        .configure_followups(
+            "g",
+            &Policy {
+                mode: Mode::Enabled,
+                interval_seconds: 60,
+                max_seconds: 3600,
+                notifier: None,
+            },
+            f.time,
+        )
+        .await?;
     f.mail("ignored").await?;
-    let pool = support::pool(&f.store).await?;
-    sqlx::query("UPDATE mailboxes SET attempts=3,wake_attempted=(SELECT MAX(id) FROM coordination_events WHERE recipient=?) WHERE id=?").bind(f.owner.id).bind(f.owner.id).execute(&pool).await?;
-    followup::reconcile(&f.store, f.time + 1).await?;
+    for delay in [0, 300, 600] {
+        f.store
+            .claim_attention(
+                &f.owner,
+                agent_mail::names::DeliveryConsumer::Native,
+                f.time + delay,
+            )
+            .await?
+            .unwrap();
+    }
+    followup::reconcile(&f.store, f.time + 900).await?;
     assert!(f.events(&f.owner).await?.is_empty());
     assert_eq!(f.events(&f.writer).await?.len(), 1);
-    followup::reconcile(&f.store, f.time + 2).await?;
+    followup::reconcile(&f.store, f.time + 901).await?;
     assert_eq!(f.events(&f.writer).await?.len(), 1);
-    assert_eq!(f.store.mailbox("g", "owner").await?.attempts, 3);
+    assert!(
+        f.store
+            .claim_attention(
+                &f.owner,
+                agent_mail::names::DeliveryConsumer::Native,
+                f.time + 901
+            )
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        f.store.followup_status(Some("g"), f.time + 901).await?["delivery_attempts"][0]["attempts"],
+        3
+    );
     Ok(())
 }
 #[tokio::test]
@@ -1149,6 +1185,7 @@ async fn reply_before_checkpoint_is_not_lost_and_does_not_accept_work() -> Resul
         .publish(
             &f.owner,
             Publish {
+                intent: agent_mail::states::MessageIntent::Request,
                 recipients: vec!["writer".into()],
                 key: "result".into(),
                 summary: "Review result".into(),
@@ -1170,7 +1207,10 @@ async fn reply_before_checkpoint_is_not_lost_and_does_not_accept_work() -> Resul
         )
         .await?;
     let mut report = f.checkpoint();
-    report.waiting = Some(WaitFor::Mail { id: request });
+    report.waiting = Some(WaitFor::Mail {
+        id: request,
+        predicate: Default::default(),
+    });
     f.store
         .checkpoint(
             &f.owner,

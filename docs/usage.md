@@ -409,7 +409,7 @@ clears prior launch evidence; an old session cannot establish new readiness.
 ## Existing installations
 
 Upgrade the binary, then use Agent Mail normally. Commands, hooks, managed launches
-and worker startup automatically upgrade an existing store to schema 18. Missing
+and worker startup automatically upgrade an existing store to schema 24. Missing
 stores still require `agent-mail init GROUP`. Help, the skill guide and read-only
 `status --check NAME` diagnostics do not migrate state.
 
@@ -601,6 +601,12 @@ confirmed receipt. This survives a worker restart and means execution may have
 started. A fresh event cannot bypass that reservation's retry delay. Runtime
 errors and timeouts appear in the worker's service observations.
 
+Each current attention reason has a three-attempt budget, shared by native
+delivery, Herdr, hooks, and explicit model-facing watches. A new reason cannot
+restart an exhausted reason's budget. The last attempt retains a five-minute
+receipt window before exhaustion can escalate. Status exposes these attempts and
+remaining uncertainty; actual retrieval never resolves the underlying work.
+
 ### Record a next step when yielding
 
 Fetch `task show ID` or `mail show ID` first. The response's `followup.version` is
@@ -636,12 +642,25 @@ Optional `waiting` values:
 ```
 
 ```json
-{"kind":"mail","id":57}
+{"kind":"mail","id":57,"predicate":"all_settled"}
 ```
 
 ```json
 {"kind":"external","responsible":"release owner","reason":"Awaiting rollout approval"}
 ```
+
+```json
+{"kind":"pull_request","repository":"owner/repository","number":1513,"head":"0123456789abcdef0123456789abcdef01234567"}
+```
+
+Mail predicates are `first_reply`, `any_settled`, `all_settled`, and
+`first_reply_or_all_settled` (the default when omitted). They evaluate business
+dispositions and replies. A GitHub wait requires the expected full head and a
+confirmed merge commit. The service observes a bounded page through authenticated
+`gh pr view`, caches facts for two minutes, and preserves them across restart.
+An unavailable adapter or a different head leaves the condition unqualified; status
+shows the observed identity, query time, and error. External waits without a
+supported adapter remain visibly supervised by their named person or role.
 
 A task dependency must be local and in the same group; cycles are rejected. A mail
 wait names a request **you sent**. An external wait always needs a responsible
@@ -661,6 +680,9 @@ wakes at the next follow-up deadline and signals watchers after committing new
 attention. A five-second recovery scan covers missed signals.
 
 ```sh
+agent-mail attention snapshot
+agent-mail watch --attention --consumer coordinator
+agent-mail attention acknowledge BATCH_TOKEN
 agent-mail attention list
 agent-mail attention list --after 123
 agent-mail attention show 124
@@ -668,6 +690,14 @@ agent-mail attention checkpoint 124 --key review-extension-1 --file checkpoint.j
 agent-mail attention history --task api
 agent-mail attention history --mail 42
 ```
+
+`attention snapshot` shows outstanding current reasons without consuming them.
+`watch --attention --consumer NAME` shares model-delivery ownership with other
+adapters. Acknowledge its exact token after model ingestion, or retrieve its listed
+records. An ordinary `watch` remains a complete audit stream; saving its cursor
+does not record model ingestion. Notices are available through mail/context and
+history without creating attention. Final responses need inspection through
+`mail show`, and create no reciprocal reply or resolve obligation.
 
 `attention show` fetches an occurrence addressed to your identity. Its `current`
 field identifies superseded work, and its `followup` gives the current source and

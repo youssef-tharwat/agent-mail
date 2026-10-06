@@ -11,6 +11,7 @@ use agent_mail::{
 use anyhow::Result;
 fn request(to: &str, key: &str) -> Publish {
     Publish {
+        intent: agent_mail::states::MessageIntent::Request,
         recipients: vec![to.into()],
         key: key.into(),
         summary: "Review".into(),

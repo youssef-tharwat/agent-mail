@@ -59,6 +59,7 @@ async fn no_deadline_still_publishes_delivery_events_without_false_overdue() -> 
         .publish(
             &sender,
             Publish {
+                intent: agent_mail::states::MessageIntent::Request,
                 recipients: vec!["worker".into()],
                 key: "request".into(),
                 summary: "Review".into(),
@@ -70,8 +71,12 @@ async fn no_deadline_still_publishes_delivery_events_without_false_overdue() -> 
             1000,
         )
         .await?;
-    assert_eq!(store.message(&worker, id).await?.due, None);
     assert_eq!(store.notifications(&worker, 0).await?.len(), 1);
+    assert_eq!(store.message(&worker, id).await?.due, None);
+    assert!(
+        store.notifications(&worker, 0).await?.is_empty(),
+        "retrieval suppresses the unread hint without settling its request"
+    );
     let attention = serde_json::to_value(store.attention(10_000_000).await?)?;
     assert!(
         !attention["items"]

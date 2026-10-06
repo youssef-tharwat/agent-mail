@@ -66,9 +66,12 @@ async fn replay_live_restart_and_binding_rotation() -> Result<()> {
         other => panic!("{other:?}"),
     };
     // Stream consumption never supplies a runtime receipt.
-    let receipts = sqlx::query!("SELECT COUNT(*) AS 'count!:i64' FROM event_receipts")
-        .fetch_one(&support::pool(&store).await?)
-        .await?;
+    let receipts = sqlx::query!(
+        "SELECT COUNT(*) AS 'count!:i64' FROM event_receipts WHERE recipient=?",
+        owner.id
+    )
+    .fetch_one(&support::pool(&store).await?)
+    .await?;
     assert_eq!(receipts.count, 0);
     drop(client);
     server.shutdown().await?;

@@ -54,6 +54,35 @@ pub struct TaskPrerequisite {
     pub accepted_revision: Option<String>,
 }
 /// Condition to reassess; satisfaction never grants business authority.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum MailPredicate {
+    /// A reply arrives or every recipient records a business disposition.
+    #[default]
+    FirstReplyOrAllSettled,
+    /// At least one recipient published a final reply.
+    FirstReply,
+    /// At least one recipient recorded a business disposition.
+    AnySettled,
+    /// Every recipient recorded a business disposition.
+    AllSettled,
+}
+impl MailPredicate {
+    /// Omit the default from canonical checkpoint JSON.
+    pub fn is_default(&self) -> bool {
+        *self == Self::FirstReplyOrAllSettled
+    }
+    /// Evaluate only business outcomes, never transport receipts.
+    pub fn satisfied(self, total: i64, pending: i64, replies: i64) -> bool {
+        match self {
+            Self::FirstReplyOrAllSettled => replies > 0 || (total > 0 && pending == 0),
+            Self::FirstReply => replies > 0,
+            Self::AnySettled => pending < total,
+            Self::AllSettled => total > 0 && pending == 0,
+        }
+    }
+}
+/// Condition to reassess; satisfaction never grants business authority.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WaitFor {
@@ -75,6 +104,18 @@ pub enum WaitFor {
     Mail {
         /// Outgoing message identifier.
         id: i64,
+        /// Explicit qualifying outcome; omission means first reply or all settled.
+        #[serde(default, skip_serializing_if = "MailPredicate::is_default")]
+        predicate: MailPredicate,
+    },
+    /// Reassess only after GitHub confirms the merge of an exact expected head.
+    PullRequest {
+        /// GitHub owner/repository, observed through the authenticated gh adapter.
+        repository: crate::external::GitHubRepository,
+        /// Positive GitHub pull-request number.
+        number: i64,
+        /// Full expected head; another revision cannot satisfy this condition.
+        head: crate::external::CommitId,
     },
     /// An external condition needs a person or role to review it.
     External {
@@ -442,6 +483,25 @@ impl Store {
             .bind(plan.id)
             .fetch_one(&mut *tx)
             .await?;
+        match &source {
+            Source::Task { id, version } => {
+                Self::retrieve_tx(&mut tx, actor, EventKind::WorkChanged, id, *version).await?
+            }
+            Source::Mail { id } => {
+                Self::retrieve_tx(&mut tx, actor, EventKind::MailPending, &id.to_string(), 0)
+                    .await?
+            }
+            Source::Attention { id } => {
+                Self::retrieve_tx(
+                    &mut tx,
+                    actor,
+                    EventKind::AttentionDue,
+                    &id.to_string(),
+                    plan.version,
+                )
+                .await?
+            }
+        }
         let result = current.value()?;
         sqlx::query("INSERT INTO followup_history(followup,version,actor,key,canonical,snapshot,created) VALUES(?,?,?,?,?,?,?)")
             .bind(plan.id).bind(current.version).bind(actor.id).bind(key).bind(canonical).bind(serde_json::to_string(&result)?).bind(time).execute(&mut *tx).await?;
@@ -510,7 +570,7 @@ impl Store {
                 "source is not addressed to this agent"
             );
             let item = sqlx::query_as!(Message,
-                "SELECT m.id,b.name AS sender,m.summary,m.body,m.created,m.deadline AS due,d.state AS 'state: MessageState',d.reply_id,m.work_id FROM messages m JOIN deliveries d ON d.message=m.id JOIN mailboxes b ON b.id=m.sender WHERE m.id=? AND d.recipient=?",
+                "SELECT m.intent AS 'intent: crate::states::MessageIntent',m.id,b.name AS sender,m.summary,m.body,m.created,m.deadline AS due,d.state AS 'state: MessageState',d.reply_id,m.work_id FROM messages m JOIN deliveries d ON d.message=m.id JOIN mailboxes b ON b.id=m.sender WHERE m.id=? AND d.recipient=?",
                 message, plan.recipient).fetch_one(&mut *tx).await?;
             if actor.id == plan.recipient {
                 Self::retrieve_tx(
@@ -580,6 +640,9 @@ async fn validate_wait(
     wait: &WaitFor,
 ) -> Result<()> {
     match wait {
+        WaitFor::PullRequest { number, .. } => {
+            ensure!(*number > 0, "pull-request number must be positive")
+        }
         WaitFor::External {
             responsible,
             reason,
@@ -592,9 +655,9 @@ async fn validate_wait(
                 );
             }
         }
-        WaitFor::Mail { id } => {
+        WaitFor::Mail { id, .. } => {
             let valid: bool =
-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM messages WHERE id=? AND sender=?)")
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM messages WHERE id=? AND sender=? AND intent='request')")
                     .bind(id)
                     .bind(actor.id)
                     .fetch_one(&mut **tx)
@@ -714,24 +777,73 @@ pub(crate) async fn validate_dependency_graph(
     Ok(())
 }
 async fn waiting_satisfied(tx: &mut Transaction<'_, Sqlite>, plan: &Plan) -> Result<bool> {
-    match plan.report()?.and_then(|r|r.waiting) {
-        Some(WaitFor::Task{id,states})=>{
-            let state:Option<String>=sqlx::query_scalar("SELECT state FROM work_items WHERE group_name=? AND id=?").bind(&plan.group_name).bind(id).fetch_optional(&mut **tx).await?;
-            Ok(state.is_some_and(|s|states.iter().any(|state|state.as_str()==s)))
-        },
-        Some(WaitFor::Tasks{mode,tasks})=>{
-            let mut qualified=0;
+    match plan.report()?.and_then(|r| r.waiting) {
+        Some(WaitFor::Task { id, states }) => {
+            let state: Option<String> =
+                sqlx::query_scalar("SELECT state FROM work_items WHERE group_name=? AND id=?")
+                    .bind(&plan.group_name)
+                    .bind(id)
+                    .fetch_optional(&mut **tx)
+                    .await?;
+            Ok(state.is_some_and(|s| states.iter().any(|state| state.as_str() == s)))
+        }
+        Some(WaitFor::Tasks { mode, tasks }) => {
+            let mut qualified = 0;
             for task in &tasks {
-                let row=sqlx::query("SELECT state,accepted_revision FROM work_items WHERE group_name=? AND id=?").bind(&plan.group_name).bind(&task.id).fetch_optional(&mut **tx).await?;
-                if let Some(row)=row {
-                    let state:String=row.get("state");let revision:Option<String>=row.get("accepted_revision");
-                    if task.states.iter().any(|s|s.as_str()==state) && task.accepted_revision.as_ref().is_none_or(|r|revision.as_ref()==Some(r)){qualified+=1;}
+                let row = sqlx::query(
+                    "SELECT state,accepted_revision FROM work_items WHERE group_name=? AND id=?",
+                )
+                .bind(&plan.group_name)
+                .bind(&task.id)
+                .fetch_optional(&mut **tx)
+                .await?;
+                if let Some(row) = row {
+                    let state: String = row.get("state");
+                    let revision: Option<String> = row.get("accepted_revision");
+                    if task.states.iter().any(|s| s.as_str() == state)
+                        && task
+                            .accepted_revision
+                            .as_ref()
+                            .is_none_or(|r| revision.as_ref() == Some(r))
+                    {
+                        qualified += 1;
+                    }
                 }
             }
-            Ok(match mode{PrerequisiteMode::All=>qualified==tasks.len(),PrerequisiteMode::Any=>qualified>0})
-        },
-        Some(WaitFor::Mail{id})=>Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM messages WHERE reply_to=?) OR NOT EXISTS(SELECT 1 FROM deliveries WHERE message=? AND state='pending')").bind(id).bind(id).fetch_one(&mut **tx).await?),
-        _=>Ok(false),
+            Ok(match mode {
+                PrerequisiteMode::All => qualified == tasks.len(),
+                PrerequisiteMode::Any => qualified > 0,
+            })
+        }
+        Some(WaitFor::Mail { id, predicate }) => {
+            let row=sqlx::query("SELECT COUNT(*) AS total,COALESCE(SUM(state='pending'),0) AS pending,COALESCE(SUM(reply_id IS NOT NULL),0) AS replies FROM deliveries WHERE message=?").bind(id).fetch_one(&mut **tx).await?;
+            Ok(predicate.satisfied(row.get("total"), row.get("pending"), row.get("replies")))
+        }
+        Some(WaitFor::PullRequest { repository,number,head }) => {
+            Ok(sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM external_pr_facts WHERE repository=? AND number=? AND state='merged' AND head=? AND merge_commit IS NOT NULL AND error IS NULL)")
+                .bind(repository.as_str()).bind(number).bind(head.as_str()).fetch_one(&mut **tx).await?)
+        }
+        _ => Ok(false),
+    }
+}
+
+pub(crate) async fn occurrence_current(
+    tx: &mut Transaction<'_, Sqlite>,
+    actor: &Mailbox,
+    subject: &str,
+) -> Result<bool> {
+    let plan=sqlx::query_as::<_,Plan>("SELECT f.* FROM active_followups f JOIN active_attention o ON o.followup=f.id WHERE CAST(o.id AS TEXT)=? AND o.recipient=?")
+        .bind(subject).bind(actor.id).fetch_optional(&mut **tx).await?;
+    let Some(plan) = plan else {
+        return Ok(false);
+    };
+    if plan
+        .report()?
+        .is_some_and(|report| report.waiting.is_some())
+    {
+        waiting_satisfied(tx, &plan).await
+    } else {
+        Ok(true)
     }
 }
 
@@ -754,6 +866,7 @@ async fn advance_attention(
     p: &Plan,
     stage: i64,
     time: i64,
+    dependency_ready: bool,
 ) -> Result<()> {
     let recipient = if stage == 3 { p.authority } else { p.recipient };
     let operator_after = (stage == 3).then_some(if recipient == p.recipient {
@@ -762,7 +875,7 @@ async fn advance_attention(
         time.saturating_add(300)
     });
     let result = sqlx::query("INSERT OR IGNORE INTO attention_occurrences(followup,plan_version,stage,reason,recipient,created,operator_after) VALUES(?,?,?,?,?,?,?)")
-        .bind(p.id).bind(p.version).bind(stage).bind(if stage==3 {"escalation"} else {"reminder"}).bind(recipient).bind(time).bind(operator_after).execute(&mut **tx).await?;
+        .bind(p.id).bind(p.version).bind(stage).bind(if stage==3 {"escalation"} else if dependency_ready {"dependency_ready"} else {"reminder"}).bind(recipient).bind(time).bind(operator_after).execute(&mut **tx).await?;
     if result.rows_affected() == 1 && (stage != 3 || recipient != p.recipient) {
         sqlx::query("INSERT INTO coordination_events(recipient,kind,subject,version,created) VALUES(?,'attention_due',?,?,?)")
             .bind(recipient).bind(result.last_insert_rowid().to_string()).bind(p.version).bind(time).execute(&mut **tx).await?;
@@ -809,12 +922,12 @@ pub async fn reconcile(store: &Store, time: i64) -> Result<()> {
         .fetch_one(&mut *tx)
         .await?;
     // Bounded repair also covers registrations that became local after assignment.
-    sqlx::query("INSERT OR IGNORE INTO followups(group_name,message,recipient,authority,opened,next_check,escalate_at) SELECT b.group_name,d.message,b.id,m.sender,m.created,?+p.max_seconds,?+p.max_seconds FROM deliveries d JOIN messages m ON m.id=d.message JOIN mailboxes b ON b.id=d.recipient JOIN followup_policy p ON p.group_name=b.group_name WHERE d.state='pending' AND b.remote_machine IS NULL AND NOT EXISTS(SELECT 1 FROM followups f WHERE f.message=d.message AND f.recipient=b.id) ORDER BY m.id,b.id LIMIT 100")
+    sqlx::query("INSERT OR IGNORE INTO followups(group_name,message,recipient,authority,opened,next_check,escalate_at) SELECT b.group_name,d.message,b.id,m.sender,m.created,?+p.max_seconds,?+p.max_seconds FROM deliveries d JOIN messages m ON m.id=d.message JOIN mailboxes b ON b.id=d.recipient JOIN followup_policy p ON p.group_name=b.group_name WHERE m.intent='request' AND d.state='pending' AND b.remote_machine IS NULL AND NOT EXISTS(SELECT 1 FROM followups f WHERE f.message=d.message AND f.recipient=b.id) ORDER BY m.id,b.id LIMIT 100")
         .bind(time).bind(time).execute(&mut *tx).await?;
     sqlx::query("INSERT OR IGNORE INTO followups(group_name,task,task_version,recipient,authority,opened,next_check,escalate_at) SELECT w.group_name,w.id,w.version,b.id,a.id,w.updated,?+p.max_seconds,?+p.max_seconds FROM work_items w JOIN mailboxes b ON b.group_name=w.group_name AND b.name=w.owner JOIN mailboxes a ON a.group_name=w.group_name AND a.name=w.writer JOIN followup_policy p ON p.group_name=w.group_name WHERE w.open=1 AND b.remote_machine IS NULL AND NOT EXISTS(SELECT 1 FROM followups f WHERE f.group_name=w.group_name AND f.task=w.id) ORDER BY w.group_name,w.id LIMIT 100")
         .bind(time).bind(time).execute(&mut *tx).await?;
     let plans = sqlx::query_as::<_, Plan>(
-        "SELECT * FROM active_followups WHERE stage<3 OR (dependency_ready_at IS NULL AND json_extract(checkpoint,'$.waiting.kind') IN ('task','tasks','mail')) ORDER BY scanned,id LIMIT 100",
+        "SELECT * FROM active_followups WHERE stage<3 OR (dependency_ready_at IS NULL AND json_extract(checkpoint,'$.waiting.kind') IN ('task','tasks','mail','pull_request')) ORDER BY scanned,id LIMIT 100",
     )
     .fetch_all(&mut *tx)
     .await?;
@@ -833,8 +946,8 @@ pub async fn reconcile(store: &Store, time: i64) -> Result<()> {
             .fetch_one(&mut *tx)
             .await?;
         let retrieved = p.retrieved_at.is_some() && p.retrieved_binding == Some(binding);
-        let exhausted:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM coordination_events e JOIN mailboxes b ON b.id=e.recipient WHERE e.recipient=? AND ((e.kind='mail_pending' AND e.subject=CAST(? AS TEXT)) OR (e.kind='work_changed' AND e.subject=? AND e.version=?)) AND ((b.attempts>=3 AND b.wake_attempted>=e.id) OR EXISTS(SELECT 1 FROM runtime_wakes n WHERE n.recipient=b.id AND n.binding_version=b.binding_version AND n.attempts>=3 AND n.attempted>=e.id)))")
-            .bind(p.recipient).bind(p.message).bind(&p.task).bind(p.task_version).fetch_one(&mut *tx).await?;
+        let exhausted:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM coordination_events e JOIN mailboxes b ON b.id=e.recipient JOIN attention_attempts a ON a.recipient=e.recipient AND a.binding_version=b.binding_version AND a.event=e.id WHERE e.recipient=? AND ((e.kind='mail_pending' AND e.subject=CAST(? AS TEXT)) OR (e.kind='work_changed' AND e.subject=? AND e.version=?)) AND a.attempts>=3 AND a.next_attempt<=? AND NOT EXISTS(SELECT 1 FROM event_receipts r WHERE r.recipient=e.recipient AND r.binding_version=b.binding_version AND r.event=e.id))")
+            .bind(p.recipient).bind(p.message).bind(&p.task).bind(p.task_version).bind(time).fetch_one(&mut *tx).await?;
         let report = p.report()?;
         let unread = !retrieved && report.is_none();
         let waiting = report.as_ref().is_some_and(|r| r.waiting.is_some());
@@ -872,7 +985,7 @@ pub async fn reconcile(store: &Store, time: i64) -> Result<()> {
                 p.stage + 1
             };
         // Escalation is attention metadata, never a recursive mail obligation.
-        advance_attention(&mut tx, &p, stage, time).await?;
+        advance_attention(&mut tx, &p, stage, time, newly_satisfied).await?;
         if stage == 3 && newly_satisfied && !held {
             publish_dependency_ready(&mut tx, &p, time).await?;
         }
@@ -911,10 +1024,22 @@ impl Store {
                 .transpose()?;
             items.push(json!({"id":r.get::<i64,_>("id"),"group":r.get::<String,_>("group_name"),"task":r.get::<Option<String>,_>("task"),"task_version":r.get::<i64,_>("task_version"),"message":r.get::<Option<i64>,_>("message"),"version":r.get::<i64,_>("version"),"owner":r.get::<String,_>("owner"),"decision_owner":r.get::<String,_>("decision_owner"),"retrieved_at":r.get::<Option<i64>,_>("retrieved_at"),"retrieval_current":r.get::<Option<i64>,_>("retrieved_binding")==Some(r.get::<i64,_>("current_binding")),"checkpoint":checkpoint,"next_check_at":r.get::<i64,_>("next_check"),"escalate_at":r.get::<i64,_>("escalate_at"),"escalated":r.get::<i64,_>("stage")==3,"due":r.get::<i64,_>("next_check")<=time,"mode":r.get::<String,_>("mode")}));
         }
+        for item in &mut items {
+            if !item["checkpoint"].is_null() {
+                let report: Checkpoint = serde_json::from_value(item["checkpoint"].clone())?;
+                if let Some(wait) = report.waiting {
+                    item["external_condition"] =
+                        crate::external::condition_status(self, &wait).await?;
+                }
+            }
+        }
+        let delivery=sqlx::query("SELECT e.id,e.kind,e.subject,e.recipient,b.name,b.binding_version,a.attempts,a.next_attempt FROM attention_events e JOIN mailboxes b ON b.id=e.recipient JOIN attention_attempts a ON a.recipient=e.recipient AND a.binding_version=b.binding_version AND a.event=e.id WHERE (? IS NULL OR b.group_name=?) AND (? IS NULL OR e.recipient=?) ORDER BY a.next_attempt,e.id LIMIT 101")
+            .bind(group).bind(group).bind(actor).bind(actor).fetch_all(self.pool()).await?;
+        let attempts:Vec<Value>=delivery.iter().take(100).map(|r|json!({"event":r.get::<i64,_>("id"),"kind":r.get::<String,_>("kind"),"subject":r.get::<String,_>("subject"),"participant":r.get::<String,_>("name"),"binding_version":r.get::<i64,_>("binding_version"),"attempts":r.get::<i64,_>("attempts"),"next_attempt":r.get::<i64,_>("next_attempt"),"exhausted":r.get::<i64,_>("attempts")>=3 && r.get::<i64,_>("next_attempt")<=time})).collect();
         let notifications=sqlx::query("SELECT o.id,f.group_name,o.operator_state,o.operator_detail,o.operator_attempts,o.operator_next FROM active_attention o JOIN followups f ON f.id=o.followup WHERE o.stage=3 AND (? IS NULL OR f.group_name=?) AND (? IS NULL OR f.recipient=? OR f.authority=?) ORDER BY o.id DESC LIMIT 101").bind(group).bind(group).bind(actor).bind(actor).bind(actor).fetch_all(self.pool()).await?;
         let alerts:Vec<Value>=notifications.iter().take(100).map(|r|json!({"id":r.get::<i64,_>("id"),"group":r.get::<String,_>("group_name"),"state":r.get::<String,_>("operator_state"),"detail":r.get::<Option<String>,_>("operator_detail"),"attempts":r.get::<i64,_>("operator_attempts"),"next_attempt":r.get::<i64,_>("operator_next")})).collect();
         Ok(
-            json!({"totals":{"pending":totals.get::<i64,_>("pending"),"due":totals.get::<i64,_>("due"),"escalated":totals.get::<i64,_>("escalated")},"items":items,"more":more || notifications.len()>100,"operator_notifications":alerts,"remote_followup":"unsupported"}),
+            json!({"totals":{"pending":totals.get::<i64,_>("pending"),"due":totals.get::<i64,_>("due"),"escalated":totals.get::<i64,_>("escalated")},"items":items,"more":more || notifications.len()>100 || delivery.len()>100,"delivery_attempts":attempts,"operator_notifications":alerts,"remote_followup":"unsupported"}),
         )
     }
 }

@@ -58,11 +58,21 @@ enum Command {
     WatchChanges {
         group: String,
         after: Option<String>,
+        attention: bool,
+        consumer: Option<String>,
+    },
+    AttentionSnapshot {
+        group: String,
+    },
+    AttentionAcknowledge {
+        group: String,
+        token: String,
     },
     WaitMail {
         group: String,
         id: i64,
         timeout: Option<i64>,
+        predicate: agent_mail::followup::MailPredicate,
     },
     AckDelivery {
         group: String,
@@ -176,6 +186,7 @@ enum Command {
     Bridge(Bridge),
     /// Publish one durable message. Reuse its key when retrying.
     Send {
+        intent: agent_mail::states::MessageIntent,
         group: String,
         recipients: Vec<String>,
         key: String,
@@ -680,6 +691,7 @@ async fn run(cli: RunArgs) -> Result<()> {
             )?
         }
         Command::Send {
+            intent,
             group,
             recipients,
             key,
@@ -698,6 +710,7 @@ async fn run(cli: RunArgs) -> Result<()> {
                 .publish(
                     &actor,
                     Publish {
+                        intent,
                         recipients,
                         key,
                         summary,
@@ -729,6 +742,15 @@ async fn run(cli: RunArgs) -> Result<()> {
         Command::AttentionList { group, after } => {
             let actor = store.authenticate(&group, cli.session.as_ref()).await?;
             store.attention_list(&actor, after).await?
+        }
+        Command::AttentionSnapshot { group } => {
+            let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+            serde_json::to_value(store.attention_snapshot(&actor).await?)?
+        }
+        Command::AttentionAcknowledge { group, token } => {
+            let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+            store.acknowledge_attention(&actor, &token).await?;
+            json!({"acknowledged":true,"business_disposition_changed":false})
         }
         Command::AttentionShow { group, id } => {
             let actor = store.authenticate(&group, cli.session.as_ref()).await?;
@@ -832,12 +854,7 @@ async fn run(cli: RunArgs) -> Result<()> {
                 _ => anyhow::bail!("incomplete Claude messaging environment"),
             };
             match receipt {
-                Some(receipt_context) => {
-                    store
-                        .reserve_hook(&actor, &input.session_id.to_string(), false, false, now()?)
-                        .await?;
-                    receipt_context
-                }
+                Some(receipt_context) => receipt_context,
                 None => {
                     store
                         .hook(&actor, serde_json::from_slice(&bytes)?, now()?)
@@ -1058,10 +1075,55 @@ async fn run(cli: RunArgs) -> Result<()> {
                 serde_json::to_value(store.work_relations(&actor, &id, query).await?)?
             }
         },
-        Command::WatchChanges { group, after } => {
+        Command::WatchChanges {
+            group,
+            after,
+            attention,
+            consumer,
+        } => {
             use std::io::Write;
             let actor = store.authenticate(&group, cli.session.as_ref()).await?;
             let mut watch = store.watch(&actor, after.as_deref()).await?;
+            if attention {
+                if let Some(name) = &consumer {
+                    agent_mail::name(name)?;
+                }
+                let mut previous = None;
+                loop {
+                    let value = if let Some(name) = &consumer {
+                        store
+                            .claim_attention(
+                                &actor,
+                                agent_mail::names::DeliveryConsumer::Watch(name.parse()?),
+                                now()?,
+                            )
+                            .await?
+                            .map(serde_json::to_value)
+                            .transpose()?
+                    } else {
+                        Some(serde_json::to_value(
+                            store.attention_snapshot(&actor).await?,
+                        )?)
+                    };
+                    if let Some(value) = value {
+                        let changed = previous.as_ref() != Some(&value);
+                        if changed
+                            && value["items"]
+                                .as_array()
+                                .is_some_and(|items| !items.is_empty())
+                        {
+                            println!("{}", value);
+                            std::io::stdout().flush()?;
+                        }
+                        previous = Some(value);
+                    }
+                    if let Ok(result) =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), watch.next()).await
+                    {
+                        result?;
+                    }
+                }
+            }
             println!(
                 "{}",
                 json!({"type":"ready","group":group,"agent":actor.name,"cursor":watch.cursor()})
@@ -1073,14 +1135,20 @@ async fn run(cli: RunArgs) -> Result<()> {
                 std::io::stdout().flush()?;
             }
         }
-        Command::WaitMail { group, id, timeout } => {
+        Command::WaitMail {
+            group,
+            id,
+            timeout,
+            predicate,
+        } => {
             let actor = store.authenticate(&group, cli.session.as_ref()).await?;
             serde_json::to_value(
                 store
-                    .wait_mail(
+                    .wait_mail_for(
                         &actor,
                         id,
                         timeout.map(|seconds| std::time::Duration::from_secs(seconds as u64)),
+                        predicate,
                     )
                     .await?,
             )?

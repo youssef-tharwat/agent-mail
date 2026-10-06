@@ -289,6 +289,10 @@ pub struct RecipientOutcome {
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WaitOutcome {
+    /// Some recipients settled; others still owe a business disposition.
+    PartiallySettled,
+    /// All recipients settled but the requested reply condition cannot qualify.
+    Unsatisfied,
     /// At least one recipient sent a reply.
     Reply,
     /// Every recipient resolved or withdrew without sending a reply.
@@ -319,7 +323,7 @@ impl Store {
         let mut tx = self.pool().begin().await?;
         Self::check_actor(&mut tx, actor).await?;
         let request = sqlx::query!(
-            "SELECT deadline AS \"deadline?\" FROM messages WHERE id=? AND sender=?",
+            "SELECT deadline AS \"deadline?\" FROM messages WHERE id=? AND sender=? AND intent='request'",
             id,
             actor.id
         )
@@ -334,8 +338,10 @@ impl Store {
                 id,
                 outcome: if counts.replies > 0 {
                     WaitOutcome::Reply
-                } else {
+                } else if counts.pending == 0 {
                     WaitOutcome::Settled
+                } else {
+                    WaitOutcome::PartiallySettled
                 },
                 recipients: counts.recipients,
                 pending: counts.pending,
@@ -356,10 +362,39 @@ impl Store {
         id: i64,
         timeout: Option<Duration>,
     ) -> Result<WaitResult> {
+        self.wait_mail_for(
+            actor,
+            id,
+            timeout,
+            crate::followup::MailPredicate::FirstReplyOrAllSettled,
+        )
+        .await
+    }
+    /// Wait for an explicit mail predicate without recording any disposition.
+    /// # Errors
+    /// The request is not owned by the actor, the binding changes or transport fails.
+    pub async fn wait_mail_for(
+        &self,
+        actor: &Mailbox,
+        id: i64,
+        timeout: Option<Duration>,
+        predicate: crate::followup::MailPredicate,
+    ) -> Result<WaitResult> {
         let position = self.change_position(actor).await?;
         let (result, due) = self.request_outcome(actor, id).await?;
-        if result.pending == 0 || result.replies > 0 {
-            return Ok(result);
+        if predicate.satisfied(result.recipients, result.pending, result.replies)
+            || result.pending == 0
+        {
+            return Ok(
+                if predicate.satisfied(result.recipients, result.pending, result.replies) {
+                    result
+                } else {
+                    WaitResult {
+                        outcome: WaitOutcome::Unsatisfied,
+                        ..result
+                    }
+                },
+            );
         }
         let business_deadline = match due {
             Some(due) => Some(Duration::from_secs(
@@ -389,8 +424,19 @@ impl Store {
         // Recheck after subscribing: a racing resolution is visible even before its event arrives.
         loop {
             let (result, _) = self.request_outcome(actor, id).await?;
-            if result.pending == 0 || result.replies > 0 {
-                return Ok(result);
+            if predicate.satisfied(result.recipients, result.pending, result.replies)
+                || result.pending == 0
+            {
+                return Ok(
+                    if predicate.satisfied(result.recipients, result.pending, result.replies) {
+                        result
+                    } else {
+                        WaitResult {
+                            outcome: WaitOutcome::Unsatisfied,
+                            ..result
+                        }
+                    },
+                );
             }
             tokio::select! {
                 batch = watch.next() => { batch?; }

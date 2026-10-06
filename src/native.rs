@@ -349,20 +349,26 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
     .fetch_one(store.pool())
     .await?
     .id;
-    if latest <= endpoint.scanned {
+    let snapshot = store.attention_snapshot(actor).await?;
+    if latest <= endpoint.scanned && snapshot.items.is_empty() {
         return Ok(DeliveryState::Settled);
     }
-    let actionable = store.needs_wake(actor, endpoint.scanned).await?;
-    let cancellation = store.needs_cancellation(actor, endpoint.scanned).await?;
+    let candidates = store.attention_candidates(actor, time).await?;
+    let actionable = candidates
+        .iter()
+        .any(|i| i.reason != crate::states::AttentionReason::StopWork);
+    let cancellation = candidates
+        .iter()
+        .any(|i| i.reason == crate::states::AttentionReason::StopWork);
     if !actionable && !cancellation {
+        if !snapshot.items.is_empty() {
+            return Ok(DeliveryState::Waiting);
+        }
         store.scan_passive(actor, latest).await?;
         return Ok(DeliveryState::Passive);
     }
-    if latest == endpoint.attempted && endpoint.attempts >= 3 {
-        return Ok(DeliveryState::Exhausted);
-    }
     // A new event must not bypass a reserved or ambiguous attempt.
-    if endpoint.attempted > endpoint.scanned && endpoint.next_attempt > time {
+    if endpoint.attempts > 0 && endpoint.next_attempt > time && !cancellation {
         return Ok(DeliveryState::Waiting);
     }
     let thread = Uuid::parse_str(&endpoint.thread)?;
@@ -377,14 +383,6 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
         Peer::connect(kind, Path::new(&endpoint.socket), thread).await?
     };
     let inbox = matches!(peer, Peer::ClaudeInbox { .. });
-    let message_id = if inbox {
-        Uuid::new_v4().to_string()
-    } else {
-        format!(
-            "agent-mail-{}-{}-{}-{latest}",
-            actor.id, actor.binding_version, endpoint.thread
-        )
-    };
     let active = match peer.state().await? {
         State::Active if cancellation => true,
         State::Idle if actionable => false,
@@ -395,16 +393,40 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
         _ => return Ok(DeliveryState::Busy),
     };
     peer.prepare(active).await?;
+    let Some(batch) = store
+        .claim_attention(actor, crate::names::DeliveryConsumer::Native, time)
+        .await?
+    else {
+        return Ok(DeliveryState::Ineligible);
+    };
+    // Queue identity belongs to this exact reservation, including its receipt token.
+    // A cursor can remain unchanged across distinct pages and retry reservations.
+    let message_id = if inbox {
+        batch.token.clone()
+    } else {
+        format!(
+            "agent-mail-{}-{}-{}-{}",
+            actor.id, actor.binding_version, endpoint.thread, batch.token
+        )
+    };
+    let latest = batch
+        .attention
+        .items
+        .iter()
+        .map(|i| i.event)
+        .max()
+        .context("empty attention batch")?;
     // Persist the attempt before I/O. A crash or lost response consumes its budget.
     let mut tx = store.pool().begin().await?;
     Store::lock_actor(&mut tx, actor).await?;
-    let next = time + 300;
-    let reserved = sqlx::query!("UPDATE runtime_wakes SET attempts=CASE WHEN attempted=? THEN attempts+1 ELSE 1 END, attempted=?,next_attempt=? WHERE recipient=? AND binding_version=? AND socket=? AND thread=? AND scanned<? AND (attempted<=scanned OR next_attempt<=?) AND (attempted<>? OR attempts<3) AND EXISTS(SELECT 1 FROM groups WHERE name=? AND paused=0)",latest,latest,next,actor.id,actor.binding_version,endpoint.socket,endpoint.thread,latest,time,latest,actor.group_name).execute(&mut *tx).await?.rows_affected();
+    let next = batch.expires;
+    let reserved = sqlx::query!("UPDATE runtime_wakes SET attempts=CASE WHEN attempted=? THEN attempts+1 ELSE 1 END, attempted=?,next_attempt=? WHERE recipient=? AND binding_version=? AND socket=? AND thread=? AND EXISTS(SELECT 1 FROM groups WHERE name=? AND paused=0) AND EXISTS(SELECT 1 FROM attention_dispatch WHERE recipient=? AND binding_version=? AND token=?)",latest,latest,next,actor.id,actor.binding_version,endpoint.socket,endpoint.thread,actor.group_name,actor.id,actor.binding_version,batch.token).execute(&mut *tx).await?.rows_affected();
     if reserved != 0 && inbox {
         sqlx::query!(
-            "UPDATE claude_inboxes SET pending_id=?,pending_event=? WHERE recipient=?",
+            "UPDATE claude_inboxes SET pending_id=?,pending_event=?,pending_attention=? WHERE recipient=?",
             message_id,
             latest,
+            batch.token,
             actor.id
         )
         .execute(&mut *tx)
@@ -424,18 +446,24 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
             None
         }
     };
-    let delivery = store
-        .delivery(actor, challenge.as_deref(), endpoint.scanned)
-        .await?;
+    let mut text = Store::attention_text(&batch, true)?;
+    if let Some(nonce) = challenge.as_deref() {
+        text.push('\n');
+        text.push_str(&crate::verification::challenge(actor, nonce));
+    }
     // Hold the binding lock during the bounded send: replacement/detachment cannot race it.
     let mut tx = store.pool().begin().await?;
     Store::lock_actor(&mut tx, actor).await?;
-    let still_attached = sqlx::query!("SELECT recipient FROM runtime_wakes WHERE recipient=? AND binding_version=? AND socket=? AND thread=? AND EXISTS(SELECT 1 FROM groups WHERE name=? AND paused=0) AND NOT EXISTS(SELECT 1 FROM coordination_events WHERE recipient=? AND id>?)",actor.id,actor.binding_version,endpoint.socket,endpoint.thread,actor.group_name,actor.id,latest).fetch_optional(&mut *tx).await?.is_some();
+    let still_attached = sqlx::query!("SELECT recipient FROM runtime_wakes WHERE recipient=? AND binding_version=? AND socket=? AND thread=? AND EXISTS(SELECT 1 FROM groups WHERE name=? AND paused=0) AND EXISTS(SELECT 1 FROM attention_dispatch WHERE recipient=? AND token=?)",actor.id,actor.binding_version,endpoint.socket,endpoint.thread,actor.group_name,actor.id,batch.token).fetch_optional(&mut *tx).await?.is_some();
     ensure!(still_attached, "Runtime endpoint changed before delivery");
+    if !Store::validate_attention_tx(&mut tx, actor, &batch).await? {
+        tx.commit().await?;
+        return Ok(DeliveryState::StateChanged);
+    }
     if let Peer::ClaudeInbox { socket, endpoint } = &peer {
         crate::claude_inbox::verify(store, socket, endpoint)?;
     }
-    peer.send(thread, delivery.text, active, message_id).await?;
+    peer.send(thread, text, active, message_id).await?;
     if let Some(nonce) = challenge.as_deref() {
         sqlx::query!(
             "UPDATE delivery_probes SET transport_accepted_at=COALESCE(transport_accepted_at,?),healthy_at=?,failed=0 WHERE recipient=? AND binding_version=? AND nonce=?",
@@ -453,15 +481,14 @@ async fn deliver(store: &Store, actor: &Mailbox, time: i64) -> Result<DeliverySt
         return Ok(DeliveryState::AwaitingReceipt);
     }
     sqlx::query!(
-        "UPDATE runtime_wakes SET delivered=?,scanned=?,attempts=0,next_attempt=0 WHERE recipient=?",
-        latest,
+        "UPDATE runtime_wakes SET delivered=? WHERE recipient=?",
         latest,
         actor.id
     )
     .execute(&mut *tx)
     .await?;
-    // Queue acceptance acknowledges transport only. Business deliveries remain pending.
-    sqlx::query!("INSERT OR IGNORE INTO event_receipts(recipient,binding_version,event) SELECT recipient,?,id FROM coordination_events WHERE recipient=? AND id<=?",actor.binding_version,actor.id,latest).execute(&mut *tx).await?;
+    // Queue acceptance is not ingestion. Keep the reservation and bounded retry
+    // state until explicit batch acknowledgement or record retrieval.
     tx.commit().await?;
     Ok(DeliveryState::Queued)
 }

@@ -104,6 +104,20 @@ impl Demo {
     fn hook(&self, event: &str, active: bool) -> Result<Value> {
         self.call(Some(&self.worker), &["adapter", "hook"],Some(json!({"hook_event_name":event,"session_id":"test-client","stop_hook_active":active})),false)
     }
+    fn consume_hook(&self, session: &str, output: &Value) -> Result<()> {
+        if let Some(text) = output["hookSpecificOutput"]["additionalContext"].as_str() {
+            let state: Value = serde_json::from_str(text.lines().nth(1).unwrap())?;
+            if let Some(token) = state["receipt"]["token"].as_str() {
+                self.call(
+                    Some(session),
+                    &["attention", "acknowledge", token],
+                    None,
+                    false,
+                )?;
+            }
+        }
+        Ok(())
+    }
     fn decide(&self, value: Value, fail: bool) -> Result<Value> {
         let path = self.temp.path().join("decision.json");
         std::fs::write(&path, serde_json::to_vec(&value)?)?;
@@ -152,12 +166,10 @@ fn changes_publish_without_a_separate_send_and_receipts_do_not_resolve() -> Resu
             .iter()
             .any(|e| e["version"] == 2)
     );
-    assert!(
-        d.events(&d.writer)?["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|e| e["version"] == 2)
+    assert_eq!(
+        d.events(&d.writer)?["items"],
+        json!([]),
+        "the writer already consumed its own decision result"
     );
     Ok(())
 }
@@ -209,9 +221,9 @@ fn decisions_resolve_and_publish_once_or_roll_back_everything() -> Result<()> {
 }
 
 #[test]
-fn hooks_restore_after_reset_suppress_repeats_and_bound_stop_continuations() -> Result<()> {
+fn hooks_restore_after_reset_suppress_repeats_and_leave_turns_to_deadlines() -> Result<()> {
     let d = Demo::new()?;
-    // Retain coverage for the legacy recovery contract when automatic follow-through is off.
+    // Observation mode retains recovery and keeps reassessment with persisted policy.
     d.call(None, &["attention", "configure", "--observe"], None, false)?;
     d.create()?;
     let start = d.hook("SessionStart", false)?;
@@ -247,12 +259,13 @@ fn hooks_restore_after_reset_suppress_repeats_and_bound_stop_continuations() -> 
         "routine updates must not repeat the guide"
     );
     assert!(routine.len() <= 6000);
+    d.consume_hook(&d.worker, &update)?;
     assert_eq!(d.hook("Stop", false)?, json!({}));
     d.decide(
         json!({"version":2,"reason":"Clarify again","patch":{"next_action":"Check tests"}}),
         false,
     )?;
-    assert_eq!(d.hook("Stop", false)?["decision"], "block");
+    assert_eq!(d.hook("Stop", false)?, json!({}));
     assert_eq!(d.hook("Stop", true)?, json!({}));
     d.decide(
         json!({"version":3,"reason":"More work","patch":{"next_action":"Check diff"}}),
@@ -269,13 +282,13 @@ fn hooks_restore_after_reset_suppress_repeats_and_bound_stop_continuations() -> 
             .ends_with(agent_mail::SKILL)
     );
     assert!(recovered.to_string().contains("Check diff"));
-    // Compaction/restart always restores durable state; emissions never acknowledge events.
+    // Compaction/restart restores durable records and receipts only those actually returned.
     assert!(
         d.hook("SessionStart", false)?
             .to_string()
             .contains("Check diff")
     );
-    assert!(!d.events(&d.worker)?["items"].as_array().unwrap().is_empty());
+    assert!(d.events(&d.worker)?["items"].as_array().unwrap().is_empty());
     Ok(())
 }
 
@@ -290,10 +303,23 @@ async fn lost_hook_output_retries_with_a_persisted_budget_and_reset_restores() -
     let store = Store::open(dir.path(), true).await?;
     store.enroll("g", None).await?;
     store.register("g", "worker", false).await?;
+    store.register("g", "writer", false).await?;
     let actor = store.mailbox("g", "worker").await?;
+    let writer = store.mailbox("g", "writer").await?;
+    store
+        .hook(
+            &actor,
+            HookInput {
+                hook_event_name: HookEvent::SessionStart,
+                session_id: "client".into(),
+                stop_hook_active: false,
+            },
+            999,
+        )
+        .await?;
     store
         .work_create(
-            &actor,
+            &writer,
             WorkDraft {
                 id: "task".into(),
                 scope: "Review".into(),
@@ -306,11 +332,20 @@ async fn lost_hook_output_retries_with_a_persisted_budget_and_reset_restores() -
             1000,
         )
         .await?;
-    // Reserve, then lose output entirely. No receipt is manufactured.
-    assert!(
+    // Emit a claimed batch, then lose its output. No ingestion receipt is manufactured.
+    assert_ne!(
         store
-            .reserve_hook(&actor, "client", true, false, 1000)
-            .await?
+            .hook(
+                &actor,
+                HookInput {
+                    hook_event_name: HookEvent::PostToolUse,
+                    session_id: "client".into(),
+                    stop_hook_active: false
+                },
+                1000
+            )
+            .await?,
+        json!({})
     );
     store.close().await;
     let store = Store::open(dir.path(), false).await?;

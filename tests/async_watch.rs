@@ -37,6 +37,7 @@ fn task(id: &str) -> WorkDraft {
 }
 fn mail(recipients: &[&str], key: &str, due_after: Option<i64>) -> Publish {
     Publish {
+        intent: agent_mail::states::MessageIntent::Request,
         recipients: recipients.iter().map(|value| (*value).into()).collect(),
         key: key.into(),
         summary: "Please review".into(),

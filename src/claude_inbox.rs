@@ -147,7 +147,7 @@ impl Store {
             tx.commit().await?;
             return Ok(None);
         }
-        let endpoint = sqlx::query!("SELECT i.pending_id,i.pending_event FROM claude_inboxes i JOIN runtime_wakes w ON w.recipient=i.recipient WHERE i.recipient=? AND w.binding_version=? AND w.socket=? AND w.thread=? AND i.token=? AND i.socket_identity=?",actor.id,actor.binding_version,socket,session,token,identity).fetch_optional(&mut *tx).await?.context("Claude inbox is not registered for this session; restart with its startup hook")?;
+        let endpoint = sqlx::query!("SELECT i.pending_id,i.pending_event,i.pending_attention FROM claude_inboxes i JOIN runtime_wakes w ON w.recipient=i.recipient WHERE i.recipient=? AND w.binding_version=? AND w.socket=? AND w.thread=? AND i.token=? AND i.socket_identity=?",actor.id,actor.binding_version,socket,session,token,identity).fetch_optional(&mut *tx).await?.context("Claude inbox is not registered for this session; restart with its startup hook")?;
         let activity = match input.hook_event_name {
             Event::Stop | Event::StopFailure => InboxActivity::Idle,
             Event::SessionEnd => InboxActivity::Ended,
@@ -174,17 +174,36 @@ impl Store {
             None
         };
         let context = if receipt {
-            let delivery = self.delivery(actor, challenge.as_deref(), 0).await?;
-            Some(delivery.text)
+            let token = endpoint
+                .pending_attention
+                .as_deref()
+                .context("notification lacks an attention batch; recover context")?;
+            let mut text = {
+                let row=sqlx::query!("SELECT consumer,expires,items FROM attention_dispatch WHERE recipient=? AND binding_version=? AND token=?",actor.id,actor.binding_version,token).fetch_optional(&mut *tx).await?.context("delivery batch was replaced; recover context")?;
+                let batch = crate::notification::Batch {
+                    token: token.into(),
+                    consumer: row.consumer.parse()?,
+                    expires: row.expires,
+                    attention: serde_json::from_str(&row.items)?,
+                };
+                Store::attention_text(&batch, false)?
+            };
+            if let Some(nonce) = challenge.as_deref() {
+                text.push('\n');
+                text.push_str(&crate::verification::challenge(actor, nonce));
+            }
+            Some(text)
         } else {
             None
         };
         if receipt {
             let event = endpoint.pending_event;
             sqlx::query!("UPDATE runtime_wakes SET delivered=MAX(delivered,?),scanned=MAX(scanned,?),attempts=0,next_attempt=0 WHERE recipient=?",event,event,actor.id).execute(&mut *tx).await?;
-            sqlx::query!("INSERT OR IGNORE INTO event_receipts(recipient,binding_version,event) SELECT recipient,?,id FROM coordination_events WHERE recipient=? AND id<=?",actor.binding_version,actor.id,event).execute(&mut *tx).await?;
+            if let Some(token) = endpoint.pending_attention.as_deref() {
+                Self::acknowledge_attention_tx(&mut tx, actor, token).await?;
+            }
             sqlx::query!(
-                "UPDATE claude_inboxes SET pending_id=NULL,pending_event=0 WHERE recipient=?",
+                "UPDATE claude_inboxes SET pending_id=NULL,pending_event=0,pending_attention=NULL WHERE recipient=?",
                 actor.id
             )
             .execute(&mut *tx)

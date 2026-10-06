@@ -84,10 +84,15 @@ alerts require a configured notification route.
 
 ```sh
 agent-mail context                  # Recover assignments and pending requests
-agent-mail watch                    # Stream changes
+agent-mail attention snapshot       # Inspect current reasons for attention
+agent-mail watch --attention         # Observe attention without claiming delivery
 agent-mail mail wait 42 --timeout 5m # Wait for a reply or settlement
 agent-mail status                   # Inspect delivery health
 ```
+
+Use `mail send --intent notice` for quiet information. `mail reply` resolves the
+incoming request and returns a response for inspection without requiring another
+reply. Mail waits can require `--until all-settled` for a fan-out request.
 
 **Ready** in status means delivery is verified. Task completion requires a writer
 decision. [Delivery and repair](docs/usage.md#delivery-verification-08).

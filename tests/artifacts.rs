@@ -603,6 +603,7 @@ async fn paginated_targets_and_record_message_inspection_preserve_visibility() -
         .publish(
             &actor,
             agent_mail::store::Publish {
+                intent: agent_mail::states::MessageIntent::Request,
                 recipients: vec!["recipient".into()],
                 key: "artifact-inspect".into(),
                 summary: "Review".into(),

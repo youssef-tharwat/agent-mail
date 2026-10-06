@@ -8,7 +8,7 @@ description: >-
 
 Use the skill bundled with the running binary: `agent-mail --skill`. Startup and
 recovery hooks supply it automatically; do not reload instructions already in
-context. This guide matches 0.11; use the installed binary's guide for older versions.
+context. This guide matches 0.12; use the installed binary's guide for older versions.
 Use `agent-mail COMMAND --help` for syntax. Task/mail/agent operations return JSON;
 `status` is a readable summary, `status --json` returns structured data, and
 `status --check NAME` returns detailed diagnostics. `run` preserves the child interface.
@@ -80,12 +80,14 @@ only for the intended group; do not guess groups to repair access failures.
 | Need | Operation and effect |
 |---|---|
 | New request, blocker or result | `mail send RECIPIENT "SUMMARY" --key KEY --task ID`; creates a pending obligation for the recipient. |
-| Final answer to an inbox request | `mail reply MESSAGE_ID "ANSWER"`; sends an answer and resolves your delivery atomically. The answer is pending in the sender's inbox. |
+| Quiet information or a routine broadcast | `mail send RECIPIENT "SUMMARY" --intent notice --key KEY`; preserves information without a reply, deadline, follow-up, or model interruption. |
+| Final answer to an inbox request | `mail reply MESSAGE_ID "ANSWER"`; sends a response and resolves your delivery atomically. The requester receives attention to inspect the response; no reciprocal reply or resolution is owed. |
 | Outcome with no answer needed | `mail resolve MESSAGE_ID --note "OUTCOME"`; resolves your delivery without sending mail. |
 | Withdraw your outgoing request | `mail withdraw MESSAGE_ID`; does not cancel or accept its task. |
 | Decide a task and settle linked incoming mail | `task update ID ... --resolve MESSAGE_ID`; commits both or neither. |
 
-Reading and delivery receipts never resolve an obligation. Use a new `mail send`
+Use `mail show` to inspect notices and responses; they need no resolve command.
+Reading and delivery receipts never resolve a request. Use a new `mail send`
 for interim discussion while the original request remains actionable; `reply` is
 final, and resolving first then replying conflicts. Each new logical send needs
 its own key; reuse the same key and identical content only for retries. Include
@@ -98,8 +100,22 @@ it grants no permission to retry tools, reassign work or accept a result.
 
 ## Follow changes and wait for a reply
 
-Use `agent-mail watch` when coordinating multiple active agents. It streams
-small groups of changed mail/task IDs and reconnects if the local worker restarts.
+Use `agent-mail attention snapshot` to inspect current reasons for attention.
+Native delivery, Herdr, and recovery hooks share one reservation for your current
+binding. Routine delivery updates stay in history and create no model interruption.
+After actually consuming a claimed batch, run its supplied
+`attention acknowledge TOKEN` command, or fetch the listed records. This receipts
+only that batch; it preserves unfinished requests and tasks.
+
+For an explicit model-facing watch integration, use
+`agent-mail watch --attention --consumer coordinator`. It emits a bounded claimed
+batch with a token and generation. The integration must confirm model ingestion
+with `attention acknowledge TOKEN`. Printing or queue acceptance leaves its receipt
+unconfirmed; other delivery paths wait for the lease to expire. Use
+`watch --attention` for observation without claiming delivery.
+
+`agent-mail watch` streams the complete audit history, including passive updates,
+and reconnects if the local worker restarts.
 Fetch only the records needed with `mail show ID` or `task show ID`. For a durable
 resume, save the cursor from the last batch you handled and run
 `agent-mail watch --after CURSOR`; a cursor belongs to this local store, agent,
@@ -115,6 +131,8 @@ agent-mail mail wait MESSAGE_ID
 
 `mail wait` returns on the first reply, when every recipient settles without a
 reply, or when the request deadline is reached. Use `--timeout 5m` to stop earlier.
+Select `--until first-reply`, `--until any-settled`, or `--until all-settled` when
+that exact business outcome is required. Transport receipts never satisfy them.
 Without either deadline, it waits until one of those conditions is met. Its result
 reports reply IDs; fetch reply details with `mail show REPLY_ID`. Timeout leaves the
 request pending. Waiting does not complete linked work. A waiting agent should
@@ -364,8 +382,8 @@ workers waiting for that decision should not poll or invent authorization.
 
 `Ready` requires this exact acknowledgment and recent connection health. Evidence
 is invalidated by registration, launch or endpoint changes; a prior successful check
-is not proof of future delivery. Retry schedules are system-owned; agents do not
-maintain timers, acknowledge adapter events, or mark work complete on wake-up.
+is not proof of future delivery. Retry schedules are system-owned. Confirm batch
+ingestion only after consuming it; keep timers and retry budgets with the service.
 
 ## Follow through when yielding unfinished work
 
@@ -385,7 +403,10 @@ This records intent without changing task authority or resolving mail. Do not
 create a checkpoint after every tool call or repeat unchanged reports each turn.
 
 Waiting may name a local same-group task and qualifying states, an outgoing mail
-request, or a person/role responsible for an external condition. Preserve explicit
+request with an explicit outcome predicate, a GitHub pull-request merge at an
+expected full head revision, or a person/role responsible for an external condition.
+GitHub observations use authenticated `gh` and persist through restart. Unsupported
+external conditions show manual supervision and their responsible role. Preserve explicit
 approval holds. A condition or timer waking you means reassess the current source,
 not permission to resume an action. Owners report blockers; writers still make task
 decisions. On version conflict, fetch current records and reconsider.
