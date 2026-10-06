@@ -565,10 +565,20 @@ impl Store {
     /// # Errors
     /// The participant is missing, its binding cannot be decoded, or the query fails.
     pub async fn mailbox(&self, group: &str, participant: &str) -> Result<Mailbox> {
+        self.find_mailbox(group, participant)
+            .await?
+            .context("participant is not registered in this group")
+    }
+
+    pub(crate) async fn find_mailbox(
+        &self,
+        group: &str,
+        participant: &str,
+    ) -> Result<Option<Mailbox>> {
         sqlx::query_as!(MailboxRow,
             "SELECT id,group_name,name,binding,binding_version,agent_state AS 'state: AgentState',agent_version AS version,agent_updated AS updated,attempts,next_wake,alerted FROM mailboxes WHERE group_name=? AND name=?",
             group, participant).fetch_optional(self.pool()).await?
-            .context("participant is not registered in this group")?.try_into()
+            .map(Mailbox::try_from).transpose()
     }
 
     /// Look up a participant by its bound Herdr pane.

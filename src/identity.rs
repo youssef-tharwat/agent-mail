@@ -106,11 +106,16 @@ impl Store {
     pub async fn launch_identity(&self, group: &str, name: &str) -> Result<Mailbox> {
         crate::name(name)?;
         self.group(group).await?;
-        let binding = serde_json::to_string(&Binding::Standalone {
-            session: Uuid::new_v4(),
-        })?;
-        sqlx::query!("INSERT INTO mailboxes(group_name,name,binding) VALUES (?,?,?) ON CONFLICT(group_name,name) DO NOTHING",group,name,binding).execute(self.pool()).await?;
-        let actor = self.mailbox(group, name).await?;
+        let actor = match self.find_mailbox(group, name).await? {
+            Some(actor) => actor,
+            None => {
+                let binding = serde_json::to_string(&Binding::Standalone {
+                    session: Uuid::new_v4(),
+                })?;
+                sqlx::query!("INSERT INTO mailboxes(group_name,name,binding) VALUES (?,?,?) ON CONFLICT(group_name,name) DO NOTHING",group,name,binding).execute(self.pool()).await?;
+                self.mailbox(group, name).await?
+            }
+        };
         anyhow::ensure!(
             actor.state == crate::states::AgentState::Registered,
             "agent is retired; restore it explicitly before launching"

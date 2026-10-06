@@ -1,4 +1,5 @@
 //! Exercise process-scoped identity and native-client launch arguments.
+mod support;
 use anyhow::{Result, ensure};
 use serde_json::Value;
 use std::{
@@ -134,6 +135,40 @@ fn launch_preserves_exit_status_signals_and_creates_missing_identity() -> Result
         .command(&["run", "alice", "--", "/nonexistent/mail-client"])
         .output()?;
     assert!(!missing.status.success());
+    Ok(())
+}
+
+#[tokio::test]
+async fn existing_identity_launch_does_not_wait_for_an_unrelated_writer() -> Result<()> {
+    let d = Demo::new()?;
+    let store = agent_mail::store::Store::open(d.0.path(), false).await?;
+    let before = store.mailbox("demo", "alice").await?;
+    let pool = support::pool(&store).await?;
+    let mut writer = pool.begin().await?;
+    sqlx::query("UPDATE groups SET paused=paused WHERE name='demo'")
+        .execute(&mut *writer)
+        .await?;
+    let mut command = d.command(&["run", "alice", "--", "agent-mail", "--version"]);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        tokio::task::spawn_blocking(move || command.output()),
+    )
+    .await;
+    writer.rollback().await?;
+    let output = result???;
+    ensure!(
+        output.status.success(),
+        "registered read-only launch acquired the writer lock: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout)?.trim(),
+        concat!("agent-mail ", env!("CARGO_PKG_VERSION"))
+    );
+    let after = store.mailbox("demo", "alice").await?;
+    assert_eq!(before.id, after.id);
+    assert_eq!(before.binding_version, after.binding_version);
+    assert_eq!(before.version, after.version);
     Ok(())
 }
 
