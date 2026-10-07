@@ -24,7 +24,7 @@ Download the archive and its checksum from [GitHub Releases](https://github.com/
 For Apple Silicon:
 
 ```sh
-version=0.14.0
+version=0.14.1
 target=aarch64-apple-darwin
 archive="agent-mail-v${version}-${target}.tar.gz"
 base="https://github.com/youssef-tharwat/agent-mail/releases/download/v${version}"
@@ -123,6 +123,13 @@ is used. Use the same store for the CLI, client hooks and background worker.
 a runtime. Repeating init preserves a previously configured group connection.
 
 ## Messages
+
+Publish handoffs through durable Mail. A stopped recipient retains pending work;
+delivery never falls back to raw shell input. For direct Herdr interaction, use
+the live agent API (`herdr agent prompt`) and treat a refusal as an unavailable
+handoff. Pane output can outlive the agent process. Raw pane commands are reserved
+for intentional terminal commands, and restarting/rebinding a lane requires the
+workflow's authority. See the [handoff contract](agent-guide.md#setup-and-delivery-problems).
 
 ```sh
 agent-mail mail list

@@ -26,6 +26,8 @@ struct Host {
     enabled: bool,
     drop_prompt_response: bool,
     invalid_agent_response: bool,
+    prompt_error: Option<Value>,
+    methods: Vec<String>,
     prompt_gate: Option<Arc<PromptGate>>,
 }
 
@@ -95,6 +97,11 @@ impl Fixture {
                         return;
                     };
                     let mut host = shared.lock().await;
+                    host.methods
+                        .push(request["method"].as_str().unwrap_or_default().into());
+                    let prompt_error = (request["method"] == "agent.prompt")
+                        .then(|| host.prompt_error.clone())
+                        .flatten();
                     let gate = (request["method"] == "agent.prompt")
                         .then(|| host.prompt_gate.clone())
                         .flatten();
@@ -108,12 +115,14 @@ impl Fixture {
                             json!({"plugins":[{"plugin_id":PLUGIN_ID,"enabled":host.enabled}]})
                         }
                         "agent.prompt" => {
-                            host.prompts.push(
-                                request["params"]["text"]
-                                    .as_str()
-                                    .unwrap_or_default()
-                                    .to_string(),
-                            );
+                            if prompt_error.is_none() {
+                                host.prompts.push(
+                                    request["params"]["text"]
+                                        .as_str()
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                );
+                            }
                             if host.drop_prompt_response {
                                 return;
                             }
@@ -130,7 +139,11 @@ impl Fixture {
                         gate.entered.notify_one();
                         gate.release.notified().await;
                     }
-                    let response = format!("{}\n", json!({"id":request["id"],"result":result}));
+                    let response = match prompt_error {
+                        Some(error) => json!({"id":request["id"],"error":error}),
+                        None => json!({"id":request["id"],"result":result}),
+                    };
+                    let response = format!("{response}\n");
                     let _ = write.write_all(response.as_bytes()).await;
                 });
             }
@@ -170,6 +183,17 @@ impl Fixture {
 
     async fn send(&self, key: &str) -> Result<i64> {
         self.store.publish(&self.a, message(key), 1000).await
+    }
+
+    async fn mail_state(&self, id: i64) -> Result<agent_mail::states::MessageState> {
+        let pool = support::pool(&self.store).await?;
+        Ok(
+            sqlx::query_scalar("SELECT state FROM deliveries WHERE message=? AND recipient=?")
+                .bind(id)
+                .bind(self.b.id)
+                .fetch_one(&pool)
+                .await?,
+        )
     }
 
     async fn cli(&self, pane: &str, args: &[&str]) -> Result<std::process::Output> {
@@ -1436,6 +1460,117 @@ async fn manually_started_done_client_wakes_without_launch_metadata() -> Result<
     service::tick(&f.store, 1000).await?;
     assert_eq!(f.host.lock().await.prompts.len(), 1);
     assert!(f.host.lock().await.prompts[0].contains("act or checkpoint"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn stopped_agent_retains_handoff_and_resumes_only_with_live_identity() -> Result<()> {
+    use agent_mail::states::{DeliveryState, MessageState, TaskState};
+    let f = Fixture::new().await?;
+    let mail = f.send("stopped-handoff").await?;
+    f.store
+        .work_create(
+            &f.a,
+            WorkDraft {
+                id: "handoff".into(),
+                scope: "review".into(),
+                owner: "b".into(),
+                state: TaskState::Open,
+                next_action: "review when running".into(),
+                deadline: None,
+                evidence: vec![],
+            },
+            1000,
+        )
+        .await?;
+    {
+        let mut host = f.host.lock().await;
+        host.agents.retain(|a| a.pane_id != "w1:p2");
+        host.methods.clear();
+    }
+    let report = service::tick(&f.store, 1000).await?;
+    assert!(
+        report
+            .iter()
+            .any(|o| o.participant == "b" && o.state == DeliveryState::Unavailable)
+    );
+    {
+        let host = f.host.lock().await;
+        assert!(host.prompts.is_empty());
+        assert!(
+            !host
+                .methods
+                .iter()
+                .any(|m| m.starts_with("pane.") || m.starts_with("terminal."))
+        );
+    }
+    assert_eq!(f.store.mailbox("g", "b").await?.attempts, 0);
+    assert_eq!(f.mail_state(mail).await?, MessageState::Pending);
+    // A replacement client in the same pane does not inherit the old identity.
+    let mut replacement = agent("w1:p2");
+    replacement.agent_session.as_mut().unwrap().value = "replacement-session".into();
+    f.host.lock().await.agents.push(replacement);
+    let report = service::tick(&f.store, 1001).await?;
+    assert!(
+        report
+            .iter()
+            .any(|o| o.participant == "b" && o.state == DeliveryState::BindingMismatch)
+    );
+    assert!(f.host.lock().await.prompts.is_empty());
+    // The original verified client can receive the same queued obligation.
+    f.host.lock().await.agents[1] = agent("w1:p2");
+    let report = service::tick(&f.store, 1002).await?;
+    assert!(
+        report
+            .iter()
+            .any(|o| o.participant == "b" && o.state == DeliveryState::Queued)
+    );
+    assert_eq!(f.host.lock().await.prompts.len(), 1);
+    assert_eq!(f.store.inbox(&f.b, 0).await?[0].id, mail);
+    assert_eq!(f.mail_state(mail).await?, MessageState::Pending);
+    assert_eq!(
+        f.store.work_show(&f.a, "handoff").await?.state,
+        TaskState::Open
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn guarded_prompt_refusal_never_falls_back_to_shell_or_receipts_work() -> Result<()> {
+    use agent_mail::states::{DeliveryState, MessageState};
+    let f = Fixture::new().await?;
+    let mail = f.send("exit-during-handoff").await?;
+    {
+        let mut host = f.host.lock().await;
+        // The initial live checks passed; the guarded input operation refuses.
+        host.prompt_error = Some(json!({"message":"agent exited before guarded input"}));
+        host.methods.clear();
+    }
+    let report = service::tick(&f.store, 1000).await?;
+    let refused = report.iter().find(|o| o.participant == "b").unwrap();
+    assert_eq!(refused.state, DeliveryState::Uncertain);
+    assert!(refused.detail.as_deref().unwrap().contains("agent exited"));
+    {
+        let host = f.host.lock().await;
+        assert!(host.methods.iter().any(|m| m == "agent.prompt"));
+        assert!(
+            !host
+                .methods
+                .iter()
+                .any(|m| m.starts_with("pane.") || m.starts_with("terminal."))
+        );
+        assert!(host.prompts.is_empty());
+    }
+    let pool = support::pool(&f.store).await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM event_receipts WHERE recipient=?")
+            .bind(f.b.id)
+            .fetch_one(&pool)
+            .await?,
+        0
+    );
+    assert_eq!(f.store.inbox(&f.b, 0).await?[0].id, mail);
+    assert_eq!(f.mail_state(mail).await?, MessageState::Pending);
     Ok(())
 }
 

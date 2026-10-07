@@ -8,7 +8,8 @@ description: >-
 
 Use the skill bundled with the running binary: `agent-mail --skill`. Startup and
 recovery hooks supply it automatically; do not reload instructions already in
-context. This guide matches 0.13; use the installed binary's guide for older versions.
+context. The installed binary supplies its matching guide; `agent-mail --version`
+identifies that binary.
 Use `agent-mail COMMAND --help` for syntax. Task/mail/agent operations return JSON;
 `status` is a readable summary, `status --json` returns structured data, and
 `status --check NAME` returns detailed diagnostics. `run` preserves the child interface.
@@ -373,6 +374,21 @@ For a stalled handoff, use `agent-mail status --check NAME`. Distinguish:
 - Queued/received notification: transport evidence, not model understanding or completion.
 - Paused, missing endpoint or exhausted retries: an integration issue for the operator.
 
+Agent handoffs must use Mail's durable task/message path. Herdr's raw pane input
+is for intentional terminal commands, never for handoff prose. When direct agent
+interaction is necessary, use `herdr agent prompt` against the verified live
+agent; do not fall back to pane input or send-keys when it refuses. Old screen
+output, an earlier completed turn, and a registered address do not prove that a
+client is still running. A live `done` status means an idle client; text remaining
+after a client exits is only history.
+
+If the agent is stopped, retain its task and pending mail and report the unavailable
+endpoint. Continue independent authorized work. Restarting a lane and rebinding
+its new native session are explicit workflow decisions, not automatic delivery
+recovery. Read current task/mail after restart; do not create duplicate requests
+or claim receipt from successful terminal submission. Shell errors and a clean
+worktree alone do not establish that pasted prose had no effects.
+
 An ordinary worker reports the diagnostic and continues independent authorized
 work. Do not acknowledge adapter events on the integration's behalf or reset
 budgets to hide a stall. When authorized to repair setup, use the relevant
@@ -520,11 +536,12 @@ the returned cursor. `task history ID` and `task messages ID` page retained audi
 metadata. A task link does not grant another mailbox's private body. Normal
 `context` stays bounded and focuses on current obligations.
 
-Use `task relate ID --file relation.json` for explicit hierarchy, review context,
-and dependencies. `task relations ID` reads relationship facts, including
-terminal work. Specify the source revision when recovering review coverage.
-All/any prerequisites schedule reassessment through checkpoints; a wake never
-supplies approval or clears an approval hold.
+Use `task relate ID --file relation.json` for explicit hierarchy and review
+context. `task relations ID` reads relationship facts, including terminal work.
+Specify the source revision when recovering review coverage. Persistent
+prerequisites use `task dependencies ID --file plan.json`; checkpoint waits add
+temporary progress conditions. A wake never supplies approval or clears an
+approval hold.
 
 Use `task transfer-writer ID --file transfer.json` for an explicit authority
 handoff with observed task version, retry key, new writer, and reason. Owner

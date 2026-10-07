@@ -1,0 +1,860 @@
+diff --git a/docs/next/api/herdr-api.schema.json b/docs/next/api/herdr-api.schema.json
+index e2553f7..aaa3e6d 100644
+--- a/docs/next/api/herdr-api.schema.json
++++ b/docs/next/api/herdr-api.schema.json
+@@ -2151,6 +2151,13 @@
+           ],
+           "type": "object"
+         },
++        "InputTarget": {
++          "enum": [
++            "terminal",
++            "agent"
++          ],
++          "type": "string"
++        },
+         "IntegrationInstallParams": {
+           "properties": {
+             "target": {
+@@ -2613,6 +2620,26 @@
+           ],
+           "type": "object"
+         },
++        "PaneInputTargetSetParams": {
++          "properties": {
++            "pane_id": {
++              "type": "string"
++            },
++            "target": {
++              "$ref": "#/schemas/request/$defs/InputTarget"
++            },
++            "terminal_id": {
++              "description": "Observed terminal identity prevents releasing protection on a replacement.",
++              "type": "string"
++            }
++          },
++          "required": [
++            "pane_id",
++            "terminal_id",
++            "target"
++          ],
++          "type": "object"
++        },
+         "PaneLayoutParams": {
+           "properties": {
+             "pane_id": {
+@@ -6312,6 +6339,22 @@
+             "params"
+           ],
+           "type": "object"
++        },
++        {
++          "properties": {
++            "method": {
++              "const": "pane.input_target.set",
++              "type": "string"
++            },
++            "params": {
++              "$ref": "#/schemas/request/$defs/PaneInputTargetSetParams"
++            }
++          },
++          "required": [
++            "method",
++            "params"
++          ],
++          "type": "object"
+         }
+       ],
+       "properties": {
+diff --git a/docs/next/website/src/content/docs/agent-automation.mdx b/docs/next/website/src/content/docs/agent-automation.mdx
+index def306f..6daab9f 100644
+--- a/docs/next/website/src/content/docs/agent-automation.mdx
++++ b/docs/next/website/src/content/docs/agent-automation.mdx
+@@ -15,6 +15,16 @@ Use Herdr as an automation layer for coding agents. A script can control them, o
+ 
+ A pane exists whether or not it contains an agent. An agent is the recognized process currently running inside a pane. `agent start` therefore requires an existing shell pane and never creates, splits, or moves layout.
+ 
++Automation input has a persistent target separate from the current process. Starting or recognizing an agent reserves its terminal for agent input. Raw `pane send-text`, `pane send-keys`, and `pane run` reject with `agent_input_protected`, including after the agent exits. Use `agent prompt` and `agent send-keys` for a live agent. Human TUI input is unaffected.
++
++To deliberately reuse an exited agent's lane for shell commands, read `pane get` and explicitly release the observed terminal:
++
++```bash
++herdr pane input-target <pane_id> terminal --terminal <terminal_id>
++```
++
++Release requires the same terminal identity, no live or launching agent, and an idle shell. Use `agent` instead of `terminal` to reserve an empty lane before launching. Protection follows its terminal through pane moves, shell respawn, session restore, and live handoff. A refusal never retries through a raw input API; keep the durable task or message pending. Old screen output is history, not a live-agent check.
++
+ Creating a workspace also creates its first tab and root pane; creating a tab creates its root pane. Use the returned pane ID for the first process, and split only when that layout needs another terminal.
+ 
+ Creation commands print JSON. Capture IDs from the response instead of predicting them:
+diff --git a/docs/next/website/src/content/docs/cli-reference.mdx b/docs/next/website/src/content/docs/cli-reference.mdx
+index 5186fe7..99eac13 100644
+--- a/docs/next/website/src/content/docs/cli-reference.mdx
++++ b/docs/next/website/src/content/docs/cli-reference.mdx
+@@ -256,6 +256,7 @@ Send input:
+ herdr pane send-text <pane_id> <text>
+ herdr pane send-keys <pane_id> <key> [key ...]
+ herdr pane run <pane_id> <command>
++herdr pane input-target <pane_id> agent|terminal --terminal <observed_terminal_id>
+ ```
+ 
+ `<key>` uses Herdr key-combo syntax: plain printable keys such as `a`,
+@@ -268,6 +269,8 @@ aliases for `ctrl+c`.
+ 
+ `pane run` honors live bracketed-paste mode and submits text plus Enter atomically. Prefer it over `send-text` plus `send-keys Enter` for commands; the separate send operations remain low-level and non-submitting.
+ 
++Agent terminals remain reserved after exit. Raw pane input is rejected until `pane input-target ... terminal --terminal ...` explicitly releases the observed terminal while an idle shell is running. Use `agent prompt` and `agent send-keys` for agent interaction. The reservation is terminal-owned and persists across moves and restores.
++
+ Report agent state from custom hooks:
+ 
+ ```bash
+diff --git a/src/api/schema.rs b/src/api/schema.rs
+index 439ed33..4a2e446 100644
+--- a/src/api/schema.rs
++++ b/src/api/schema.rs
+@@ -249,6 +249,8 @@ pub enum Method {
+     PluginPaneFocus(PluginPaneFocusParams),
+     #[serde(rename = "plugin.pane.close")]
+     PluginPaneClose(PluginPaneCloseParams),
++    #[serde(rename = "pane.input_target.set")]
++    PaneInputTargetSet(PaneInputTargetSetParams),
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/api/schema/panes.rs b/src/api/schema/panes.rs
+index 9dbe022..ea05ebf 100644
+--- a/src/api/schema/panes.rs
++++ b/src/api/schema/panes.rs
+@@ -328,6 +328,14 @@ pub struct PaneSendTextParams {
+     pub text: String,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
++pub struct PaneInputTargetSetParams {
++    pub pane_id: String,
++    /// Observed terminal identity prevents releasing protection on a replacement.
++    pub terminal_id: String,
++    pub target: crate::terminal::InputTarget,
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+ pub struct PaneSendKeysParams {
+     pub pane_id: String,
+diff --git a/src/api/server.rs b/src/api/server.rs
+index 0a4cfa6..74c36a0 100644
+--- a/src/api/server.rs
++++ b/src/api/server.rs
+@@ -678,6 +678,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
+         Method::PaneLinkResolve(_) => "pane.link.resolve",
+         Method::PaneRename(_) => "pane.rename",
+         Method::PaneSendText(_) => "pane.send_text",
++        Method::PaneInputTargetSet(_) => "pane.input_target.set",
+         Method::PaneSendKeys(_) => "pane.send_keys",
+         Method::PaneSendInput(_) => "pane.send_input",
+         Method::PaneRead(_) => "pane.read",
+diff --git a/src/app/agents.rs b/src/app/agents.rs
+index 0aa26fb..0779755 100644
+--- a/src/app/agents.rs
++++ b/src/app/agents.rs
+@@ -219,6 +219,7 @@ impl App {
+             terminal.clear_agent_name();
+             return Err(AgentStartError::InputFailed(err.to_string()));
+         }
++        terminal.input_target = crate::terminal::InputTarget::Agent;
+         if let Some(session) = persisted_agent_session {
+             terminal.set_managed_agent_launch_session(session);
+         }
+@@ -416,7 +417,7 @@ impl App {
+     }
+ }
+ 
+-fn available_shell_name(runtime: &crate::terminal::TerminalRuntime) -> Option<String> {
++pub(super) fn available_shell_name(runtime: &crate::terminal::TerminalRuntime) -> Option<String> {
+     #[cfg(test)]
+     if runtime.child_pid().is_none() {
+         return Some("sh".into());
+diff --git a/src/app/api.rs b/src/app/api.rs
+index 9bc3736..63252fd 100644
+--- a/src/app/api.rs
++++ b/src/app/api.rs
+@@ -687,6 +687,10 @@ impl App {
+     }
+ 
+     pub(crate) fn emit_pane_state_update(&mut self, update: &crate::app::actions::PaneStateUpdate) {
++        if update.previous_agent_label != update.agent_label && update.agent_label.is_some() {
++            self.state.mark_session_dirty();
++            self.schedule_session_save();
++        }
+         let Some(pane_id) = self.public_pane_id(update.ws_idx, update.pane_id) else {
+             return;
+         };
+@@ -1202,6 +1206,9 @@ impl App {
+                 return self.handle_pane_release_agent(request.id, params);
+             }
+             Method::PaneSendText(params) => return self.handle_pane_send_text(request.id, params),
++            Method::PaneInputTargetSet(params) => {
++                return self.handle_pane_input_target_set(request.id, params)
++            }
+             Method::PaneSendInput(params) => {
+                 return self.handle_pane_send_input(request.id, params);
+             }
+diff --git a/src/app/api/panes.rs b/src/app/api/panes.rs
+index 435ecdc..08d62c0 100644
+--- a/src/app/api/panes.rs
++++ b/src/app/api/panes.rs
+@@ -31,6 +31,79 @@ use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
+ use super::responses::{encode_error, encode_success};
+ 
+ impl App {
++    fn guard_raw_pane_input(
++        &self,
++        id: &str,
++        ws_idx: usize,
++        pane_id: PaneId,
++        public_id: &str,
++    ) -> Result<(), String> {
++        let terminal = self
++            .state
++            .terminal_id_for_pane(ws_idx, pane_id)
++            .and_then(|terminal_id| self.state.terminals.get(&terminal_id))
++            .ok_or_else(|| pane_not_found(id.to_owned(), public_id))?;
++        if terminal.input_target == crate::terminal::InputTarget::Agent
++            || terminal.is_agent_terminal()
++        {
++            return Err(encode_error(id.to_owned(), "agent_input_protected",
++                "terminal is reserved for agent input; use agent.prompt or agent.send_keys. After the client exits, explicitly set the input target to terminal using its observed terminal_id"));
++        }
++        Ok(())
++    }
++
++    pub(super) fn handle_pane_input_target_set(
++        &mut self,
++        id: String,
++        params: crate::api::schema::PaneInputTargetSetParams,
++    ) -> String {
++        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
++            return pane_not_found(id, &params.pane_id);
++        };
++        let Some(terminal_id) = self.state.terminal_id_for_pane(ws_idx, pane_id) else {
++            return pane_not_found(id, &params.pane_id);
++        };
++        if terminal_id.as_str() != params.terminal_id {
++            return encode_error(
++                id,
++                "terminal_identity_changed",
++                "pane no longer hosts the observed terminal",
++            );
++        }
++        if params.target == crate::terminal::InputTarget::Terminal
++            && self
++                .lookup_runtime_sender(ws_idx, pane_id)
++                .and_then(crate::app::agents::available_shell_name)
++                .is_none()
++        {
++            return encode_error(
++                id,
++                "terminal_not_idle_shell",
++                "raw terminal input requires a live idle shell",
++            );
++        }
++        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
++            return pane_not_found(id, &params.pane_id);
++        };
++        if params.target == crate::terminal::InputTarget::Terminal
++            && (terminal.is_agent_terminal() || terminal.managed_agent_kind().is_some())
++        {
++            return encode_error(
++                id,
++                "agent_still_running",
++                "cannot release agent input protection while an agent is present or launching",
++            );
++        }
++        if terminal.input_target != params.target {
++            terminal.input_target = params.target;
++            terminal.revision = terminal.revision.saturating_add(1);
++            self.state.mark_session_dirty();
++            self.schedule_session_save();
++            self.emit_pane_updated(ws_idx, pane_id);
++        }
++        encode_success(id, ResponseResult::Ok {})
++    }
++
+     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
+         let target = if let Some(target_pane_id) = params.target_pane_id.as_deref() {
+             self.parse_pane_id(target_pane_id)
+@@ -1917,6 +1990,9 @@ impl App {
+         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+             return pane_not_found(id, &params.pane_id);
+         };
++        if let Err(response) = self.guard_raw_pane_input(&id, ws_idx, pane_id, &params.pane_id) {
++            return response;
++        }
+         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+             return pane_not_found(id, &params.pane_id);
+         };
+@@ -1935,6 +2011,9 @@ impl App {
+         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+             return pane_not_found(id, &params.pane_id);
+         };
++        if let Err(response) = self.guard_raw_pane_input(&id, ws_idx, pane_id, &params.pane_id) {
++            return response;
++        }
+         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+             return pane_not_found(id, &params.pane_id);
+         };
+@@ -2037,6 +2116,9 @@ impl App {
+         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+             return pane_not_found(id, &params.pane_id);
+         };
++        if let Err(response) = self.guard_raw_pane_input(&id, ws_idx, pane_id, &params.pane_id) {
++            return response;
++        }
+         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+             return pane_not_found(id, &params.pane_id);
+         };
+@@ -2384,6 +2466,114 @@ mod tests {
+         (app, public_pane_id, rx)
+     }
+ 
++    #[tokio::test]
++    async fn agent_input_guard_rejects_all_raw_paths_until_explicit_identity_checked_release() {
++        use crate::api::schema::{Method, PaneInputTargetSetParams, Request};
++        use crate::terminal::InputTarget;
++        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(8);
++        app.state.active = Some(0);
++        app.state.mode = Mode::Terminal;
++        let internal = app.state.workspaces[0].tabs[0].root_pane;
++        let terminal_id = app.state.terminal_id_for_pane(0, internal).unwrap();
++        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
++        terminal.set_detected_agent_process_at(Agent::Claude, std::time::Instant::now());
++        assert_eq!(terminal.input_target, InputTarget::Agent);
++        terminal.clear_agent_runtime_identity_after_respawn();
++        assert!(!terminal.is_agent_terminal());
++        assert_eq!(terminal.input_target, InputTarget::Agent);
++        for method in [
++            Method::PaneSendText(PaneSendTextParams {
++                pane_id: pane_id.clone(),
++                text: "handoff prose".into(),
++            }),
++            Method::PaneSendInput(PaneSendInputParams {
++                pane_id: pane_id.clone(),
++                text: "handoff prose".into(),
++                keys: vec!["Enter".into()],
++            }),
++            Method::PaneSendKeys(PaneSendKeysParams {
++                pane_id: pane_id.clone(),
++                keys: vec!["h".into(), "Enter".into()],
++            }),
++        ] {
++            let response: ErrorResponse = serde_json::from_str(&app.handle_api_request(Request {
++                id: "raw".into(),
++                method,
++            }))
++            .unwrap();
++            assert_eq!(response.error.code, "agent_input_protected");
++            assert!(
++                rx.try_recv().is_err(),
++                "guard must reject before writing any bytes"
++            );
++        }
++        let stale: ErrorResponse = serde_json::from_str(&app.handle_api_request(Request {
++            id: "stale".into(),
++            method: Method::PaneInputTargetSet(PaneInputTargetSetParams {
++                pane_id: pane_id.clone(),
++                terminal_id: "replaced-terminal".into(),
++                target: InputTarget::Terminal,
++            }),
++        }))
++        .unwrap();
++        assert_eq!(stale.error.code, "terminal_identity_changed");
++        assert_eq!(
++            app.state.terminals[&terminal_id].input_target,
++            InputTarget::Agent
++        );
++        let release_response = app.handle_api_request(Request {
++            id: "release".into(),
++            method: Method::PaneInputTargetSet(PaneInputTargetSetParams {
++                pane_id: pane_id.clone(),
++                terminal_id: terminal_id.to_string(),
++                target: InputTarget::Terminal,
++            }),
++        });
++        let released: SuccessResponse = serde_json::from_str(&release_response)
++            .unwrap_or_else(|_| panic!("{release_response}"));
++        assert_eq!(released.result, ResponseResult::Ok {});
++        let sent: SuccessResponse = serde_json::from_str(&app.handle_pane_send_text(
++            "command".into(),
++            PaneSendTextParams {
++                pane_id,
++                text: "pwd".into(),
++            },
++        ))
++        .unwrap();
++        assert_eq!(sent.result, ResponseResult::Ok {});
++        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"pwd"));
++        app.state.assert_invariants_for_test();
++    }
++
++    #[tokio::test]
++    async fn live_agent_cannot_be_reclassified_as_terminal_input() {
++        use crate::api::schema::{Method, PaneInputTargetSetParams, Request};
++        use crate::terminal::InputTarget;
++        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(1);
++        let internal = app.state.workspaces[0].tabs[0].root_pane;
++        let terminal_id = app.state.terminal_id_for_pane(0, internal).unwrap();
++        app.state
++            .terminals
++            .get_mut(&terminal_id)
++            .unwrap()
++            .set_detected_agent_process_at(Agent::Claude, std::time::Instant::now());
++        let response: ErrorResponse = serde_json::from_str(&app.handle_api_request(Request {
++            id: "release".into(),
++            method: Method::PaneInputTargetSet(PaneInputTargetSetParams {
++                pane_id,
++                terminal_id: terminal_id.to_string(),
++                target: InputTarget::Terminal,
++            }),
++        }))
++        .unwrap();
++        assert_eq!(response.error.code, "agent_still_running");
++        assert_eq!(
++            app.state.terminals[&terminal_id].input_target,
++            InputTarget::Agent
++        );
++        assert!(rx.try_recv().is_err());
++    }
++
+     fn app_with_scrollback_runtime() -> (App, String, PaneId) {
+         let (mut app, public_pane_id) = app_with_test_workspace();
+         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+diff --git a/src/cli/pane.rs b/src/cli/pane.rs
+index 33583ee..dcba612 100644
+--- a/src/cli/pane.rs
++++ b/src/cli/pane.rs
+@@ -29,6 +29,7 @@ pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
+         "read" => pane_read(&args[1..]),
+         "rename" => pane_rename(&args[1..]),
+         "input" => pane_input(&args[1..]),
++        "input-target" => pane_input_target(&args[1..]),
+         "split" => pane_split(&args[1..]),
+         "swap" => pane_swap(&args[1..]),
+         "move" => pane_move(&args[1..]),
+@@ -52,6 +53,28 @@ pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
+     }
+ }
+ 
++fn pane_input_target(args: &[String]) -> std::io::Result<i32> {
++    if args.len() != 4 || args[2] != "--terminal" {
++        eprintln!("usage: herdr pane input-target <pane_id> agent|terminal --terminal <observed_terminal_id>");
++        return Ok(2);
++    }
++    let target = match args[1].parse() {
++        Ok(target) => target,
++        Err(error) => {
++            eprintln!("{error}");
++            return Ok(2);
++        }
++    };
++    super::print_response(&super::send_request(&Request {
++        id: "cli:pane:input-target".into(),
++        method: Method::PaneInputTargetSet(crate::api::schema::PaneInputTargetSetParams {
++            pane_id: super::normalize_pane_id(&args[0]),
++            terminal_id: args[3].clone(),
++            target,
++        }),
++    })?)
++}
++
+ fn pane_list(args: &[String]) -> std::io::Result<i32> {
+     let mut workspace_id = None;
+ 
+@@ -1703,6 +1726,9 @@ fn print_pane_help() {
+     eprintln!("  herdr pane release-agent <pane_id> --source ID --agent LABEL [--seq N]");
+     eprintln!("  herdr pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--state-label STATUS=TEXT] [--clear-state-labels] [--token NAME=VALUE] [--clear-token NAME] [--seq N] [--ttl-ms N]");
+     eprintln!("  herdr pane run <pane_id> <command>");
++    eprintln!(
++        "  herdr pane input-target <pane_id> agent|terminal --terminal <observed_terminal_id>"
++    );
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/cli/spec.rs b/src/cli/spec.rs
+index 9a503a1..2b8b722 100644
+--- a/src/cli/spec.rs
++++ b/src/cli/spec.rs
+@@ -475,6 +475,11 @@ fn pane_command() -> Command {
+                 .args(current_pane_args()),
+         )
+         .subcommand(id_command("get", "pane_id", "Show a pane"))
++        .subcommand(Command::new("input-target")
++            .about("Reserve automation input for agents, or explicitly return an idle terminal to raw input")
++            .arg(required("pane_id", "PANE_ID"))
++            .arg(required("target", "agent|terminal").value_parser(["agent", "terminal"]))
++            .arg(option("terminal", "OBSERVED_TERMINAL_ID").required(true)))
+         .subcommand(
+             Command::new("layout")
+                 .about("Show pane layout information")
+@@ -1196,6 +1201,37 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn pane_input_target_requires_observed_identity_and_a_known_target() {
++        for target in ["agent", "terminal"] {
++            assert!(super::command()
++                .try_get_matches_from([
++                    "herdr",
++                    "pane",
++                    "input-target",
++                    "pane:1",
++                    target,
++                    "--terminal",
++                    "terminal:1",
++                ])
++                .is_ok());
++        }
++        for invalid in [
++            &["herdr", "pane", "input-target", "pane:1", "terminal"][..],
++            &[
++                "herdr",
++                "pane",
++                "input-target",
++                "pane:1",
++                "shell",
++                "--terminal",
++                "terminal:1",
++            ][..],
++        ] {
++            assert!(super::command().try_get_matches_from(invalid).is_err());
++        }
++    }
++
+     #[test]
+     fn agent_prompt_until_requires_wait() {
+         let error = super::command()
+diff --git a/src/persist/restore.rs b/src/persist/restore.rs
+index a8c6fd3..9db49e4 100644
+--- a/src/persist/restore.rs
++++ b/src/persist/restore.rs
+@@ -440,6 +440,45 @@ fn restore_workspace(
+     )
+ }
+ 
++fn saved_input_target(pane: &super::snapshot::PaneSnapshot) -> crate::terminal::InputTarget {
++    pane.input_target.unwrap_or_else(|| {
++        if pane.agent_session.is_some()
++            || pane.managed_agent_kind.is_some()
++            || pane.agent_name.is_some()
++        {
++            crate::terminal::InputTarget::Agent
++        } else {
++            crate::terminal::InputTarget::Terminal
++        }
++    })
++}
++
++#[cfg(test)]
++mod input_target_tests {
++    use super::*;
++    #[test]
++    fn restored_agent_input_target_preserves_explicit_intent_and_imports_old_agent_lanes() {
++        let old: super::super::snapshot::PaneSnapshot =
++            serde_json::from_value(serde_json::json!({"cwd":"/tmp","agent_name":"reviewer"}))
++                .unwrap();
++        assert_eq!(
++            saved_input_target(&old),
++            crate::terminal::InputTarget::Agent
++        );
++        let released: super::super::snapshot::PaneSnapshot = serde_json::from_value(
++            serde_json::json!({"cwd":"/tmp","agent_name":"reviewer","input_target":"terminal"}),
++        )
++        .unwrap();
++        assert_eq!(
++            saved_input_target(&released),
++            crate::terminal::InputTarget::Terminal
++        );
++        let restored =
++            unavailable_restored_terminal(Some(&old), "/tmp".into(), "endpoint missing".into());
++        assert_eq!(restored.input_target, crate::terminal::InputTarget::Agent);
++    }
++}
++
+ fn unavailable_restored_terminal(
+     pane: Option<&super::snapshot::PaneSnapshot>,
+     cwd: PathBuf,
+@@ -449,6 +488,7 @@ fn unavailable_restored_terminal(
+     let mut terminal = TerminalState::new(TerminalId::alloc(), cwd);
+     terminal.restore_error = Some(reason);
+     if let Some(pane) = pane {
++        terminal.input_target = saved_input_target(pane);
+         terminal.manual_label = pane.label.clone();
+         terminal.launch_argv = pane.launch_argv.clone();
+         if let Some(session) = restored_terminal_agent_session(pane.agent_session.as_ref(), false) {
+@@ -688,6 +728,9 @@ fn restore_tab(
+             Ok(runtime) => {
+                 let terminal_id = TerminalId::alloc();
+                 let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
++                if let Some(pane) = saved_pane {
++                    terminal.input_target = saved_input_target(pane);
++                }
+                 if was_imported {
+                     if let Some(argv) = saved_launch_argv {
+                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
+@@ -1544,6 +1587,7 @@ mod tests {
+                         super::super::snapshot::PaneSnapshot {
+                             cwd,
+                             label: Some("reviewer".into()),
++                            input_target: None,
+                             agent_name: Some("reviewer".into()),
+                             managed_agent_kind: Some("opencode".into()),
+                             agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+@@ -1631,6 +1675,7 @@ mod tests {
+                             super::super::snapshot::PaneSnapshot {
+                                 cwd: cwd.clone(),
+                                 label: None,
++                                input_target: None,
+                                 agent_name: None,
+                                 managed_agent_kind: None,
+                                 agent_session: None,
+@@ -1643,6 +1688,7 @@ mod tests {
+                             super::super::snapshot::PaneSnapshot {
+                                 cwd: cwd.clone(),
+                                 label: None,
++                                input_target: None,
+                                 agent_name: None,
+                                 managed_agent_kind: None,
+                                 agent_session: None,
+@@ -1697,6 +1743,7 @@ mod tests {
+                 super::super::snapshot::PaneSnapshot {
+                     cwd: cwd.clone(),
+                     label: None,
++                    input_target: None,
+                     agent_name: None,
+                     managed_agent_kind: None,
+                     agent_session: None,
+@@ -1708,6 +1755,7 @@ mod tests {
+         let final_pane = super::super::snapshot::PaneSnapshot {
+             cwd: cwd.clone(),
+             label: Some("planner".into()),
++            input_target: None,
+             agent_name: Some("planner".into()),
+             managed_agent_kind: None,
+             agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+@@ -1860,6 +1908,7 @@ mod tests {
+                         super::super::snapshot::PaneSnapshot {
+                             cwd,
+                             label: None,
++                            input_target: None,
+                             agent_name: None,
+                             managed_agent_kind: None,
+                             agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+@@ -2171,6 +2220,7 @@ mod tests {
+             super::super::snapshot::PaneSnapshot {
+                 cwd: cwd.clone(),
+                 label: None,
++                input_target: None,
+                 agent_name: None,
+                 managed_agent_kind: None,
+                 agent_session: None,
+diff --git a/src/persist/snapshot.rs b/src/persist/snapshot.rs
+index 3518ef4..0436397 100644
+--- a/src/persist/snapshot.rs
++++ b/src/persist/snapshot.rs
+@@ -100,6 +100,8 @@ pub struct TabSnapshot {
+ pub struct PaneSnapshot {
+     pub cwd: PathBuf,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub input_target: Option<crate::terminal::InputTarget>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub label: Option<String>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub agent_name: Option<String>,
+@@ -382,6 +384,7 @@ fn capture_tab(
+             id.raw(),
+             PaneSnapshot {
+                 cwd,
++                input_target: terminal.map(|terminal| terminal.input_target),
+                 label,
+                 agent_name,
+                 managed_agent_kind,
+@@ -672,6 +675,25 @@ mod tests {
+         assert_eq!(restored.sidebar_section_split, Some(0.5));
+     }
+ 
++    #[test]
++    fn agent_input_target_survives_json_capture_after_client_exit() {
++        let mut state = state_with_workspaces(&["reserved"]);
++        let pane = state.workspaces[0].tabs[0].root_pane;
++        let terminal_id = state.terminal_id_for_pane(0, pane).unwrap();
++        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
++        terminal
++            .set_detected_agent_process_at(crate::detect::Agent::Claude, std::time::Instant::now());
++        terminal.clear_agent_runtime_identity_after_respawn();
++        let snapshot = capture_from_state(&state);
++        let serialized = serde_json::to_string(&snapshot).unwrap();
++        let restored = parse_snapshot(&serialized).unwrap();
++        assert_eq!(
++            restored.workspaces[0].tabs[0].panes[&pane.raw()].input_target,
++            Some(crate::terminal::InputTarget::Agent)
++        );
++        state.assert_invariants_for_test();
++    }
++
+     #[test]
+     fn round_trip_layout_snapshot() {
+         let layout = LayoutSnapshot::Split {
+@@ -702,6 +724,7 @@ mod tests {
+             PaneSnapshot {
+                 cwd: PathBuf::from("/home/can/Projects/herdr"),
+                 label: None,
++                input_target: None,
+                 agent_name: None,
+                 managed_agent_kind: None,
+                 agent_session: None,
+@@ -714,6 +737,7 @@ mod tests {
+             PaneSnapshot {
+                 cwd: PathBuf::from("/home/can/Projects/website"),
+                 label: Some("website".into()),
++                input_target: None,
+                 agent_name: None,
+                 managed_agent_kind: None,
+                 agent_session: None,
+@@ -1400,6 +1424,7 @@ mod tests {
+             PaneSnapshot {
+                 cwd: PathBuf::from("/tmp/this-directory-does-not-exist-for-herdr-test"),
+                 label: None,
++                input_target: None,
+                 agent_name: None,
+                 managed_agent_kind: None,
+                 agent_session: None,
+@@ -1414,6 +1439,7 @@ mod tests {
+                     .map(PathBuf::from)
+                     .unwrap_or_else(|_| PathBuf::from("/tmp")),
+                 label: None,
++                input_target: None,
+                 agent_name: None,
+                 managed_agent_kind: None,
+                 agent_session: None,
+diff --git a/src/terminal/mod.rs b/src/terminal/mod.rs
+index 129634c..b322c1b 100644
+--- a/src/terminal/mod.rs
++++ b/src/terminal/mod.rs
+@@ -1,5 +1,6 @@
+ mod history_read;
+ mod id;
++mod input_target;
+ mod runtime;
+ mod runtime_registry;
+ pub mod state;
+@@ -7,6 +8,7 @@ mod title;
+ 
+ pub(crate) use history_read::{merge_scrolled_up, snapshot_text, ScreenSnapshot, UpwardMerge};
+ pub use id::TerminalId;
++pub use input_target::InputTarget;
+ pub use runtime::TerminalRuntime;
+ pub(crate) use runtime_registry::TerminalRuntimeRegistry;
+ pub use state::{
+diff --git a/src/terminal/state.rs b/src/terminal/state.rs
+index 669a580..1270aaf 100644
+--- a/src/terminal/state.rs
++++ b/src/terminal/state.rs
+@@ -128,6 +128,8 @@ struct RecentAgentProcessExit {
+ /// metadata.
+ pub struct TerminalState {
+     pub id: TerminalId,
++    /// Automation audience survives client exit; human input remains unrestricted.
++    pub input_target: crate::terminal::InputTarget,
+     pub cwd: PathBuf,
+     pub detected_agent: Option<Agent>,
+     pub fallback_state: AgentState,
+@@ -168,6 +170,7 @@ impl TerminalState {
+     pub fn new(id: TerminalId, cwd: PathBuf) -> Self {
+         Self {
+             id,
++            input_target: crate::terminal::InputTarget::Terminal,
+             cwd,
+             detected_agent: None,
+             fallback_state: AgentState::Unknown,
+@@ -2439,6 +2442,9 @@ impl TerminalState {
+         };
+         let agent_label = self.effective_agent_label().map(str::to_string);
+         let known_agent = self.effective_known_agent();
++        if agent_label.is_some() {
++            self.input_target = crate::terminal::InputTarget::Agent;
++        }
+ 
+         let presentation = self.effective_presentation_for_state_at(state, now);
+         self.clear_expiry_pending_for_hidden_metadata();
+diff --git a/tests/live_handoff.rs b/tests/live_handoff.rs
+index 7a64b57..aae6f46 100644
+--- a/tests/live_handoff.rs
++++ b/tests/live_handoff.rs
+@@ -1706,6 +1706,33 @@ fn live_handoff_keeps_agent_started_pane_after_agent_exits() {
+     support::wait_for_file(&exited_marker, Duration::from_secs(5));
+     thread::sleep(Duration::from_millis(300));
+ 
++    let refused = request(
++        &api_socket,
++        serde_json::json!({
++            "id":"test:stale-handoff", "method":"pane.send_input",
++            "params":{"pane_id":pane_id,"text":format!("echo unsafe > {}",shell_marker.display()),"keys":["Enter"]}
++        }),
++    );
++    assert_eq!(refused["error"]["code"], "agent_input_protected");
++    assert!(
++        !shell_marker.exists(),
++        "agent exit must not turn handoff input into a shell command"
++    );
++    let observed = request(
++        &api_socket,
++        serde_json::json!({
++            "id":"test:observe-terminal", "method":"pane.get", "params":{"pane_id":pane_id}
++        }),
++    );
++    assert_ok(observed.clone());
++    assert_ok(request(
++        &api_socket,
++        serde_json::json!({
++            "id":"test:release-for-shell", "method":"pane.input_target.set",
++            "params":{"pane_id":pane_id,"terminal_id":observed["result"]["pane"]["terminal_id"],"target":"terminal"}
++        }),
++    ));
++
+     assert_ok(request(
+         &api_socket,
+         serde_json::json!({
+diff --git a/src/terminal/input_target.rs b/src/terminal/input_target.rs
+new file mode 100644
+index 0000000..b56b666
+--- /dev/null
++++ b/src/terminal/input_target.rs
+@@ -0,0 +1,29 @@
++//! Persistent intended recipient of automation input, independent of liveness.
++#[derive(
++    Debug,
++    Clone,
++    Copy,
++    Default,
++    PartialEq,
++    Eq,
++    serde::Serialize,
++    serde::Deserialize,
++    schemars::JsonSchema,
++)]
++#[serde(rename_all = "snake_case")]
++pub enum InputTarget {
++    #[default]
++    Terminal,
++    Agent,
++}
++
++impl std::str::FromStr for InputTarget {
++    type Err = String;
++    fn from_str(value: &str) -> Result<Self, Self::Err> {
++        match value {
++            "agent" => Ok(Self::Agent),
++            "terminal" => Ok(Self::Terminal),
++            _ => Err("input target must be agent or terminal".into()),
++        }
++    }
++}
