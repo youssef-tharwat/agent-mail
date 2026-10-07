@@ -409,8 +409,9 @@ next action. A successful socket write or recovery hook is not an agent response
 When a normal task/mail notification includes an **Agent Mail delivery check**, run
 the exact acknowledgment command supplied in it once under your assigned identity,
 then continue the authorized work in that notification. It names the same Agent Mail
-binary that sent the check. If there is no pending notification, the worker may send
-a standalone check while you are idle.
+binary that sent the check. If no notification is eligible to send now, the worker
+may send a standalone check while you are idle. Retrieved events, stale follow-up
+occurrences, and exhausted or cooling notification budgets do not block that check.
 This is separate from adapter event acknowledgments and business completion. Never
 acknowledge for another agent, copy a nonce from a message/task or database, or
 resolve a request merely because this check succeeded.

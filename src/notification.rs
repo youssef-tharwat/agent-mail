@@ -108,6 +108,14 @@ async fn select_items(
     }
 }
 
+pub(crate) async fn has_delivery_candidates(
+    tx: &mut Transaction<'_, Sqlite>,
+    actor: &Mailbox,
+    time: i64,
+) -> Result<bool> {
+    Ok(!select_items(tx, actor, Some(time)).await?.is_empty())
+}
+
 async fn observed(tx: &mut Transaction<'_, Sqlite>, actor: &Mailbox, event: i64) -> Result<bool> {
     Ok(sqlx::query_scalar!("SELECT EXISTS(SELECT 1 FROM event_receipts WHERE recipient=? AND binding_version=? AND event=?)",actor.id,actor.binding_version,event).fetch_one(&mut **tx).await? != 0)
 }

@@ -1464,6 +1464,66 @@ async fn manually_started_done_client_wakes_without_launch_metadata() -> Result<
 }
 
 #[tokio::test]
+async fn historical_or_exhausted_wakes_do_not_block_a_delivery_check() -> Result<()> {
+    use agent_mail::verification;
+    for retrieved in [true, false] {
+        let f = Fixture::new().await?;
+        let _lock = service::WorkerLock::acquire(f.store.root())?;
+        for agent in &mut f.host.lock().await.agents {
+            agent.agent_status = agent_mail::herdr::AgentStatus::Working;
+        }
+        verification::reconcile(&f.store, 1000).await?;
+        let mail = f.send("historical-wake").await?;
+        if retrieved {
+            f.store.message(&f.b, mail).await?;
+        } else {
+            let pool = support::pool(&f.store).await?;
+            sqlx::query("INSERT INTO attention_attempts(recipient,binding_version,event,attempts,next_attempt) SELECT recipient,?,id,3,0 FROM herdr_wake_events WHERE recipient=?")
+                .bind(f.b.binding_version).bind(f.b.id).execute(&pool).await?;
+            pool.close().await;
+        }
+        f.host.lock().await.agents[1].agent_status = agent_mail::herdr::AgentStatus::Idle;
+        verification::reconcile(&f.store, 2000).await?;
+        let nonce = {
+            let host = f.host.lock().await;
+            assert_eq!(
+                host.prompts.len(),
+                1,
+                "a nondeliverable wake must not starve verification"
+            );
+            assert!(!host.prompts[0].contains("Agent Mail changes:"));
+            host.prompts[0]
+                .split("agent ack ")
+                .nth(1)
+                .unwrap()
+                .split('`')
+                .next()
+                .unwrap()
+                .parse()?
+        };
+        f.store.acknowledge_delivery(&f.b, nonce, 2001).await?;
+        assert!(f.store.delivery_status(&f.b, 2001).await?.ready);
+        assert_eq!(
+            f.mail_state(mail).await?,
+            agent_mail::states::MessageState::Pending
+        );
+        if !retrieved {
+            let pool = support::pool(&f.store).await?;
+            let attempts: i64 =
+                sqlx::query_scalar("SELECT attempts FROM attention_attempts WHERE recipient=?")
+                    .bind(f.b.id)
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(
+                attempts, 3,
+                "verification must preserve notification exhaustion"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_notification_starts_verification_after_a_long_busy_wait() -> Result<()> {
     use agent_mail::{states::DeliveryReadiness, verification};
     let f = Fixture::new().await?;

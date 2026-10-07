@@ -24,7 +24,7 @@ Download the archive and its checksum from [GitHub Releases](https://github.com/
 For Apple Silicon:
 
 ```sh
-version=0.14.3
+version=0.14.4
 target=aarch64-apple-darwin
 archive="agent-mail-v${version}-${target}.tar.gz"
 base="https://github.com/youssef-tharwat/agent-mail/releases/download/v${version}"
@@ -536,8 +536,11 @@ Registration is an address. Transport acceptance is a dispatch receipt. A Claude
 hook is runtime receipt. None alone marks automatic delivery ready.
 
 When a task or message already wakes an agent, the worker includes the small
-challenge in that same delivery. If there is no pending notification, it uses a
-standalone probe when the client is idle. The receiving agent executes the supplied
+challenge in that same delivery. If no notification is eligible to send now, it
+uses a standalone probe when the client is idle. Verification shares normal delivery
+selection, including retrieval receipts, current follow-up occurrences, and
+notification budgets. Historical or exhausted wakes cannot starve a check.
+The receiving agent executes the supplied
 `agent ack NONCE` command using its own identity. Only this exact acknowledgment,
 bound to the current group, registration, launch and endpoint, plus connection
 health checked within 30 seconds, yields `delivery.ready: true`. It never resolves

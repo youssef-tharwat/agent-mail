@@ -271,13 +271,7 @@ impl Store {
         // Work and verification share the wake channel. If a real notification
         // is waiting, let its delivery carry the challenge instead of opening
         // a second turn for the same recipient.
-        let pending = sqlx::query!(
-            "SELECT recipient FROM wake_events WHERE recipient=? LIMIT 1",
-            actor.id
-        )
-        .fetch_optional(&mut *tx)
-        .await?
-        .is_some();
+        let pending = crate::notification::has_delivery_candidates(&mut tx, actor, now).await?;
         if pending {
             tx.commit().await?;
             return Ok(false);
@@ -477,14 +471,7 @@ async fn reconcile_one(store: &Store, actor: &Mailbox, now: i64) -> Result<()> {
     if !health.context("delivery route health check failed")? {
         return Ok(());
     }
-    if sqlx::query!(
-        "SELECT id FROM wake_events WHERE recipient=? LIMIT 1",
-        actor.id
-    )
-    .fetch_optional(store.pool())
-    .await?
-    .is_some()
-    {
+    if !store.attention_candidates(actor, now).await?.is_empty() {
         return Ok(());
     }
     let pending=sqlx::query!("SELECT recipient FROM delivery_probes WHERE recipient=? AND nonce=? AND acknowledged_at IS NULL AND (attempts=0 OR deadline>?) AND attempts<3 AND next_attempt<=?",actor.id,nonce,now,now).fetch_optional(store.pool()).await?.is_some();

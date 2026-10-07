@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install the published native binary. No compiler or package manager required.
 set -eu
-version=0.14.3
+version=0.14.4
 plugin=false
 case "${1-}" in
   --plugin) plugin=true ;;
