@@ -24,7 +24,7 @@ Download the archive and its checksum from [GitHub Releases](https://github.com/
 For Apple Silicon:
 
 ```sh
-version=0.8.0
+version=0.14.0
 target=aarch64-apple-darwin
 archive="agent-mail-v${version}-${target}.tar.gz"
 base="https://github.com/youssef-tharwat/agent-mail/releases/download/v${version}"
@@ -644,6 +644,17 @@ business deadlines. A checkpoint does not accept a task or resolve a request.
 Ordinary final replies and task decisions need no extra checkpoint.
 
 Optional `waiting` values:
+
+For lasting prerequisite requirements, prefer the writer-owned dependency plan
+described in the [agent guide](agent-guide.md#task-lifecycle-and-update-contract).
+`task dependencies ID` reports the plan, current outcome facts and derived
+readiness. `task dependencies ID --file plan.json` replaces the complete plan
+atomically, with observed versions, an `all`/`any` rule and explicit qualifying
+states. Checkpoint waits are additional temporary progress conditions; an owner
+checkpoint cannot bypass a writer-owned prerequisite. Source task updates preserve
+dependency plans. Parent/child links organize work without creating a wait or
+inheriting acceptance: use `task create ... --parent ID --parent-version VERSION`
+and `task tree ID`. Mail about child work uses that child's task context.
 
 ```json
 {"kind":"task","id":"dependency","states":["accepted"]}

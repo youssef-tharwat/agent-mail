@@ -208,6 +208,48 @@ to this task. Owner work, a successful test command or a reply alone is not acce
 
 ## Task lifecycle and update contract
 
+Task structure uses normal tasks with independent owners, writers and lifecycles.
+Create a subtask with `task create CHILD "SCOPE" --owner OWNER --parent PARENT
+--parent-version VERSION`, using the parent version you inspected. Inspect the
+bounded graph with `task tree PARENT`. Child progress prompts the parent writer
+to reassess; it never accepts the parent. Address mail to the specific child and
+its observed version when that is the work being discussed.
+
+Persistent dependencies belong to the task writer. Read `task dependencies ID`;
+replace the complete plan with `task dependencies ID --file plan.json` (or `-`
+for stdin). Use observed source and prerequisite versions:
+
+```json
+{
+  "version": 2,
+  "mode": "all",
+  "requirements": [
+    {
+      "condition": {"task": "api", "states": ["accepted"], "accepted_revision": "abc123"},
+      "version": 3
+    }
+  ],
+  "reason": "Use the reviewed API before integration"
+}
+```
+
+`mode` is `all` or `any`; at most 32 distinct prerequisites are supported. Empty
+requirements explicitly clear the contract. Qualifying states are explicit;
+`cancelled` does not satisfy a dependency unless listed. An accepted revision, if
+provided, must also match exactly. Identical retries return the original result;
+changed retries and stale observations fail. A graph decision advances the task
+version once. Source updates preserve the plan; reopening a prerequisite
+recalculates readiness and invalidates stale ready delivery immediately.
+
+Readiness describes prerequisite facts, not permission or lifecycle acceptance.
+Unmet plans suppress owner follow-up reminders while keeping the original hard
+supervision boundary. Ready plans prompt reassessment; blocked/review holds still
+require the writer. Parent links do not imply waiting: declare the dependency if
+a parent's next action needs a child's outcome. Checkpoints remain temporary
+progress reports and may add a wait; they cannot replace the writer's contract.
+Dependencies are scheduled on the home machine. Remote dependency inspection
+shows the cached plan with unknown readiness; `task tree` requires the home store.
+
 | State | Meaning |
 |---|---|
 | `open` | Captured assignment; default on creation. |

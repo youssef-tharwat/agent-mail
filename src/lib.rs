@@ -50,6 +50,8 @@ pub mod service;
 pub mod status;
 pub mod store;
 pub mod supervision;
+/// Writer-owned task dependency contracts and bounded subtask inspection.
+pub mod task_graph;
 /// End-to-end delivery verification, separate from business decisions.
 pub mod verification;
 pub mod work;

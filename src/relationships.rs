@@ -84,6 +84,10 @@ impl Store {
         now: i64,
     ) -> Result<Value> {
         name(source)?;
+        ensure!(
+            update.kind != RelationKind::Dependency,
+            "replace the task dependency plan with task dependencies --file; dependency links are derived from that plan"
+        );
         name(&update.target)?;
         ensure!(source != update.target, "task cannot link to itself");
         bounded(&update.reason, 512, "relation reason")?;
@@ -133,18 +137,9 @@ impl Store {
             "target task missing or version conflict"
         );
         if update.active && update.kind != RelationKind::Related {
-            // Follow every active blocking/ownership edge; cycles cannot be hidden across kinds.
+            // Parent hierarchy and blocking prerequisites are separate graphs.
             let cycle:bool=sqlx::query_scalar("WITH RECURSIVE reach(id) AS (SELECT ? UNION SELECT r.target FROM task_relations r JOIN reach n ON r.source=n.id WHERE r.group_name=? AND r.active=1 AND r.kind=?) SELECT EXISTS(SELECT 1 FROM reach WHERE id=?)").bind(&update.target).bind(&actor.group_name).bind(update.kind.text()).bind(source).fetch_one(&mut *tx).await?;
             ensure!(!cycle, "relationship cycle");
-            if update.kind == RelationKind::Dependency {
-                crate::followup::validate_dependency_graph(
-                    &mut tx,
-                    &actor.group_name,
-                    Some(source),
-                    std::slice::from_ref(&update.target),
-                )
-                .await?;
-            }
         }
         let version = update
             .version
@@ -153,26 +148,19 @@ impl Store {
         sqlx::query("INSERT INTO task_relations(group_name,source,target,kind,review_round,source_revision,active,version,actor,reason,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(group_name,source,target,kind,review_round,source_revision) DO UPDATE SET active=excluded.active,version=excluded.version,actor=excluded.actor,reason=excluded.reason,updated=excluded.updated")
             .bind(&actor.group_name).bind(source).bind(&update.target).bind(update.kind.text()).bind(&update.review_round).bind(&update.source_revision).bind(update.active).bind(version).bind(&actor.name).bind(&update.reason).bind(now).execute(&mut *tx).await?;
         let fact = json!({"source":source,"target":update.target,"kind":update.kind,"review_round":update.review_round,"source_revision":update.source_revision,"active":update.active,"version":version});
-        sqlx::query("INSERT INTO task_relation_history(group_name,source,snapshot,actor,reason,changed) VALUES(?,?,?,?,?,?)").bind(&actor.group_name).bind(source).bind(fact.to_string()).bind(&actor.name).bind(&update.reason).bind(now).execute(&mut *tx).await?;
-        sqlx::query(
-            "UPDATE work_items SET version=?,updated=? WHERE group_name=? AND id=? AND version=?",
+        record_graph_change_tx(
+            &mut tx,
+            actor,
+            GraphChange {
+                source,
+                expected: update.version,
+                reason: &update.reason,
+                canonical: &canonical,
+                fact: &fact,
+            },
+            now,
         )
-        .bind(version)
-        .bind(now)
-        .bind(&actor.group_name)
-        .bind(source)
-        .bind(update.version)
-        .execute(&mut *tx)
         .await?;
-        let snapshot:String=sqlx::query_scalar("SELECT snapshot FROM work_changes WHERE group_name=? AND work_id=? ORDER BY version DESC LIMIT 1").bind(&actor.group_name).bind(source).fetch_one(&mut *tx).await?;
-        let mut item: WorkItem = serde_json::from_str(&snapshot)?;
-        item.version = version;
-        item.updated = now;
-        sqlx::query("INSERT INTO work_changes(group_name,work_id,version,actor,reason,snapshot,changed) VALUES(?,?,?,?,?,?,?)").bind(&actor.group_name).bind(source).bind(version).bind(&actor.name).bind(format!("relationship: {}",update.reason)).bind(serde_json::to_string(&item)?).bind(now).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO task_relation_retries(group_name,source,expected,actor,binding_version,canonical,result) VALUES(?,?,?,?,?,?,?)").bind(&actor.group_name).bind(source).bind(update.version).bind(actor.id).bind(actor.binding_version).bind(canonical).bind(fact.to_string()).execute(&mut *tx).await?;
-        crate::relay::enqueue_snapshot(&mut tx, &item, None, now).await?;
-        let relations = relation_snapshot_tx(&mut tx, &actor.group_name, source).await?;
-        crate::relay::enqueue_relation_snapshot(&mut tx, &relations, now).await?;
         tx.commit().await?;
         crate::stream::hint(self.root()).await;
         Ok(fact)
@@ -232,7 +220,7 @@ impl Store {
             );
             let mut facts = Vec::new();
             for row in rows {
-                let snapshot: RelationSnapshot =
+                let snapshot: TaskGraphSnapshot =
                     serde_json::from_str(&row.get::<String, _>("snapshot"))?;
                 for fact in snapshot.relations {
                     if fact["source"].as_str() != Some(id) && fact["target"].as_str() != Some(id) {
@@ -315,6 +303,9 @@ impl Store {
         Self::check_actor(&mut tx, actor).await?;
         let rows=sqlx::query("SELECT old_writer,new_writer,operator,changed,expected FROM task_transfers WHERE group_name=? AND work_id=? ORDER BY expected DESC LIMIT 5").bind(&actor.group_name).bind(id).fetch_all(&mut *tx).await?;
         let transfers=rows.iter().map(|r|json!({"old_writer":r.get::<String,_>("old_writer"),"new_writer":r.get::<String,_>("new_writer"),"operator":r.get::<bool,_>("operator"),"changed":r.get::<i64,_>("changed"),"version":r.get::<i64,_>("expected")+1})).collect::<Vec<_>>();
+        let readiness =
+            crate::task_graph::readiness_tx(&mut tx, &actor.group_name, Some(id)).await?;
+        let dependencies = json!({"readiness":readiness,"details":format!("task dependencies {id}"),"scheduling":"home_only"});
         tx.commit().await?;
         let relations = self
             .work_relations(
@@ -327,14 +318,14 @@ impl Store {
             )
             .await?;
         Ok(
-            json!({"transfers":transfers,"relations":relations,"private_reports":"remain addressed to their original recipients; explicit sharing required"}),
+            json!({"transfers":transfers,"relations":relations,"dependencies":dependencies,"private_reports":"remain addressed to their original recipients; explicit sharing required"}),
         )
     }
 }
 
 /// Home-authoritative relationship snapshot transported independently of private messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RelationSnapshot {
+pub struct TaskGraphSnapshot {
     /// Authoritative group.
     pub group_name: String,
     /// Source task.
@@ -343,13 +334,15 @@ pub struct RelationSnapshot {
     pub version: i64,
     /// Public relationship facts.
     pub relations: Vec<Value>,
+    /// Complete writer-owned dependency plan at this source revision.
+    pub dependencies: crate::task_graph::DependencyPlan,
 }
 /// Capture complete current incident source facts under the mutation transaction.
-pub(crate) async fn relation_snapshot_tx(
+pub(crate) async fn graph_snapshot_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     group: &str,
     source: &str,
-) -> Result<RelationSnapshot> {
+) -> Result<TaskGraphSnapshot> {
     let version: i64 =
         sqlx::query_scalar("SELECT version FROM work_items WHERE group_name=? AND id=?")
             .bind(group)
@@ -361,7 +354,7 @@ pub(crate) async fn relation_snapshot_tx(
         rows.len() <= 1000,
         "source task relationship limit is 1000 retained edges"
     );
-    let snapshot=RelationSnapshot{group_name:group.to_owned(),source:source.to_owned(),version,relations:rows.iter().map(|r|json!({"source":source,"target":r.get::<String,_>("target"),"kind":r.get::<String,_>("kind"),"review_round":r.get::<String,_>("review_round"),"source_revision":r.get::<String,_>("source_revision"),"active":r.get::<bool,_>("active"),"version":r.get::<i64,_>("version")})).collect()};
+    let snapshot=TaskGraphSnapshot{group_name:group.to_owned(),source:source.to_owned(),version,dependencies:crate::task_graph::plan_tx(tx,group,source).await?,relations:rows.iter().map(|r|json!({"source":source,"target":r.get::<String,_>("target"),"kind":r.get::<String,_>("kind"),"review_round":r.get::<String,_>("review_round"),"source_revision":r.get::<String,_>("source_revision"),"active":r.get::<bool,_>("active"),"version":r.get::<i64,_>("version")})).collect()};
     bounded(
         &serde_json::to_string(&snapshot)?,
         192 * 1024,
@@ -370,9 +363,9 @@ pub(crate) async fn relation_snapshot_tx(
     Ok(snapshot)
 }
 /// Apply a previously origin-authorized home snapshot without granting private mail access.
-pub(crate) async fn apply_relation_snapshot_tx(
+pub(crate) async fn apply_graph_snapshot_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    snapshot: &RelationSnapshot,
+    snapshot: &TaskGraphSnapshot,
     now: i64,
 ) -> Result<()> {
     bounded(
@@ -383,11 +376,20 @@ pub(crate) async fn apply_relation_snapshot_tx(
     name(&snapshot.group_name)?;
     name(&snapshot.source)?;
     ensure!(snapshot.version > 0, "invalid relation snapshot version");
+    crate::task_graph::validate_snapshot(snapshot)?;
     ensure!(
         snapshot.relations.len() <= 1000,
         "relation snapshot exceeds supported bound"
     );
     for relation in &snapshot.relations {
+        let kind: RelationKind = serde_json::from_value(relation["kind"].clone())?;
+        let active = relation["active"]
+            .as_bool()
+            .context("relationship active flag must be boolean")?;
+        ensure!(
+            kind != RelationKind::Dependency || !active,
+            "dependency edges must come from the dependency plan"
+        );
         ensure!(
             relation["source"].as_str() == Some(snapshot.source.as_str()),
             "relation snapshot source mismatch"
@@ -404,27 +406,79 @@ pub(crate) async fn apply_relation_snapshot_tx(
 }
 
 /// Seed all retained source relationship facts when a remote group route is installed.
-pub(crate) async fn enqueue_relations_for_route(
+pub(crate) async fn enqueue_graphs_for_route(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     group: &str,
     machine: uuid::Uuid,
     time: i64,
 ) -> Result<()> {
     let sources: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT source FROM task_relations WHERE group_name=? ORDER BY source",
+        "SELECT source FROM task_relations WHERE group_name=? UNION SELECT source FROM task_dependency_plans WHERE group_name=? ORDER BY source",
     )
+    .bind(group)
     .bind(group)
     .fetch_all(&mut **tx)
     .await?;
     for source in sources {
-        let snapshot = relation_snapshot_tx(tx, group, &source).await?;
+        let snapshot = graph_snapshot_tx(tx, group, &source).await?;
         crate::relay::enqueue(
             tx,
             machine,
-            crate::relay::Event::RelationSnapshot(snapshot),
+            crate::relay::Event::TaskGraphSnapshot(snapshot),
             time,
         )
         .await?;
     }
+    Ok(())
+}
+
+/// One observed, canonical writer decision to persist and replicate.
+pub(crate) struct GraphChange<'a> {
+    pub source: &'a str,
+    pub expected: i64,
+    pub reason: &'a str,
+    pub canonical: &'a str,
+    pub fact: &'a Value,
+}
+/// Commit one graph decision using the normal task version, audit and relay path.
+pub(crate) async fn record_graph_change_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    actor: &Mailbox,
+    change: GraphChange<'_>,
+    now: i64,
+) -> Result<()> {
+    let GraphChange {
+        source,
+        expected,
+        reason,
+        canonical,
+        fact,
+    } = change;
+    let version = expected.checked_add(1).context("task version overflow")?;
+    sqlx::query("INSERT INTO task_relation_history(group_name,source,snapshot,actor,reason,changed) VALUES(?,?,?,?,?,?)")
+        .bind(&actor.group_name).bind(source).bind(fact.to_string()).bind(&actor.name).bind(reason).bind(now).execute(&mut **tx).await?;
+    let changed = sqlx::query(
+        "UPDATE work_items SET version=?,updated=? WHERE group_name=? AND id=? AND version=?",
+    )
+    .bind(version)
+    .bind(now)
+    .bind(&actor.group_name)
+    .bind(source)
+    .bind(expected)
+    .execute(&mut **tx)
+    .await?;
+    ensure!(changed.rows_affected() == 1, "source task version conflict");
+    let snapshot: String = sqlx::query_scalar("SELECT snapshot FROM work_changes WHERE group_name=? AND work_id=? ORDER BY version DESC LIMIT 1")
+        .bind(&actor.group_name).bind(source).fetch_one(&mut **tx).await?;
+    let mut item: WorkItem = serde_json::from_str(&snapshot)?;
+    item.version = version;
+    item.updated = now;
+    sqlx::query("INSERT INTO work_changes(group_name,work_id,version,actor,reason,snapshot,changed) VALUES(?,?,?,?,?,?,?)")
+        .bind(&actor.group_name).bind(source).bind(version).bind(&actor.name).bind(format!("task graph: {reason}")).bind(serde_json::to_string(&item)?).bind(now).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO task_relation_retries(group_name,source,expected,actor,binding_version,canonical,result) VALUES(?,?,?,?,?,?,?)")
+        .bind(&actor.group_name).bind(source).bind(expected).bind(actor.id).bind(actor.binding_version).bind(canonical).bind(fact.to_string()).execute(&mut **tx).await?;
+    crate::relay::enqueue_snapshot(tx, &item, None, now).await?;
+    let relations = graph_snapshot_tx(tx, &actor.group_name, source).await?;
+    crate::relay::enqueue_graph_snapshot(tx, &relations, now).await?;
     Ok(())
 }

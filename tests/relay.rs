@@ -174,6 +174,129 @@ async fn negotiate(one: &Node, two: &Node) -> Result<()> {
 }
 
 #[tokio::test]
+async fn task_graph_relay_preserves_conditions_and_rejects_unsupported_peers() -> Result<()> {
+    use agent_mail::{
+        followup::PrerequisiteMode,
+        mail_context::TaskVersion,
+        names::TaskId,
+        states::TaskState,
+        task_graph::{DependencyUpdate, ObservedRequirement, TaskRequirement},
+    };
+    let home = Node::new("home", "coordinator").await?;
+    let remote = Node::new("remote", "worker").await?;
+    remote.store.set_home("g", home.id().await?).await?;
+    home.store
+        .route("g", "worker", remote.id().await?, 100)
+        .await?;
+    negotiate(&home, &remote).await?;
+    let writer = home.store.mailbox("g", "coordinator").await?;
+    for id in ["build", "integrate"] {
+        home.store
+            .work_create(
+                &writer,
+                WorkDraft {
+                    id: id.into(),
+                    scope: "implement".into(),
+                    owner: "worker".into(),
+                    state: TaskState::Open,
+                    next_action: "implement".into(),
+                    deadline: None,
+                    evidence: vec![],
+                },
+                100,
+            )
+            .await?;
+    }
+    home.store
+        .task_dependencies_set(
+            &writer,
+            "integrate",
+            DependencyUpdate {
+                version: TaskVersion::new(1)?,
+                mode: PrerequisiteMode::Any,
+                requirements: vec![ObservedRequirement {
+                    condition: TaskRequirement {
+                        task: TaskId::new("build")?,
+                        states: vec![TaskState::Accepted],
+                        accepted_revision: Some("reviewed-head".into()),
+                    },
+                    version: TaskVersion::new(1)?,
+                }],
+                reason: "reviewed prerequisite".into(),
+            },
+            101,
+        )
+        .await?;
+    let outgoing = home.store.export().await?;
+    let graph = outgoing
+        .iter()
+        .find(|e| matches!(e.event, agent_mail::relay::Event::TaskGraphSnapshot(_)))
+        .unwrap()
+        .clone();
+    let unsupported = remote
+        .store
+        .exchange(
+            home.id().await?,
+            Exchange {
+                capabilities: vec!["mail_context_v1".into(), "communication_intent_v1".into()],
+                incoming: vec![graph.clone()],
+                ack: vec![],
+            },
+            102,
+        )
+        .await
+        .unwrap_err();
+    assert!(unsupported.to_string().contains("task graph"));
+    assert!(
+        home.store
+            .export()
+            .await?
+            .iter()
+            .any(|e| e.event_id == graph.event_id)
+    );
+    transfer(&home, &remote, 103).await?;
+    let worker = remote.store.mailbox("g", "worker").await?;
+    let cached = remote.store.task_dependencies(&worker, "integrate").await?;
+    assert_eq!(cached["plan"]["mode"], "any");
+    assert_eq!(
+        cached["plan"]["requirements"][0]["accepted_revision"],
+        "reviewed-head"
+    );
+    assert!(cached["readiness"].is_null());
+    assert_eq!(cached["scheduling"], "home_only");
+    let mut forged = graph;
+    let agent_mail::relay::Event::TaskGraphSnapshot(ref mut snapshot) = forged.event else {
+        unreachable!();
+    };
+    snapshot.version += 1;
+    snapshot
+        .dependencies
+        .requirements
+        .push(snapshot.dependencies.requirements[0].clone());
+    forged.event_id = uuid::Uuid::new_v4();
+    assert!(
+        remote
+            .store
+            .exchange(
+                home.id().await?,
+                Exchange {
+                    capabilities: agent_mail::relay::capabilities(),
+                    incoming: vec![forged],
+                    ack: vec![]
+                },
+                104
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        remote.store.task_dependencies(&worker, "integrate").await?,
+        cached
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn context_cannot_be_downgraded_or_forged_during_relay() -> Result<()> {
     use agent_mail::{
         mail_context::{ContextSource, MessageContext},

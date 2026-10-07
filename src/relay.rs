@@ -23,10 +23,15 @@ use uuid::Uuid;
 const BATCH_LIMIT: usize = 16;
 const INTENT_CAPABILITY: &str = "communication_intent_v1";
 const CONTEXT_CAPABILITY: &str = "mail_context_v1";
+const TASK_GRAPH_CAPABILITY: &str = "task_graph_v1";
 
 /// Capabilities advertised by this relay implementation.
 pub fn capabilities() -> Vec<String> {
-    vec![INTENT_CAPABILITY.into(), CONTEXT_CAPABILITY.into()]
+    vec![
+        INTENT_CAPABILITY.into(),
+        CONTEXT_CAPABILITY.into(),
+        TASK_GRAPH_CAPABILITY.into(),
+    ]
 }
 // Shared by encoding and streaming reads; changing this changes the relay wire contract.
 const WIRE_LIMIT: usize = 256 * 1024;
@@ -90,7 +95,7 @@ pub enum Event {
     /// Typed resource metadata; payload transfer remains explicit.
     ArtifactSnapshot(crate::artifacts::ArtifactSnapshot),
     /// Explicit task relationship facts from the authoritative group home.
-    RelationSnapshot(crate::relationships::RelationSnapshot),
+    TaskGraphSnapshot(crate::relationships::TaskGraphSnapshot),
 }
 
 /// Portable message content identified by UUIDs across installations.
@@ -430,7 +435,7 @@ impl Store {
                 group, participant, machine).execute(&mut *tx).await?;
             crate::records::enqueue_records_for_route(&mut tx, group, parse_id(&machine)?, time)
                 .await?;
-            crate::relationships::enqueue_relations_for_route(
+            crate::relationships::enqueue_graphs_for_route(
                 &mut tx,
                 group,
                 parse_id(&machine)?,
@@ -556,7 +561,7 @@ impl Store {
         sqlx::query!("DELETE FROM relay_capabilities WHERE machine=?", source_id)
             .execute(&mut *tx)
             .await?;
-        for capability in [INTENT_CAPABILITY, CONTEXT_CAPABILITY] {
+        for capability in [INTENT_CAPABILITY, CONTEXT_CAPABILITY, TASK_GRAPH_CAPABILITY] {
             if !exchange.capabilities.iter().any(|c| c == capability) {
                 continue;
             }
@@ -735,6 +740,14 @@ impl Store {
             )
             .await?;
         let outgoing = self.export_for(peer).await?;
+        if outgoing
+            .iter()
+            .any(|e| matches!(e.event, Event::TaskGraphSnapshot(_)))
+        {
+            ensure!(sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM relay_capabilities WHERE machine=? AND capability=?)")
+                .bind(peer.to_string()).bind(TASK_GRAPH_CAPABILITY).fetch_one(self.pool()).await?,
+                "peer does not support task graphs; upgrade it before synchronizing dependency plans");
+        }
         let sent = outgoing.len();
         let sent_ids: std::collections::HashSet<_> =
             outgoing.iter().map(|event| event.event_id).collect();
@@ -790,7 +803,7 @@ fn event_group(event: &Event) -> &str {
         Event::WorkSnapshot(item) => &item.group_name,
         Event::RecordSnapshot(item) => &item.record.group_name,
         Event::ArtifactSnapshot(item) => &item.artifact.group_name,
-        Event::RelationSnapshot(item) => &item.group_name,
+        Event::TaskGraphSnapshot(item) => &item.group_name,
     }
 }
 
@@ -890,7 +903,7 @@ async fn validate_forward(tx: &mut Transaction<'_, Sqlite>, envelope: &Envelope)
         }
         Event::RecordSnapshot(_)
         | Event::ArtifactSnapshot(_)
-        | Event::RelationSnapshot(_)
+        | Event::TaskGraphSnapshot(_)
         | Event::WorkSnapshot(_) => anyhow::bail!("remote node cannot publish work snapshots"),
     }
     Ok(())
@@ -1048,12 +1061,15 @@ async fn apply_event(
             );
             crate::records::apply_record_snapshot(tx, item).await?;
         }
-        Event::RelationSnapshot(item) => {
+        Event::TaskGraphSnapshot(item) => {
             ensure!(
                 envelope.origin == home,
                 "relationship snapshot must come from home"
             );
-            crate::relationships::apply_relation_snapshot_tx(tx, item, time).await?;
+            ensure!(sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM relay_capabilities WHERE machine=? AND capability=?)")
+                .bind(envelope.origin.to_string()).bind(TASK_GRAPH_CAPABILITY).fetch_one(&mut **tx).await?,
+                "home has not negotiated task graph support; upgrade and synchronize it first");
+            crate::relationships::apply_graph_snapshot_tx(tx, item, time).await?;
         }
         Event::ArtifactSnapshot(item) => {
             ensure!(
@@ -1196,9 +1212,9 @@ pub(crate) async fn enqueue_artifact_snapshot(
 }
 
 /// Queue relationship metadata to every configured group route.
-pub(crate) async fn enqueue_relation_snapshot(
+pub(crate) async fn enqueue_graph_snapshot(
     tx: &mut Transaction<'_, Sqlite>,
-    snapshot: &crate::relationships::RelationSnapshot,
+    snapshot: &crate::relationships::TaskGraphSnapshot,
     now: i64,
 ) -> Result<()> {
     let routes: Vec<String> = sqlx::query_scalar("SELECT DISTINCT remote_machine FROM mailboxes WHERE group_name=? AND remote_machine IS NOT NULL")
@@ -1207,7 +1223,7 @@ pub(crate) async fn enqueue_relation_snapshot(
         enqueue(
             tx,
             parse_id(&machine)?,
-            Event::RelationSnapshot(snapshot.clone()),
+            Event::TaskGraphSnapshot(snapshot.clone()),
             now,
         )
         .await?;

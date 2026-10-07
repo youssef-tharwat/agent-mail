@@ -11,6 +11,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 const SCOPE_LIMIT: usize = 1024;
 const ACTION_LIMIT: usize = 512;
@@ -259,7 +260,34 @@ impl Store {
         draft: WorkDraft,
         now: i64,
     ) -> Result<WorkItem> {
-        let canonical = serde_json::to_string(&draft)?;
+        self.work_create_under(actor, draft, None, now).await
+    }
+
+    /// Create a normal task and its parent link in one transaction.
+    /// # Errors
+    /// The actor, owner, parent version or creation fields are invalid.
+    pub async fn create_subtask(
+        &self,
+        actor: &Mailbox,
+        parent: crate::task_graph::TaskReference,
+        draft: WorkDraft,
+        now: i64,
+    ) -> Result<WorkItem> {
+        self.work_create_under(actor, draft, Some(parent), now)
+            .await
+    }
+
+    async fn work_create_under(
+        &self,
+        actor: &Mailbox,
+        draft: WorkDraft,
+        parent: Option<crate::task_graph::TaskReference>,
+        now: i64,
+    ) -> Result<WorkItem> {
+        let canonical = match &parent {
+            Some(parent) => serde_json::to_string(&("subtask", &draft, parent))?,
+            None => serde_json::to_string(&draft)?,
+        };
         let item = WorkItem {
             group_name: actor.group_name.clone(),
             id: draft.id,
@@ -332,6 +360,22 @@ impl Store {
             .is_some(),
             "work owner is not bound in this group"
         );
+        if let Some(parent) = &parent {
+            ensure!(
+                parent.task.as_str() != item.id,
+                "task cannot be its own parent"
+            );
+            let version: Option<i64> =
+                sqlx::query_scalar("SELECT version FROM work_items WHERE group_name=? AND id=?")
+                    .bind(&actor.group_name)
+                    .bind(parent.task.as_str())
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            ensure!(
+                version == Some(parent.version.get()),
+                "parent missing or version conflict"
+            );
+        }
         let state = item.state.as_str();
         let open = item.state.is_open();
         sqlx::query!("INSERT INTO work_items(group_name,id,scope,owner,writer,state,open,next_action,deadline,accepted_revision,evidence,version,updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -343,6 +387,17 @@ impl Store {
             .execute(&mut *tx).await?;
         sqlx::query!("INSERT INTO work_creations(group_name,work_id,actor,canonical,result) VALUES(?,?,?,?,?)",actor.group_name,item.id,actor.id,canonical,snapshot).execute(&mut *tx).await?;
         relay::enqueue_snapshot(&mut tx, &item, None, now).await?;
+        if let Some(parent) = parent {
+            sqlx::query("INSERT INTO task_relations(group_name,source,target,kind,version,actor,reason,updated) VALUES(?,?,?,'parent',1,?,'subtask created',?)")
+                .bind(&actor.group_name).bind(&item.id).bind(parent.task.as_str()).bind(&actor.name).bind(now).execute(&mut *tx).await?;
+            let fact = json!({"source":item.id,"target":parent.task,"kind":"parent","version":1,"active":true});
+            sqlx::query("INSERT INTO task_relation_history(group_name,source,snapshot,actor,reason,changed) VALUES(?,?,?,?,?,?)")
+                .bind(&actor.group_name).bind(&item.id).bind(fact.to_string()).bind(&actor.name).bind("subtask created").bind(now).execute(&mut *tx).await?;
+            let relations =
+                crate::relationships::graph_snapshot_tx(&mut tx, &actor.group_name, &item.id)
+                    .await?;
+            relay::enqueue_graph_snapshot(&mut tx, &relations, now).await?;
+        }
         Self::retrieve_tx(
             &mut tx,
             actor,

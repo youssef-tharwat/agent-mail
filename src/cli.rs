@@ -252,6 +252,24 @@ enum Task {
         /// Evidence references, repeated as needed.
         #[arg(long)]
         evidence: Vec<String>,
+        /// Create this task as a subtask of the observed parent.
+        #[arg(long, requires = "parent_version")]
+        parent: Option<agent_mail::names::TaskId>,
+        /// Current parent version; checked atomically with creation.
+        #[arg(long, requires = "parent")]
+        parent_version: Option<agent_mail::mail_context::TaskVersion>,
+    },
+    /// Inspect dependencies, or atomically replace their complete plan from JSON.
+    Dependencies {
+        id: String,
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Inspect subtasks and their independent lifecycle and readiness.
+    Tree {
+        id: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
     },
     /// Read the current task, including version and linked messages.
     Show { id: String },
@@ -1023,6 +1041,8 @@ impl Cli {
                         state,
                         deadline,
                         evidence,
+                        parent,
+                        parent_version,
                     } => WorkCommand::Create {
                         group,
                         id,
@@ -1032,7 +1052,18 @@ impl Cli {
                         state,
                         deadline,
                         evidence,
+                        parent: parent.zip(parent_version).map(|(task, version)| {
+                            agent_mail::task_graph::TaskReference { task, version }
+                        }),
                     },
+                    Task::Dependencies { id, file } => WorkCommand::Dependencies {
+                        group,
+                        id,
+                        update: file
+                            .map(|p| super::coordination_cli::read_json(&p))
+                            .transpose()?,
+                    },
+                    Task::Tree { id, limit } => WorkCommand::Tree { group, id, limit },
                     Task::Show { id } => WorkCommand::Show { group, id },
                     Task::List {
                         after,

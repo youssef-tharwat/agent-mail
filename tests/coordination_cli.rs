@@ -10,6 +10,99 @@ struct Fixture {
     writer: String,
     owner: String,
 }
+
+#[test]
+fn subtasks_and_dependency_plans_use_the_public_cli() -> Result<()> {
+    let f = Fixture::new()?;
+    f.task("parent")?;
+    f.call(
+        Some(&f.writer),
+        &[
+            "task",
+            "create",
+            "child",
+            "Implement part",
+            "--owner",
+            "owner",
+            "--parent",
+            "parent",
+        ],
+        None,
+        true,
+    )?;
+    f.call(
+        Some(&f.writer),
+        &[
+            "task",
+            "create",
+            "child",
+            "Implement part",
+            "--owner",
+            "owner",
+            "--parent",
+            "parent",
+            "--parent-version",
+            "1",
+        ],
+        None,
+        false,
+    )?;
+    let tree = f.call(Some(&f.owner), &["task", "tree", "parent"], None, false)?;
+    assert_eq!(tree["tasks"].as_array().unwrap().len(), 2);
+    let update = json!({"version":1,"mode":"all","requirements":[{"condition":{"task":"child","states":["accepted"],"accepted_revision":"rev-child"},"version":1}],"reason":"accept child before parent review"});
+    f.call(
+        Some(&f.owner),
+        &["task", "dependencies", "parent", "--file", "-"],
+        Some(update.clone()),
+        true,
+    )?;
+    let result = f.call(
+        Some(&f.writer),
+        &["task", "dependencies", "parent", "--file", "-"],
+        Some(update),
+        false,
+    )?;
+    assert_eq!(result["version"], 2);
+    let plan = f.call(
+        Some(&f.owner),
+        &["task", "dependencies", "parent"],
+        None,
+        false,
+    )?;
+    assert_eq!(plan["readiness"]["ready"], false);
+    f.call(
+        Some(&f.writer),
+        &[
+            "task",
+            "update",
+            "child",
+            "--version",
+            "1",
+            "--state",
+            "accepted",
+            "--reason",
+            "reviewed",
+            "--accepted-revision",
+            "rev-child",
+        ],
+        None,
+        false,
+    )?;
+    assert_eq!(
+        f.call(
+            Some(&f.owner),
+            &["task", "dependencies", "parent"],
+            None,
+            false
+        )?["readiness"]["ready"],
+        true
+    );
+    assert_eq!(
+        f.call(Some(&f.owner), &["task", "show", "parent"], None, false)?["state"],
+        "open"
+    );
+    Ok(())
+}
 impl Fixture {
     fn new() -> Result<Self> {
         let mut f = Self {

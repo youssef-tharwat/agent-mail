@@ -310,7 +310,7 @@ pub struct Pending {
 }
 
 /// Schema understood by this binary.
-pub(crate) const SCHEMA_VERSION: i64 = 26;
+pub(crate) const SCHEMA_VERSION: i64 = 27;
 
 impl Store {
     /// Open a database, optionally creating and migrating its schema.

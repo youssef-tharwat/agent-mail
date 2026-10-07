@@ -140,6 +140,8 @@ string_enum! {
         DependencyReady => "dependency_ready",
         /// The decision authority must review overdue work.
         ReviewDue => "review_due",
+        /// A child's material progress asks its parent's writer to reassess.
+        SubtaskChanged => "subtask_changed",
         /// A bounded follow-up is due.
         ReminderDue => "reminder_due",
     }

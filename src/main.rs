@@ -301,6 +301,16 @@ enum Bridge {
 }
 
 enum WorkCommand {
+    Dependencies {
+        group: String,
+        id: String,
+        update: Option<agent_mail::task_graph::DependencyUpdate>,
+    },
+    Tree {
+        group: String,
+        id: String,
+        limit: usize,
+    },
     ListPage {
         group: String,
         query: agent_mail::work::WorkListQuery,
@@ -349,6 +359,7 @@ enum WorkCommand {
         next_action: String,
         deadline: Option<i64>,
         evidence: Vec<String>,
+        parent: Option<agent_mail::task_graph::TaskReference>,
     },
     Show {
         group: String,
@@ -971,26 +982,25 @@ async fn run(cli: RunArgs) -> Result<()> {
                 next_action,
                 deadline,
                 evidence,
+                parent,
             } => {
                 let actor = store.authenticate(&group, cli.session.as_ref()).await?;
                 let task_id = id.clone();
-                let mut value = serde_json::to_value(
-                    store
-                        .work_create(
-                            &actor,
-                            WorkDraft {
-                                id,
-                                scope,
-                                owner,
-                                state,
-                                next_action,
-                                deadline,
-                                evidence,
-                            },
-                            now()?,
-                        )
-                        .await?,
-                )?;
+                let draft = WorkDraft {
+                    id,
+                    scope,
+                    owner,
+                    state,
+                    next_action,
+                    deadline,
+                    evidence,
+                };
+                let item = if let Some(parent) = parent {
+                    store.create_subtask(&actor, parent, draft, now()?).await?
+                } else {
+                    store.work_create(&actor, draft, now()?).await?
+                };
+                let mut value = serde_json::to_value(item)?;
                 value["delivery"] = store
                     .task_delivery_outcome(&group, &task_id, value["version"].as_i64().unwrap_or(0))
                     .await;
@@ -1009,6 +1019,20 @@ async fn run(cli: RunArgs) -> Result<()> {
                         .await?,
                 )?;
                 value
+            }
+            WorkCommand::Dependencies { group, id, update } => {
+                let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+                if let Some(update) = update {
+                    store
+                        .task_dependencies_set(&actor, &id, update, now()?)
+                        .await?
+                } else {
+                    store.task_dependencies(&actor, &id).await?
+                }
+            }
+            WorkCommand::Tree { group, id, limit } => {
+                let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+                store.task_tree(&actor, &id, limit).await?
             }
             WorkCommand::List { group, after } => {
                 let actor = store.authenticate(&group, cli.session.as_ref()).await?;

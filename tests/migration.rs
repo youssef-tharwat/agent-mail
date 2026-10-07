@@ -9,6 +9,131 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::fs;
 
 #[tokio::test]
+async fn version_twenty_six_upgrades_dependency_facts_without_rewriting_business_state()
+-> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("state");
+    let migrations = temp.path().join("old-migrations");
+    fs::create_dir_all(&root)?;
+    fs::create_dir_all(&migrations)?;
+    for entry in fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let name = filename.to_str().unwrap();
+        if name.ends_with(".sql") && name[..4].parse::<u32>()? <= 26 {
+            fs::copy(entry.path(), migrations.join(name))?;
+        }
+    }
+    let pool = SqlitePoolOptions::new()
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(root.join("mail.db"))
+                .create_if_missing(true),
+        )
+        .await?;
+    sqlx::migrate::Migrator::new(migrations.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+    sqlx::raw_sql(r#"
+      INSERT INTO node VALUES ('00000000-0000-4000-8000-000000000001');
+      INSERT INTO groups(name,socket,home_machine) VALUES ('g','','00000000-0000-4000-8000-000000000001');
+      INSERT INTO mailboxes(id,group_name,name,binding) VALUES
+       (1,'g','writer','{"runtime":"standalone","session":"00000000-0000-4000-8000-000000000002"}'),
+       (2,'g','owner','{"runtime":"standalone","session":"00000000-0000-4000-8000-000000000003"}');
+      INSERT INTO work_items(group_name,id,writer,owner,scope,state,open,next_action,version,updated)
+       VALUES ('g','a','writer','owner','integrate','review',1,'writer review',2,99),
+              ('g','b','writer','owner','build','accepted',0,'finished',3,99);
+      INSERT INTO task_relations(group_name,source,target,kind,version,actor,reason,updated)
+       VALUES ('g','a','b','dependency',2,'writer','wait on build',99);
+      INSERT INTO task_relation_history(group_name,source,snapshot,actor,reason,changed)
+       VALUES ('g','a','{"original":"historical dependency"}','writer','wait on build',99);
+      INSERT INTO event_receipts(recipient,binding_version,event) SELECT 2,1,id FROM coordination_events WHERE recipient=2;
+      INSERT INTO attention_attempts(recipient,binding_version,event,attempts,next_attempt) SELECT 1,1,id,3,500 FROM coordination_events WHERE recipient=1;
+    "#).execute(&pool).await?;
+    let snapshot = serde_json::json!({"group_name":"g","source":"a","version":2,"relations":[{"source":"a","target":"b","kind":"dependency","active":true,"version":2,"review_round":"","source_revision":""}]});
+    let event_id = "00000000-0000-4000-8000-000000000010";
+    let envelope = serde_json::json!({"event_id":event_id,"origin":"00000000-0000-4000-8000-000000000001","destination":"00000000-0000-4000-8000-000000000004","event":{"kind":"relation_snapshot","data":snapshot}});
+    sqlx::query("INSERT INTO outbox(event_id,dest_machine,payload,created) VALUES(?,?,?,99)")
+        .bind(event_id)
+        .bind("00000000-0000-4000-8000-000000000004")
+        .bind(envelope.to_string())
+        .execute(&pool)
+        .await?;
+    sqlx::query("INSERT INTO task_relation_snapshots(group_name,source,version,snapshot,synced_at) VALUES('g','a',2,?,99)").bind(snapshot.to_string()).execute(&pool).await?;
+    let boundary: i64 = sqlx::query_scalar("SELECT escalate_at FROM followups WHERE task='a'")
+        .fetch_one(&pool)
+        .await?;
+    pool.close().await;
+    let store = Store::open(&root, true).await?;
+    let writer = store.mailbox("g", "writer").await?;
+    let dependencies = store.task_dependencies(&writer, "a").await?;
+    assert_eq!(dependencies["readiness"]["ready"], true);
+    assert_eq!(
+        dependencies["plan"]["requirements"][0]["states"],
+        serde_json::json!(["done", "accepted"])
+    );
+    let pool = support::pool(&store).await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM work_items WHERE id='a'")
+            .fetch_one(&pool)
+            .await?,
+        "review"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT version FROM work_items WHERE id='a'")
+            .fetch_one(&pool)
+            .await?,
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT escalate_at FROM followups WHERE task='a'")
+            .fetch_one(&pool)
+            .await?,
+        boundary
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM attention_attempts WHERE attempts=3")
+            .fetch_one(&pool)
+            .await?,
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM event_receipts")
+            .fetch_one(&pool)
+            .await?,
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT snapshot FROM task_relation_history")
+            .fetch_one(&pool)
+            .await?,
+        "{\"original\":\"historical dependency\"}"
+    );
+    let events = store.export().await?;
+    assert_eq!(events[0].event_id.to_string(), event_id);
+    let agent_mail::relay::Event::TaskGraphSnapshot(imported) = &events[0].event else {
+        panic!("wrong queued event");
+    };
+    assert_eq!(imported.version, 2);
+    assert_eq!(imported.dependencies.requirements[0].task.as_str(), "b");
+    assert_eq!(imported.relations[0]["active"], false);
+    let cached: String =
+        sqlx::query_scalar("SELECT snapshot FROM task_relation_snapshots WHERE source='a'")
+            .fetch_one(&pool)
+            .await?;
+    let cached: agent_mail::relationships::TaskGraphSnapshot = serde_json::from_str(&cached)?;
+    assert_eq!(cached.dependencies, imported.dependencies);
+    assert!(
+        sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn version_twenty_five_recovers_threads_and_queued_context_without_rewriting_mail()
 -> Result<()> {
     let temp = tempfile::tempdir()?;
@@ -305,7 +430,7 @@ async fn version_twenty_four_preserves_requests_and_budgets_when_schedules_merge
         sqlx::query_scalar::<_, i64>("PRAGMA user_version")
             .fetch_one(&pool)
             .await?,
-        26
+        27
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM active_attention")
@@ -544,7 +669,7 @@ async fn version_twenty_two_adds_wake_indexes_without_changing_events_or_receipt
         sqlx::query_scalar::<_, i64>("PRAGMA user_version")
             .fetch_one(&pool)
             .await?,
-        26
+        27
     );
     assert!(
         sqlx::query("PRAGMA foreign_key_check")
@@ -593,7 +718,7 @@ async fn existing_version_four_state_upgrades_to_opt_in_sync() -> Result<()> {
     let version = sqlx::query!("PRAGMA user_version")
         .fetch_one(&support::pool(&store).await?)
         .await?;
-    assert_eq!(version.user_version, Some(26));
+    assert_eq!(version.user_version, Some(27));
     let peer = uuid::Uuid::new_v4();
     store.add_peer(peer, "test-host").await?;
     assert!(!store.peers_status().await?[0].auto_sync);
@@ -932,7 +1057,7 @@ async fn version_sixteen_upgrades_without_changing_business_or_legacy_budgets() 
             .fetch_one(&pool)
             .await?
             .user_version,
-        Some(26)
+        Some(27)
     );
     Ok(())
 }
@@ -991,7 +1116,7 @@ async fn automatic_open_never_initializes_missing_state_or_downgrades() -> Resul
     let pool = SqlitePoolOptions::new()
         .connect_with(SqliteConnectOptions::new().filename(root.join("mail.db")))
         .await?;
-    sqlx::query!("PRAGMA user_version=27")
+    sqlx::query!("PRAGMA user_version=28")
         .execute(&pool)
         .await?;
     pool.close().await;

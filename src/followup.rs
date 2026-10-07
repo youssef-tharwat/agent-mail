@@ -33,8 +33,9 @@ pub enum Source {
     },
 }
 /// Combination semantics for a persisted prerequisite set.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
+#[sqlx(rename_all = "snake_case")]
 pub enum PrerequisiteMode {
     /// Every condition must qualify.
     All,
@@ -812,7 +813,13 @@ pub(crate) async fn validate_dependency_graph(
                 _ => {}
             }
         }
-        let links:Vec<String>=sqlx::query_scalar("SELECT target FROM task_relations WHERE group_name=? AND source=? AND active=1 AND kind='dependency'").bind(group).bind(id).fetch_all(&mut **tx).await?;
+        let links: Vec<String> = sqlx::query_scalar(
+            "SELECT target FROM task_dependency_edges WHERE group_name=? AND source=?",
+        )
+        .bind(group)
+        .bind(id)
+        .fetch_all(&mut **tx)
+        .await?;
         pending.extend(links);
     }
     Ok(())
@@ -878,6 +885,21 @@ pub(crate) async fn occurrence_current(
     let Some(plan) = plan else {
         return Ok(false);
     };
+    // Escalation remains due even while dependencies block the owner's work.
+    let escalation: bool =
+        sqlx::query_scalar("SELECT stage=3 FROM attention_occurrences WHERE CAST(id AS TEXT)=?")
+            .bind(subject)
+            .fetch_one(&mut **tx)
+            .await?;
+    if escalation {
+        return Ok(true);
+    }
+    if crate::task_graph::readiness_tx(tx, &plan.group_name, plan.task.as_deref())
+        .await?
+        .is_some_and(|r| !r.ready)
+    {
+        return Ok(false);
+    }
     if plan
         .report()?
         .is_some_and(|report| report.waiting.is_some())
@@ -968,7 +990,7 @@ pub async fn reconcile(store: &Store, time: i64) -> Result<()> {
     sqlx::query("INSERT OR IGNORE INTO followups(group_name,task,task_version,recipient,authority,opened,next_check,escalate_at) SELECT w.group_name,w.id,w.version,b.id,a.id,w.updated,?+p.max_seconds,?+p.max_seconds FROM work_items w JOIN mailboxes b ON b.group_name=w.group_name AND b.name=w.owner JOIN mailboxes a ON a.group_name=w.group_name AND a.name=w.writer JOIN followup_policy p ON p.group_name=w.group_name WHERE w.open=1 AND b.remote_machine IS NULL AND NOT EXISTS(SELECT 1 FROM followups f WHERE f.group_name=w.group_name AND f.task=w.id) ORDER BY w.group_name,w.id LIMIT 100")
         .bind(time).bind(time).execute(&mut *tx).await?;
     let plans = sqlx::query_as::<_, Plan>(
-        "SELECT * FROM scheduled_followups WHERE stage<3 OR (dependency_ready_at IS NULL AND json_extract(checkpoint,'$.waiting.kind') IN ('task','tasks','mail','pull_request')) ORDER BY scanned,id LIMIT 100",
+        "SELECT * FROM scheduled_followups f WHERE stage<3 OR (dependency_ready_at IS NULL AND (json_extract(checkpoint,'$.waiting.kind') IN ('task','tasks','mail','pull_request') OR EXISTS(SELECT 1 FROM task_dependency_edges e WHERE e.group_name=f.group_name AND e.source=f.task))) ORDER BY scanned,id LIMIT 100",
     )
     .fetch_all(&mut *tx)
     .await?;
@@ -991,8 +1013,14 @@ pub async fn reconcile(store: &Store, time: i64) -> Result<()> {
             .bind(p.recipient).bind(p.message).bind(&p.task).bind(p.task_version).bind(time).fetch_one(&mut *tx).await?;
         let report = p.report()?;
         let unread = !retrieved && report.is_none();
-        let waiting = report.as_ref().is_some_and(|r| r.waiting.is_some());
-        let satisfied = waiting && waiting_satisfied(&mut tx, &p).await?;
+        let readiness =
+            crate::task_graph::readiness_tx(&mut tx, &p.group_name, p.task.as_deref()).await?;
+        let dependencies = readiness.as_ref().is_some_and(|r| r.total > 0);
+        let checkpoint_wait = report.as_ref().is_some_and(|r| r.waiting.is_some());
+        let waiting = dependencies || checkpoint_wait;
+        let satisfied = waiting
+            && readiness.as_ref().is_none_or(|r| r.ready)
+            && (!checkpoint_wait || waiting_satisfied(&mut tx, &p).await?);
         let newly_satisfied = satisfied && p.dependency_ready_at.is_none();
         if newly_satisfied {
             sqlx::query("UPDATE followups SET dependency_ready_at=? WHERE id=?")
@@ -1003,6 +1031,18 @@ pub async fn reconcile(store: &Store, time: i64) -> Result<()> {
         }
         let held:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_items WHERE group_name=? AND id=? AND state IN ('blocked','review'))").bind(&p.group_name).bind(&p.task).fetch_one(&mut *tx).await?;
         if p.stage == 3 {
+            // A changed prerequisite creates a new generation without extending
+            // the boundary or dropping the writer's outstanding escalation.
+            let current: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM attention_occurrences WHERE followup=? AND plan_version=? AND stage=3)")
+                .bind(p.id).bind(p.version).fetch_one(&mut *tx).await?;
+            if !current {
+                advance_attention(&mut tx, &p, 3, time, false).await?;
+                // This is still the same overdue obligation. Keep operator
+                // delivery history and its deadline rather than restarting it
+                // each time a prerequisite changes truth.
+                sqlx::query("UPDATE attention_occurrences SET (operator_after,operator_attempts,operator_next,operator_state,operator_detail)=(SELECT operator_after,operator_attempts,operator_next,operator_state,operator_detail FROM attention_occurrences old WHERE old.followup=? AND old.stage=3 AND old.plan_version<? ORDER BY old.id DESC LIMIT 1) WHERE followup=? AND plan_version=? AND stage=3 AND EXISTS(SELECT 1 FROM attention_occurrences old WHERE old.followup=? AND old.stage=3 AND old.plan_version<?)")
+                    .bind(p.id).bind(p.version).bind(p.id).bind(p.version).bind(p.id).bind(p.version).execute(&mut *tx).await?;
+            }
             if newly_satisfied && !held {
                 // A dependency may become ready after escalation. Wake an unheld owner
                 // while retaining the authority's escalation and hard boundary.
@@ -1011,7 +1051,12 @@ pub async fn reconcile(store: &Store, time: i64) -> Result<()> {
             continue;
         }
         let hard_due = time >= p.escalate_at;
-        let due = time >= p.next_check || (satisfied && p.stage == 0);
+        // Persistent prerequisites suppress owner reminders, but never prevent
+        // supervision at the original hard boundary.
+        if dependencies && !satisfied && !checkpoint_wait && !hard_due {
+            continue;
+        }
+        let due = time >= p.next_check || newly_satisfied;
         if !(hard_due || due || unread && exhausted) {
             continue;
         }
