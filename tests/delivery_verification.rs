@@ -1,4 +1,5 @@
 //! Regression coverage for codex wake behavior.
+mod support;
 use agent_mail::{service, states::DeliveryReadiness, store::Store, verification};
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
@@ -204,6 +205,74 @@ async fn exact_ack_current_health_and_generation_are_required() -> Result<()> {
     assert_eq!(failed["ready"], false);
     Ok(())
 }
+#[tokio::test]
+async fn verification_window_starts_after_busy_wait_and_survives_restart() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let socket = dir.path().join("codex.sock");
+    let thread = Uuid::new_v4();
+    let server = server(UnixListener::bind(&socket)?, thread);
+    let store = Store::open(dir.path(), true).await?;
+    store.enroll("g", None).await?;
+    store.register("g", "worker", false).await?;
+    let actor = store.mailbox("g", "worker").await?;
+    store.attach_codex(&actor, &socket, thread).await?;
+    let lock = service::WorkerLock::acquire(dir.path())?;
+    server.active.store(true, Ordering::SeqCst);
+    verification::reconcile(&store, 1000).await?;
+    let pool = support::pool(&store).await?;
+    // Recover an already-expired, never-dispatched check written by older binaries.
+    sqlx::query("UPDATE delivery_probes SET deadline=1180 WHERE recipient=?")
+        .bind(actor.id)
+        .execute(&pool)
+        .await?;
+    let unsent: String = sqlx::query_scalar("SELECT nonce FROM delivery_probes WHERE recipient=?")
+        .bind(actor.id)
+        .fetch_one(&pool)
+        .await?;
+    assert!(
+        store
+            .acknowledge_delivery(&actor, unsent.parse()?, 1100)
+            .await
+            .is_err()
+    );
+    pool.close().await;
+    for time in [1000, 1180, 2500] {
+        verification::reconcile(&store, time).await?;
+        let waiting = store.delivery_status(&actor, time).await?;
+        assert_eq!(waiting.state, DeliveryReadiness::Verifying);
+        assert_eq!(waiting.attempts, 0);
+        assert_eq!(waiting.deadline, None);
+        assert_eq!(server.received.load(Ordering::SeqCst), 0);
+    }
+    store.close().await;
+    drop(lock);
+    let store = Store::open(dir.path(), false).await?;
+    let _lock = service::WorkerLock::acquire(dir.path())?;
+    server.active.store(false, Ordering::SeqCst);
+    verification::reconcile(&store, 3000).await?;
+    let sent = store.delivery_status(&actor, 3000).await?;
+    assert_eq!(sent.attempts, 1);
+    assert_eq!(sent.deadline, Some(3180));
+    assert_eq!(sent.transport_accepted_at, Some(3000));
+    let challenge = nonce(&server);
+    // Reading status cannot renew the dispatched challenge's deadline.
+    assert_eq!(
+        store.delivery_status(&actor, 3179).await?.deadline,
+        Some(3180)
+    );
+    assert!(
+        store
+            .acknowledge_delivery(&actor, challenge, 3180)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store.delivery_status(&actor, 3180).await?.state,
+        DeliveryReadiness::Expired
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn retry_budget_survives_reopen_and_requires_explicit_restart() -> Result<()> {
     let dir = tempfile::tempdir()?;

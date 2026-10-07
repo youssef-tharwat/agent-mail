@@ -415,7 +415,10 @@ This is separate from adapter event acknowledgments and business completion. Nev
 acknowledge for another agent, copy a nonce from a message/task or database, or
 resolve a request merely because this check succeeded.
 
-Checks are bounded to three attempts, 60 seconds apart, within 180 seconds. Read
+Checks are bounded to three attempts, 60 seconds apart, within 180 seconds of the
+first dispatch attempt. Waiting for an idle client consumes neither an attempt
+nor the acknowledgment window; status has no deadline before that first attempt.
+An already-dispatched check keeps its deadline through waiting and restarts. Read
 `next_attempt_at` and `deadline`; do not infer failure from a brief idle observation.
 After diagnosing and repairing the cause, `agent retry NAME` is the single recovery
 command: it establishes the worker and resets notification and verification budgets

@@ -1464,6 +1464,51 @@ async fn manually_started_done_client_wakes_without_launch_metadata() -> Result<
 }
 
 #[tokio::test]
+async fn a_notification_starts_verification_after_a_long_busy_wait() -> Result<()> {
+    use agent_mail::{states::DeliveryReadiness, verification};
+    let f = Fixture::new().await?;
+    let _lock = service::WorkerLock::acquire(f.store.root())?;
+    for agent in &mut f.host.lock().await.agents {
+        agent.agent_status = agent_mail::herdr::AgentStatus::Working;
+    }
+    verification::reconcile(&f.store, 1000).await?;
+    assert!(f.host.lock().await.prompts.is_empty());
+    let mail = f.send("long-busy-verification").await?;
+    f.host.lock().await.agents[1].agent_status = agent_mail::herdr::AgentStatus::Idle;
+    service::tick(&f.store, 2000).await?;
+    let challenge = {
+        let host = f.host.lock().await;
+        assert_eq!(host.prompts.len(), 1);
+        host.prompts[0]
+            .split("agent ack ")
+            .nth(1)
+            .expect("the real notification must carry the delayed verification challenge")
+            .split('`')
+            .next()
+            .unwrap()
+            .parse()?
+    };
+    verification::reconcile(&f.store, 2001).await?;
+    assert_eq!(
+        f.host.lock().await.prompts.len(),
+        1,
+        "no second turn for verification"
+    );
+    let pending = f.store.delivery_status(&f.b, 2001).await?;
+    assert_eq!(pending.state, DeliveryReadiness::Verifying);
+    assert_eq!(pending.deadline, Some(2180));
+    assert_eq!(pending.attempts, 1);
+    f.store.acknowledge_delivery(&f.b, challenge, 2001).await?;
+    assert!(f.store.delivery_status(&f.b, 2001).await?.ready);
+    assert_eq!(
+        f.mail_state(mail).await?,
+        agent_mail::states::MessageState::Pending
+    );
+    assert_eq!(f.store.mailbox("g", "b").await?.attempts, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn stopped_agent_retains_handoff_and_resumes_only_with_live_identity() -> Result<()> {
     use agent_mail::states::{DeliveryState, MessageState, TaskState};
     let f = Fixture::new().await?;

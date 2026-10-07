@@ -11,6 +11,8 @@ use sqlx::{Sqlite, Transaction};
 use std::{os::unix::fs::MetadataExt, path::Path};
 use uuid::Uuid;
 
+const CHALLENGE_WINDOW_SECONDS: i64 = 180;
+
 /// Current capability plus historical, explicitly scoped evidence.
 #[derive(Debug, Serialize)]
 pub struct DeliveryStatus {
@@ -36,7 +38,7 @@ pub struct DeliveryStatus {
     pub attempts: i64,
     /// Next bounded dispatch attempt, if another attempt is available.
     pub next_attempt_at: Option<i64>,
-    /// Deadline for the current challenge.
+    /// Deadline for a dispatched challenge; absent while waiting for its first attempt.
     pub deadline: Option<i64>,
     /// Concrete repair instruction when not ready.
     pub next_action: Option<String>,
@@ -189,12 +191,12 @@ impl Store {
         };
         let key = route.key(&current)?;
         if let Some(p)=sqlx::query!("SELECT deadline,next_attempt,attempts,transport_accepted_at,runtime_received_at,acknowledged_at,healthy_at,failed FROM delivery_probes WHERE recipient=? AND binding_version=? AND route_key=?",current.id,current.binding_version,key).fetch_optional(&mut *tx).await? {
-            status.deadline=Some(p.deadline);
-            status.next_attempt_at=(p.acknowledged_at.is_none() && p.attempts<3 && now<p.deadline).then_some(p.next_attempt.max(now));
+            status.deadline=(p.attempts>0).then_some(p.deadline);
+            status.next_attempt_at=(p.acknowledged_at.is_none() && p.attempts<3 && (p.attempts==0 || now<p.deadline)).then_some(p.next_attempt.max(now));
             status.attempts=p.attempts;status.acknowledged_at=p.acknowledged_at;status.agent_acknowledged=p.acknowledged_at.is_some();status.runtime_received_at=p.runtime_received_at;status.transport_accepted_at=p.transport_accepted_at;status.checked_at=p.healthy_at;
             status.state=if p.failed!=0 {State::Unavailable} else if p.acknowledged_at.is_some() {
                 if p.healthy_at.is_some_and(|t|t<=now && now-t<=30){State::Verified}else{State::Unavailable}
-            } else if now>=p.deadline{State::Expired}else{State::Verifying};
+            } else if p.attempts>0 && now>=p.deadline{State::Expired}else{State::Verifying};
         }
         if !crate::service::running(self.root()) {
             status.state = State::WorkerStopped;
@@ -229,7 +231,9 @@ impl Store {
         };
         let key = route.key(actor)?;
         let nonce = Uuid::new_v4().to_string();
-        let deadline = now + 180;
+        // Waiting for an idle recipient is not a delivery attempt. The first
+        // reservation starts the acknowledgment window atomically with its budget.
+        let deadline = 0;
         sqlx::query!("INSERT INTO delivery_probes(recipient,binding_version,route_key,nonce,created,deadline) VALUES(?,?,?,?,?,?) ON CONFLICT(recipient) DO UPDATE SET binding_version=excluded.binding_version,route_key=excluded.route_key,nonce=excluded.nonce,created=excluded.created,deadline=excluded.deadline,attempts=0,next_attempt=0,transport_accepted_at=NULL,runtime_received_at=NULL,acknowledged_at=NULL,healthy_at=NULL,failed=0 WHERE delivery_probes.route_key<>excluded.route_key",actor.id,actor.binding_version,key,nonce,now,deadline).execute(&mut *tx).await?;
         let row = sqlx::query!(
             "SELECT nonce FROM delivery_probes WHERE recipient=?",
@@ -251,7 +255,7 @@ impl Store {
             return Ok(false);
         };
         let key = route.key(actor)?;
-        Ok(sqlx::query!("SELECT recipient FROM delivery_probes WHERE recipient=? AND binding_version=? AND route_key=? AND nonce=? AND deadline>?",actor.id,actor.binding_version,key,nonce,now).fetch_optional(&mut **tx).await?.is_some())
+        Ok(sqlx::query!("SELECT recipient FROM delivery_probes WHERE recipient=? AND binding_version=? AND route_key=? AND nonce=? AND (attempts=0 OR deadline>?)",actor.id,actor.binding_version,key,nonce,now).fetch_optional(&mut **tx).await?.is_some())
     }
     pub(crate) async fn reserve_probe(
         &self,
@@ -279,7 +283,8 @@ impl Store {
             return Ok(false);
         }
         let next = now + 60;
-        let count=sqlx::query!("UPDATE delivery_probes SET attempts=attempts+1,next_attempt=? WHERE recipient=? AND nonce=? AND attempts<3 AND acknowledged_at IS NULL AND next_attempt<=?",next,actor.id,nonce,now).execute(&mut *tx).await?.rows_affected();
+        let deadline = now + CHALLENGE_WINDOW_SECONDS;
+        let count=sqlx::query!("UPDATE delivery_probes SET deadline=CASE WHEN attempts=0 THEN ? ELSE deadline END,attempts=attempts+1,next_attempt=? WHERE recipient=? AND nonce=? AND attempts<3 AND acknowledged_at IS NULL AND next_attempt<=?",deadline,next,actor.id,nonce,now).execute(&mut *tx).await?.rows_affected();
         tx.commit().await?;
         Ok(count == 1)
     }
@@ -299,8 +304,10 @@ impl Store {
             return Ok(None);
         }
         let next = now + 60;
+        let deadline = now + CHALLENGE_WINDOW_SECONDS;
         let reserved = sqlx::query!(
-            "UPDATE delivery_probes SET attempts=attempts+1,next_attempt=? WHERE recipient=? AND binding_version=? AND nonce=? AND attempts<3 AND transport_accepted_at IS NULL AND acknowledged_at IS NULL AND deadline>?",
+            "UPDATE delivery_probes SET deadline=CASE WHEN attempts=0 THEN ? ELSE deadline END,attempts=attempts+1,next_attempt=? WHERE recipient=? AND binding_version=? AND nonce=? AND attempts<3 AND transport_accepted_at IS NULL AND acknowledged_at IS NULL AND (attempts=0 OR deadline>?)",
+            deadline,
             next,
             actor.id,
             actor.binding_version,
@@ -480,7 +487,7 @@ async fn reconcile_one(store: &Store, actor: &Mailbox, now: i64) -> Result<()> {
     {
         return Ok(());
     }
-    let pending=sqlx::query!("SELECT recipient FROM delivery_probes WHERE recipient=? AND nonce=? AND acknowledged_at IS NULL AND deadline>? AND attempts<3 AND next_attempt<=?",actor.id,nonce,now,now).fetch_optional(store.pool()).await?.is_some();
+    let pending=sqlx::query!("SELECT recipient FROM delivery_probes WHERE recipient=? AND nonce=? AND acknowledged_at IS NULL AND (attempts=0 OR deadline>?) AND attempts<3 AND next_attempt<=?",actor.id,nonce,now,now).fetch_optional(store.pool()).await?.is_some();
     if !pending {
         return Ok(());
     }
