@@ -16,7 +16,9 @@ herdr pane input-target PANE terminal --terminal TERMINAL_ID
 Release requires that terminal identity, a live idle shell, and no live or
 launching agent. `agent` instead of `terminal` reserves an empty lane. Intent
 follows terminal identity through layout moves and persists in saved sessions.
-Legacy agent metadata conservatively restores agent intent. Human TUI input and
+Legacy agent metadata conservatively restores agent intent; missing intent
+restores as `unassigned` and rejects raw input until explicitly assigned. Deferred
+native agent resumes reserve agent input before a runtime attaches. Human TUI input and
 direct terminal attachment remain available; this is an automation contract,
 not an authorization sandbox. An unpatched server does not enforce it.
 
@@ -28,7 +30,7 @@ Apache 2.0 license. It includes `src/terminal/input_target.rs`; existing publish
 client codecs and endpoint fixtures are unchanged.
 
 Patch SHA-256:
-`57f777a5f47ea4d0362a2926626159f16096e8a075e4129120f136368f7c5074`.
+`1be9657ec03b51d18c24de98eda8e4c6885cef346fab4569e2b33e3e75318f7e`.
 Apply it in a separate checkout at that exact revision:
 
 ```sh
@@ -40,19 +42,31 @@ Build with Rust 1.96.1, Zig 0.16.0 and locked dependencies. The release uses
 Herdr's existing build identity flags so it is distinguishable from upstream:
 
 ```sh
-HERDR_BUILD_CHANNEL=agent-input-guard HERDR_BUILD_ID=1 \
+HERDR_BUILD_CHANNEL=agent-input-guard HERDR_BUILD_ID=2 \
   CARGO_BUILD_JOBS=2 cargo build --release --locked --bin herdr
 ```
 
-The resulting version is `0.9.3-agent-input-guard.1`. This is a custom build,
+The resulting version is `0.9.3-agent-input-guard.2`. This is a custom build,
 not an official Herdr release. Installing Agent Mail does not replace Herdr.
 Use Herdr's live handoff after validating the candidate with an isolated server;
 never stop or kill a user's server to perform this update. Do not hand off to an
 unpatched older binary and assume the input guard will remain enforced.
 
+Handoff from Herdr 0.9.1 regenerates terminal handles while preserving pane IDs
+and shell processes. Revalidate affected external bindings against the unchanged
+native agent session; stale registrations must not be guessed or rebound. The
+isolated cross-version smoke check verifies the actual receiving server version,
+preserved pane and shell PID, immediate rejection during import, rejection after
+agent exit, and successful explicit shell release.
+
+The updated Herdr skill is in [skill/SKILL.md](skill/SKILL.md). It retains the
+installed skill's workflow and adds guarded input and explicit-release guidance.
+Its optional command instructions apply only when the installed binary provides
+`pane input-target`; the upstream stable skill remains unchanged.
+
 ## Verification
 
-The prepared patch passed 3,757 native Rust tests, strict Clippy, formatting,
+The final patch passed 3,758 native Rust tests, strict Clippy, formatting,
 architecture checks, integration-asset and documentation/release-workflow checks.
 Final focused regressions cover all raw paths without writes, stale-identity
 release, live-agent release rejection, persistence, CLI validation and actual
