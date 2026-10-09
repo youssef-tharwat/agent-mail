@@ -52,7 +52,7 @@ impl TaskRequirement {
             );
         }
         if let Some(revision) = &self.accepted_revision {
-            bounded(revision, 128, "accepted revision")?;
+            bounded(revision, crate::work::REVISION_LIMIT, "accepted revision")?;
             ensure!(
                 !revision.trim().is_empty(),
                 "accepted revision cannot be empty"

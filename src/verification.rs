@@ -121,7 +121,7 @@ async fn route(tx: &mut Transaction<'_, Sqlite>, actor: &Mailbox) -> Result<Rout
     match actor.binding {
         Binding::Remote { .. } => Ok(RouteCheck::Blocked(State::RemoteUnsupported)),
         Binding::Herdr(_) => {
-            if r.auto_prompt == 0 {
+            if !Store::herdr_policy_tx(tx, actor).await? {
                 return Ok(RouteCheck::Blocked(State::NotifyOnly));
             }
             let Ok(meta) = std::fs::metadata(&r.herdr_socket) else {
@@ -504,7 +504,7 @@ async fn send_herdr(
     socket: &Path,
     now: i64,
 ) -> Result<()> {
-    let Some(_wake_lock) = crate::service::wake_lock(store.root(), actor.id)? else {
+    let Some(_wake_lock) = crate::service::herdr_wake_lock(store.root(), socket, actor)? else {
         return Ok(());
     };
     let binding = actor.binding.herdr().context("missing binding")?;

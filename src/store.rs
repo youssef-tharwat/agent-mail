@@ -99,7 +99,7 @@ pub struct Group {
     pub socket: Option<PathBuf>,
     /// Whether automatic delivery is paused, encoded as zero or one.
     pub paused: i64,
-    /// Whether automatic Herdr prompts are enabled, encoded as zero or one.
+    /// Legacy group flag; current prompting consent belongs to exact Herdr sessions.
     pub auto_prompt: i64,
     /// UUID of the authoritative machine for this group.
     pub home_machine: String,
@@ -310,7 +310,7 @@ pub struct Pending {
 }
 
 /// Schema understood by this binary.
-pub(crate) const SCHEMA_VERSION: i64 = 27;
+pub(crate) const SCHEMA_VERSION: i64 = 28;
 
 impl Store {
     /// Open a database, optionally creating and migrating its schema.
@@ -576,7 +576,8 @@ impl Store {
         Ok(())
     }
 
-    /// Opt a group into automatic Herdr prompts, or disable them.
+    /// Set prompting consent for existing Herdr sessions selected by this group.
+    /// New operator commands should select one exact session instead.
     ///
     /// # Errors
     /// The group is missing, enabling lacks a Herdr socket, or persistence fails.
@@ -586,13 +587,27 @@ impl Store {
             !enabled || config.socket.is_some(),
             "automatic prompts require a Herdr socket"
         );
-        sqlx::query!(
-            "UPDATE groups SET auto_prompt = ? WHERE name = ?",
-            enabled,
-            group
-        )
-        .execute(self.pool())
-        .await?;
+        let mut tx = self.pool().begin().await?;
+        sqlx::query!("UPDATE groups SET paused=paused WHERE name=?", group)
+            .execute(&mut *tx)
+            .await?;
+        let bindings=sqlx::query!("SELECT binding FROM mailboxes WHERE group_name=? AND pane IS NOT NULL AND agent_state='registered'",group).fetch_all(&mut *tx).await?;
+        ensure!(
+            !enabled || !bindings.is_empty(),
+            "bind a live Herdr session before enabling prompting consent"
+        );
+        for row in bindings {
+            let binding: Binding = serde_json::from_str(&row.binding)?;
+            let key = crate::sessions::endpoint_key(
+                config
+                    .socket
+                    .as_deref()
+                    .context("Herdr socket is missing")?,
+                &binding,
+            )?;
+            sqlx::query!("INSERT INTO herdr_session_policy(endpoint,auto_prompt) VALUES(?,?) ON CONFLICT(endpoint) DO UPDATE SET auto_prompt=excluded.auto_prompt",key,enabled).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -611,9 +626,27 @@ impl Store {
         group: &str,
         participant: &str,
     ) -> Result<Option<Mailbox>> {
+        Self::find_mailbox_on(self.pool(), group, participant).await
+    }
+
+    pub(crate) async fn mailbox_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        group: &str,
+        participant: &str,
+    ) -> Result<Mailbox> {
+        Self::find_mailbox_on(&mut **tx, group, participant)
+            .await?
+            .context("participant is not registered in this group")
+    }
+
+    async fn find_mailbox_on<'e>(
+        executor: impl sqlx::Executor<'e, Database = Sqlite>,
+        group: &str,
+        participant: &str,
+    ) -> Result<Option<Mailbox>> {
         sqlx::query_as!(MailboxRow,
             "SELECT id,group_name,name,binding,binding_version,agent_state AS 'state: AgentState',agent_version AS version,agent_updated AS updated,attempts,next_wake,alerted FROM mailboxes WHERE group_name=? AND name=?",
-            group, participant).fetch_optional(self.pool()).await?
+            group, participant).fetch_optional(executor).await?
             .map(Mailbox::try_from).transpose()
     }
 
@@ -719,6 +752,7 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         }
+        Self::initialize_herdr_policy_tx(&mut tx, group, binding).await?;
         tx.commit().await?;
         crate::stream::hint(self.root()).await;
         Ok(())
@@ -755,7 +789,7 @@ impl Store {
         Ok(())
     }
 
-    async fn publish_tx(
+    pub(crate) async fn publish_tx(
         tx: &mut Transaction<'_, Sqlite>,
         actor: &Mailbox,
         publish: &mut Publish,
@@ -1010,6 +1044,7 @@ impl Store {
             m.sender == actor.id,
             "only the sender can withdraw a message"
         );
+        ensure!(sqlx::query_scalar!("SELECT NOT EXISTS(SELECT 1 FROM task_reports WHERE decision_message=?) AS 'ordinary!: bool'",id).fetch_one(&mut *tx).await?,"a submitted task result requires its writer's disposition; report corrections without withdrawing its obligation");
         let remote = sqlx::query!("SELECT b.name,b.remote_machine,m.global_id FROM deliveries d JOIN mailboxes b ON b.id=d.recipient JOIN messages m ON m.id=d.message WHERE d.message=? AND d.state='pending' AND b.remote_machine IS NOT NULL", id)
             .fetch_all(&mut *tx).await?;
         sqlx::query!(

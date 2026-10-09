@@ -247,8 +247,8 @@ impl Store {
     /// The actor is stale or storage fails.
     pub async fn set_runtime_enabled(&self, actor: &Mailbox, enabled: bool) -> Result<()> {
         ensure!(
-            matches!(actor.binding, Binding::Standalone { .. }),
-            "native delivery controls require a standalone participant; use runtime pause for Herdr group delivery"
+            !matches!(actor.binding, Binding::Remote { .. }),
+            "delivery preferences require a local participant"
         );
         let mut tx = self.pool().begin().await?;
         Self::lock_actor(&mut tx, actor).await?;
@@ -261,7 +261,7 @@ impl Store {
         tx.commit().await?;
         Ok(())
     }
-    /// Whether automatic native attachment and delivery are permitted.
+    /// Whether automatic attachment and delivery are permitted for this binding.
     ///
     /// # Errors
     /// Reading the persisted preference fails.

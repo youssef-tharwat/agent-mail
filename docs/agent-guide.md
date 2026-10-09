@@ -23,8 +23,9 @@ do not reload it if present in context. skills.sh manages installed skill files.
 ## Responsibilities
 
 - **Mail** persists tasks, messages, versions, history and notifications together.
-- **Task writer** is the creator and sole decision writer, on the group's home
-  machine. **Owner** does the assigned work; changing owner does not change writer.
+- **Task writer** is the current designated decision writer on the group's home
+  machine, initially the creator and changeable through explicit writer transfer.
+  **Owner** does the assigned work; changing owner does not change writer.
 - **Workflow** defines scope, review requirements and acceptance evidence. Mail
   does not require Fleet, infer approval, or enforce a sequence of task states.
 - **Runtime/integrations** own sessions, permissions, delivery receipts and recovery.
@@ -80,11 +81,12 @@ only for the intended group; do not guess groups to repair access failures.
 
 | Need | Operation and effect |
 |---|---|
-| New request, blocker or result | `mail send RECIPIENT "SUMMARY" --key KEY --task ID --version VERSION`; creates a pending obligation for the recipient. |
+| Task result on its home store | `task report TASK --file result.json`; saves immutable evidence and atomically requests the task writer's decision. |
+| New request, discussion, blocker or remote-snapshot report | `mail send RECIPIENT "SUMMARY" --key KEY --task ID --version VERSION`; creates a pending obligation for the recipient. |
 | Quiet information or a routine broadcast | `mail send RECIPIENT "SUMMARY" --intent notice --key KEY --conversation ID`; preserves information without a reply, deadline, follow-up, or model interruption. |
 | Final answer to an inbox request | `mail reply MESSAGE_ID "ANSWER"`; sends a response and resolves your delivery atomically. The requester receives attention to inspect the response; no reciprocal reply or resolution is owed. |
 | Outcome with no answer needed | `mail resolve MESSAGE_ID --note "OUTCOME"`; resolves your delivery without sending mail. |
-| Withdraw your outgoing request | `mail withdraw MESSAGE_ID`; does not cancel or accept its task. |
+| Withdraw an ordinary outgoing request | `mail withdraw MESSAGE_ID`; typed result obligations require their writer's disposition. |
 | Decide a task and settle linked incoming mail | `task update ID ... --resolve MESSAGE_ID`; commits both or neither. |
 
 Use `mail show` to inspect notices and responses; they need no resolve command.
@@ -163,18 +165,34 @@ agent-mail task create api "Review API changes at abc123" --owner worker
 The scope supplies the initial next action unless `--next-action` overrides it.
 Choose a stable task ID. Creation itself notifies the owner.
 
-**Owner works:** recover the assignment, inspect relevant material, then send a
-result to the task's writer. Include the revision, evidence locations, outstanding
-issues and the decision needed:
+**Owner works:** recover the assignment, inspect relevant material, then submit a
+typed result on the task's home store. Include its current version, a stable key,
+the source revision, evidence locations, and the decision needed:
 
-```sh
-agent-mail mail send coordinator "API reviewed at abc123; decision needed" \
-  --task api --version 1 --key api-result-v1 --body-file result.txt
+```json
+{"version":1,"key":"api-result-v1","summary":"API reviewed; decision needed","revision":"abc123","evidence":["ci/run/42"],"body":"Ready for review; no outstanding findings."}
 ```
 
-Use `mail reply` instead if this is the final answer to an existing inbox request.
-An owner who is not the writer reports state changes through Mail. Do not attempt
-to update the record under another identity.
+Save that JSON as a result file, then run:
+
+```sh
+agent-mail task report api --file result.json
+```
+
+Reporting atomically saves immutable evidence and a mandatory request to the
+current writer. It never accepts or changes task state and cannot use notice
+intent. Read results with `task result ID`; `task reports TASK` pages metadata.
+The returned `message` is the inbox request to resolve with the writer's decision.
+Identical retries preserve the logical result, including after acceptance. A new
+result requires the current owner, exact task version and a nonterminal task.
+Pending results hold owner reminders for the current assignment; supervision
+continues to the writer. Explicit writer transfers move pending typed results
+without changing their evidence or extending the escalation boundary.
+
+Ordinary mail remains available for discussion, blockers and final answers to
+existing inbox requests. Remote snapshot holders use contextual mail: typed
+submission requires authoritative task state on its home store. Do not attempt
+to update the task under another identity.
 
 **Writer decides:** read the result, verify evidence under the active workflow,
 and use the task version actually observed:
@@ -300,8 +318,10 @@ For an authorized registration change, read `agent show NAME`, then use
 `retired`; idle/busy/offline are runtime observations, never registration decisions.
 
 Retirement rejects open tasks where the agent is owner **or writer**, and pending
-incoming/outgoing mail. Reassign owned tasks or close them through the workflow;
-the task writer cannot be transferred. Do not close real work just to retire an agent.
+incoming/outgoing mail. Reassign owned tasks and explicitly transfer writer
+authority with `task transfer-writer`, or close tasks through the workflow.
+Pending typed results follow that writer transfer; settle ordinary private mail
+separately. Do not close real work just to retire an agent.
 Restore explicitly with `--state registered` and the observed version, then launch
 again or reattach Herdr. Old standalone credentials and runtime connections stay
 invalid; explicit delivery pause remains. Binding replacement advances the version.
@@ -366,6 +386,20 @@ delivery is disabled. Enable it with `herdr plugin enable youssef-tharwat.agent-
 do not call registration alone a working integration. Binding rejects a disabled plugin.
 Herdr prompt delivery defaults to notification-only. Only an explicit operator choice
 of `runtime herdr-policy unguarded` permits prompts; Herdr cannot verify an empty draft.
+Consent belongs to the exact socket, pane, terminal and native agent session. It
+applies across that session's already verified group bindings, preserving group
+pauses and binding opt-outs. Operators targeting another agent use
+`--group GROUP runtime herdr-policy unguarded --agent NAME`; without `--agent`,
+the command authenticates its calling agent. A replacement session needs fresh
+consent. Conflicting legacy group policies migrate to notification-only.
+
+Run `agent-mail attention session` to inspect all bindings of the current verified
+Herdr session. Recovery lists additional group bindings and their inspection
+command. Every wake names the group in its fetch command. Use that exact group
+for reads and decisions; a session view does not merge mailboxes or receipt
+generations. It records no retrieval and returns a cursor for omitted groups.
+Standalone credentials remain scoped to their own registration; matching native
+socket or thread names do not authorize another group's mailbox.
 
 For a stalled handoff, use `agent-mail status --check NAME`. Distinguish:
 
@@ -548,10 +582,11 @@ temporary progress conditions. A wake never supplies approval or clears an
 approval hold.
 
 Use `task transfer-writer ID --file transfer.json` for an explicit authority
-handoff with observed task version, retry key, new writer, and reason. Owner
-reassignment leaves decision authority unchanged. Transfer preserves pending mail
-and other obligations. Private incoming reports must be explicitly shared or
-forwarded by an authorized mailbox. An unavailable writer requires the explicit
+handoff with observed task version, expected old writer, new writer, observed
+destination binding generation, and reason. Owner reassignment leaves decision
+authority unchanged. Pending typed results move to the successor atomically;
+ordinary private mail keeps its existing dispositions and must be explicitly
+shared or forwarded by an authorized mailbox. An unavailable writer requires the explicit
 local operator recovery path; agents must never borrow the old credential.
 
 Detailed formats and policies: `docs/records.md`, `docs/artifacts.md`, and

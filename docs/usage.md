@@ -24,7 +24,7 @@ Download the archive and its checksum from [GitHub Releases](https://github.com/
 For Apple Silicon:
 
 ```sh
-version=0.14.4
+version=0.15.0
 target=aarch64-apple-darwin
 archive="agent-mail-v${version}-${target}.tar.gz"
 base="https://github.com/youssef-tharwat/agent-mail/releases/download/v${version}"
@@ -97,9 +97,12 @@ Inside the worker’s session:
 
 ```sh
 agent-mail context
-agent-mail mail send coordinator "Reviewed abc123; evidence: reviews/api.md" \
-  --task api-review --version 1 --key api-review-result-v1
+agent-mail task report api-review --file reviews/result.json
 ```
+
+The result file contains the observed `version`, stable `key`, decision `summary`,
+source `revision`, `evidence` references and supporting `body`. Reporting creates
+a mandatory writer request atomically; it never accepts the task.
 
 The task's writer decides whether the result is acceptable. Creating or updating
 a task publishes the relevant notifications atomically; no bookkeeping send is
@@ -310,9 +313,12 @@ agent's delivery budget; it never resumes a paused group or retries tools.
 Inspect and fix the endpoint before retrying. Attempts are limited to three per
 change batch, five minutes apart, with budgets persisted across worker restarts.
 
-Detach disables native attachment across startup hooks and session restarts.
-Enable permits attachment again; resume Claude to register its inbox. Explicit
-native attachment also enables delivery. Herdr group delivery uses pause/resume.
+Detach disables automatic delivery for one binding. For native clients it also
+disables attachment across startup hooks and session restarts; enable permits
+attachment again, and resuming the client registers its inbox. Explicit native
+attachment also enables delivery. For Herdr these commands control the binding's
+opt-out without granting session prompting consent. Pause/resume controls the
+whole group's delivery independently.
 
 ## Status and troubleshooting
 
@@ -361,8 +367,20 @@ agent-mail agent bind worker --herdr-pane WORKER_PANE
 
 Herdr owns live sessions; Mail owns durable coordination. Herdr prompts default
 to notification-only because its API cannot verify an empty draft. Operators may
-explicitly choose `runtime herdr-policy unguarded`; `notify` restores the default.
+explicitly choose `runtime herdr-policy unguarded --agent NAME`; `notify` disables
+that exact session's prompting. Without `--agent`, the command authenticates its
+calling agent. Consent covers the exact endpoint's verified group bindings;
+another pane, socket or native session does not inherit it. Group pauses and
+binding opt-outs remain independent. Mixed legacy group choices migrate
+conservatively to notification-only and require an explicit session choice.
 Do not mistake registration or an idle pane for confirmed agent progress.
+
+`attention session` gives a bounded view across this session's group bindings,
+including pause/consent status and exact group-scoped attention sources. It
+records no retrieval and returns `next_after_group` when more groups remain.
+Every wake names the group to use when fetching its source. Recovery exposes
+additional group coverage. Standalone credentials retain their single-address
+authority. [Result handoffs and shared sessions](RESULT_HANDOFFS.md).
 
 ## Advanced integrations
 
@@ -424,7 +442,7 @@ clears prior launch evidence; an old session cannot establish new readiness.
 ## Existing installations
 
 Upgrade the binary, then use Agent Mail normally. Commands, hooks, managed launches
-and worker startup automatically upgrade an existing store to schema 26. Missing
+and worker startup automatically upgrade an existing store to schema 28. Missing
 stores still require `agent-mail init GROUP`. Help, the skill guide and read-only
 `status --check NAME` diagnostics do not migrate state.
 
@@ -502,8 +520,10 @@ result without applying it again; changed retries conflict. Binding changes also
 advance the registration version. Runtime observations never retire agents.
 
 Retirement rejects open tasks owned or written by the agent, open remote snapshots,
-and pending incoming/outgoing requests. The task writer cannot be transferred:
-settle its tasks through the workflow. Retired agents reject authentication, launches,
+and pending incoming/outgoing requests. Reassign owned tasks and explicitly
+transfer writer authority with `task transfer-writer`, or settle tasks through
+the workflow. Pending typed results follow writer authority; ordinary private
+mail still needs separate settlement. Retired agents reject authentication, launches,
 new mail, assignments and rebinding. Restore explicitly; standalone credentials rotate,
 runtime attachments become invalid, and explicit delivery pause remains in effect.
 History and coordination records are preserved. Manage remote registrations at home.
@@ -557,7 +577,7 @@ ensures the worker is connected and resets notification and verification budgets
 atomically. It preserves identity, pause/prompt policy and business state. Never execute
 an acknowledgment for another agent or obtain its challenge from storage.
 
-Send/reply and task create/update responses include `delivery` per affected
+Send/reply and task create/update/report responses include `delivery` per affected
 recipient. These diagnostics cannot turn a committed write into an error. A
 missing route means work is stored and awaiting delivery, not lost; do not resend
 under a different key. Notifications and business obligations remain separate.

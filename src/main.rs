@@ -222,6 +222,10 @@ enum Command {
         work_after: String,
         mail_after: i64,
     },
+    SessionAttention {
+        group: String,
+        after_group: String,
+    },
     /// Print lifecycle hook configuration; merge it into the client's existing hooks.
     /// Native Claude lifecycle adapter; reads runtime input and endpoint environment.
     ClaudeHook {
@@ -266,6 +270,7 @@ enum Command {
     /// Opt in to unguarded agent prompts, or return to safe notification-only mode.
     PromptMode {
         group: String,
+        agent: Option<String>,
         enable_unguarded: bool,
         disable: bool,
     },
@@ -301,6 +306,20 @@ enum Bridge {
 }
 
 enum WorkCommand {
+    Report {
+        group: String,
+        id: String,
+        report: agent_mail::task_reports::TaskReport,
+    },
+    Reports {
+        group: String,
+        id: String,
+        after: i64,
+    },
+    Result {
+        group: String,
+        id: i64,
+    },
     Dependencies {
         group: String,
         id: String,
@@ -595,7 +614,7 @@ async fn run(cli: RunArgs) -> Result<()> {
         Command::EnableRuntime { group, name } => {
             let actor = store.mailbox(&group, &name).await?;
             store.set_runtime_enabled(&actor, true).await?;
-            json!({"enabled":name,"group":group,"next_action":"resume the native session to register its endpoint"})
+            json!({"enabled":name,"group":group,"next_action":if actor.binding.herdr().is_some(){"verify the current Herdr session and its prompting consent"}else{"resume the native session to register its endpoint"}})
         }
         Command::Retry { group, name } => {
             let actor = store.mailbox(&group, &name).await?;
@@ -766,6 +785,10 @@ async fn run(cli: RunArgs) -> Result<()> {
         Command::AttentionSnapshot { group } => {
             let actor = store.authenticate(&group, cli.session.as_ref()).await?;
             serde_json::to_value(store.attention_snapshot(&actor).await?)?
+        }
+        Command::SessionAttention { group, after_group } => {
+            let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+            store.session_attention(&actor, &after_group).await?
         }
         Command::AttentionAcknowledge { group, token } => {
             let actor = store.authenticate(&group, cli.session.as_ref()).await?;
@@ -946,6 +969,27 @@ async fn run(cli: RunArgs) -> Result<()> {
             coordination_cli::run_artifact(&store, &actor, command).await?
         }
         Command::Work(command) => match command {
+            WorkCommand::Report { group, id, report } => {
+                let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+                let mut value = store.report_task(&actor, &id, report, now()?).await?;
+                value["delivery"] = store
+                    .message_delivery_outcome(
+                        &group,
+                        value["message"]
+                            .as_i64()
+                            .context("report has no decision message")?,
+                    )
+                    .await;
+                value
+            }
+            WorkCommand::Reports { group, id, after } => {
+                let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+                store.task_reports(&actor, &id, after).await?
+            }
+            WorkCommand::Result { group, id } => {
+                let actor = store.authenticate(&group, cli.session.as_ref()).await?;
+                store.task_report_value(&actor, id).await?
+            }
             WorkCommand::Checkpoint {
                 group,
                 id,
@@ -1018,6 +1062,7 @@ async fn run(cli: RunArgs) -> Result<()> {
                         .record_links(&actor, &agent_mail::records::RecordTarget::Task(id.clone()))
                         .await?,
                 )?;
+                value["reports"] = store.task_reports(&actor, &id, 0).await?;
                 value
             }
             WorkCommand::Dependencies { group, id, update } => {
@@ -1229,6 +1274,7 @@ async fn run(cli: RunArgs) -> Result<()> {
         }
         Command::PromptMode {
             group,
+            agent,
             enable_unguarded,
             disable,
         } => {
@@ -1236,8 +1282,39 @@ async fn run(cli: RunArgs) -> Result<()> {
                 enable_unguarded || disable,
                 "choose --enable-unguarded or --disable"
             );
-            store.set_auto_prompt(&group, enable_unguarded).await?;
-            json!({"group":group,"auto_prompt":enable_unguarded,"guarded":false})
+            let actor = if let Some(name) = agent {
+                ensure!(
+                    cli.session.is_none(),
+                    "named delivery consent requires operator authority; agents configure their own verified session"
+                );
+                store.mailbox(&group, &name).await?
+            } else {
+                store.authenticate(&group, cli.session.as_ref()).await?
+            };
+            let target = actor
+                .binding
+                .herdr()
+                .context("Herdr policy requires a Herdr-bound agent")?;
+            let socket = store
+                .group(&group)
+                .await?
+                .socket
+                .context("Herdr socket is missing")?;
+            let live = herdr::agent(&socket, &target.pane).await?;
+            ensure!(
+                live.matches(&actor),
+                "Herdr session changed; verify and explicitly rebind before changing consent"
+            );
+            store
+                .set_herdr_prompt_policy(&actor, enable_unguarded)
+                .await?;
+            let groups: Vec<_> = store
+                .session_mailboxes(&actor)
+                .await?
+                .into_iter()
+                .map(|a| a.group_name)
+                .collect();
+            json!({"group":group,"agent":actor.name,"scope":"herdr_session","groups":groups,"auto_prompt":enable_unguarded,"guarded":false})
         }
         Command::Service(Service::Run { once }) => {
             service::run(&store, once).await?;

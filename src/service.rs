@@ -18,7 +18,7 @@ use fs2::FileExt;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
@@ -70,13 +70,28 @@ impl Drop for WorkerLock {
 /// Serialize external wakes for one participant, including verification wakes.
 /// The OS releases this lock on cancellation, timeout, or process exit.
 pub(crate) fn wake_lock(root: &Path, recipient: i64) -> Result<Option<WorkerLock>> {
+    named_wake_lock(root, &format!("wake-{recipient}.lock"))
+}
+
+pub(crate) fn herdr_wake_lock(
+    root: &Path,
+    socket: &Path,
+    actor: &crate::store::Mailbox,
+) -> Result<Option<WorkerLock>> {
+    use sha2::{Digest, Sha256};
+    let key = crate::sessions::endpoint_key(socket, &actor.binding)?;
+    let digest = Sha256::digest(key.as_bytes());
+    named_wake_lock(root, &format!("herdr-wake-{digest:x}.lock"))
+}
+
+fn named_wake_lock(root: &Path, name: &str) -> Result<Option<WorkerLock>> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .open(root.join(format!("wake-{recipient}.lock")))?;
+        .open(root.join(name))?;
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(WorkerLock(file))),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
@@ -163,70 +178,116 @@ async fn session_tick_inner(
             .collect());
     }
     let agents = herdr::agents(socket).await?;
+    // Select the oldest eligible reason per endpoint across all its groups.
+    // Stop-work attention has priority. A busy, paused or cooling binding never
+    // takes the slot, and one busy group cannot starve another project's result.
+    struct Candidate<'a> {
+        group: &'a Group,
+        item: &'a Pending,
+        rank: Option<(u8, i64)>,
+    }
+    let mut ordered = Vec::new();
+    for item in pending {
+        let Some(group) = groups.iter().find(|g| g.name == item.group_name) else {
+            continue;
+        };
+        let actor = store.mailbox(&item.group_name, &item.name).await?;
+        let rank = if group.paused == 0
+            && store.runtime_enabled(&actor).await?
+            && store.herdr_prompt_enabled(&actor).await?
+            && agents.iter().any(|a| a.matches(&actor) && a.ready())
+        {
+            store
+                .claimable_attention_candidates(&actor, time)
+                .await?
+                .first()
+                .map(|candidate| {
+                    (
+                        u8::from(candidate.reason != crate::states::AttentionReason::StopWork),
+                        candidate.event,
+                    )
+                })
+        } else {
+            None
+        };
+        ordered.push(Candidate { group, item, rank });
+    }
+    ordered.sort_by_key(|candidate| candidate.rank.unwrap_or((u8::MAX, i64::MAX)));
+    let mut dispatched = BTreeSet::new();
+    let mut alerts: BTreeMap<String, usize> = BTreeMap::new();
     let mut observations = Vec::new();
-    for group in groups {
-        let mut alerts = 0;
-        for item in pending.iter().filter(|p| p.group_name == group.name) {
-            if group.paused != 0 {
-                observations.push(Observation::for_inbox(item, DeliveryState::Paused));
-                continue;
-            }
-            if group.auto_prompt == 0 {
-                observations.push(Observation::for_inbox(item, DeliveryState::PromptDisabled));
-                if store.reserve_alert(item.id, time).await? {
-                    alerts += 1;
-                }
-                continue;
-            }
-            let binding = store.mailbox(&group.name, &item.name).await?;
-            let attention = store.attention_snapshot(&binding).await?;
-            let candidates = store.attention_candidates(&binding, time).await?;
-            let mut detail = None;
-            let state = if let Some(agent) = agents.iter().find(|a| {
-                binding
-                    .binding
-                    .herdr()
-                    .is_some_and(|bound| a.pane_id == bound.pane)
-            }) {
-                if attention.items.is_empty() {
-                    DeliveryState::Settled
-                } else if !agent.matches(&binding) {
-                    DeliveryState::BindingMismatch
-                } else if let Some(reason) = agent.readiness_reason() {
-                    detail = Some(reason.into());
-                    DeliveryState::Busy
-                } else if candidates.is_empty() && item.attempts >= 3 && item.next_wake <= time {
-                    DeliveryState::Exhausted
-                } else if candidates.is_empty() {
-                    DeliveryState::Waiting
-                } else {
-                    wake(store, socket, &binding, time)
-                        .await
-                        .unwrap_or_else(|e| {
-                            detail = Some(format!("{e:#}"));
-                            DeliveryState::Uncertain
-                        })
-                }
-            } else {
-                DeliveryState::Unavailable
-            };
-            let mut observation = Observation::for_inbox(item, state);
-            observation.detail = detail;
-            observations.push(observation);
-            if store.reserve_alert(item.id, time).await? {
-                alerts += 1;
-            }
+    for Candidate { group, item, rank } in ordered {
+        if group.paused != 0 {
+            observations.push(Observation::for_inbox(item, DeliveryState::Paused));
+            continue;
         }
-        if alerts > 0 {
-            // Reservation is durable even if delivery is ambiguous. Status always retains the problem.
-            if let Err(e) = herdr::notify(socket, &group.name, alerts).await {
-                observations.push(Observation {
-                    group: group.name,
-                    participant: String::new(),
-                    state: DeliveryState::NotificationFailed,
-                    detail: Some(format!("{e:#}")),
-                });
+        let binding = store.mailbox(&group.name, &item.name).await?;
+        if !store.runtime_enabled(&binding).await? {
+            observations.push(Observation::for_inbox(item, DeliveryState::Paused));
+            continue;
+        }
+        if !store.herdr_prompt_enabled(&binding).await? {
+            observations.push(Observation::for_inbox(item, DeliveryState::PromptDisabled));
+            if store.reserve_alert(item.id, time).await? {
+                *alerts.entry(group.name.clone()).or_default() += 1;
             }
+            continue;
+        }
+        let attention = store.attention_snapshot(&binding).await?;
+        let candidates = store.attention_candidates(&binding, time).await?;
+        let key = crate::sessions::endpoint_key(socket, &binding.binding)?;
+        let mut detail = None;
+        let state = if let Some(agent) = agents.iter().find(|a| {
+            binding
+                .binding
+                .herdr()
+                .is_some_and(|bound| a.pane_id == bound.pane)
+        }) {
+            if attention.items.is_empty() {
+                DeliveryState::Settled
+            } else if !agent.matches(&binding) {
+                DeliveryState::BindingMismatch
+            } else if let Some(reason) = agent.readiness_reason() {
+                detail = Some(reason.into());
+                DeliveryState::Busy
+            } else if candidates.is_empty() && item.attempts >= 3 && item.next_wake <= time {
+                DeliveryState::Exhausted
+            } else if candidates.is_empty() || rank.is_none() || dispatched.contains(&key) {
+                DeliveryState::Waiting
+            } else {
+                let outcome = wake(store, socket, &binding, time)
+                    .await
+                    .unwrap_or_else(|e| {
+                        detail = Some(format!("{e:#}"));
+                        DeliveryState::Uncertain
+                    });
+                // A refused claim leaves the next ranked binding eligible.
+                // An uncertain transport may have delivered, so stop this scan
+                // for the endpoint until its live state is checked again.
+                if matches!(outcome, DeliveryState::Queued | DeliveryState::Uncertain) {
+                    dispatched.insert(key);
+                }
+                outcome
+            }
+        } else {
+            DeliveryState::Unavailable
+        };
+        let mut observation = Observation::for_inbox(item, state);
+        observation.detail = detail;
+        observations.push(observation);
+        if store.reserve_alert(item.id, time).await? {
+            *alerts.entry(group.name.clone()).or_default() += 1;
+        }
+    }
+    for (group, count) in alerts {
+        // Reservation is durable even if delivery is ambiguous. Status retains the problem.
+        if let Err(e) = herdr::notify(socket, &group, count).await {
+            observations.push(Observation {
+                group,
+                participant: String::new(),
+                state: DeliveryState::NotificationFailed,
+                detail: Some(format!("{e:#}")),
+            });
         }
     }
     Ok(observations)
@@ -238,7 +299,7 @@ async fn wake(
     binding: &crate::store::Mailbox,
     time: i64,
 ) -> Result<DeliveryState> {
-    let Some(_wake_lock) = wake_lock(store.root(), binding.id)? else {
+    let Some(_wake_lock) = herdr_wake_lock(store.root(), socket, binding)? else {
         return Ok(DeliveryState::Ineligible);
     };
     let Some(target) = binding.binding.herdr() else {
@@ -257,17 +318,28 @@ async fn wake(
     else {
         return Ok(DeliveryState::Ineligible);
     };
-    let challenge = match store.reserve_delivery_challenge(binding, time).await {
-        Ok(challenge) => challenge,
-        Err(error) => {
-            eprintln!(
-                "agent-mail: could not attach delivery check to {}/{} notification: {error:#}",
-                binding.group_name, binding.name
-            );
-            None
-        }
-    };
     let mut text = Store::attention_text(&batch, true)?;
+    // A long group or source identifier must not prevent its actionable hint.
+    // Defer verification to the ordinary standalone check without consuming an
+    // attempt when both trusted instructions cannot fit Herdr's prompt budget.
+    let fits_check = text.len()
+        + 1
+        + crate::verification::challenge(binding, "00000000-0000-0000-0000-000000000000").len()
+        <= 480;
+    let challenge = if fits_check {
+        match store.reserve_delivery_challenge(binding, time).await {
+            Ok(challenge) => challenge,
+            Err(error) => {
+                eprintln!(
+                    "agent-mail: could not attach delivery check to {}/{} notification: {error:#}",
+                    binding.group_name, binding.name
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     if let Some(nonce) = challenge.as_deref() {
         text.push('\n');
         text.push_str(&crate::verification::challenge(binding, nonce));
@@ -279,12 +351,14 @@ async fn wake(
     let operation = Operation::HerdrDelivery;
     let mut tx = store.delivery_transaction(binding, operation).await?;
     if sqlx::query_scalar!(
-        "SELECT paused<>0 OR auto_prompt=0 AS 'held!: i64' FROM groups WHERE name=?",
+        "SELECT paused<>0 AS 'held!: i64' FROM groups WHERE name=?",
         binding.group_name
     )
     .fetch_one(&mut **tx)
     .await?
         != 0
+        || !Store::herdr_policy_tx(&mut tx, binding).await?
+        || sqlx::query_scalar!("SELECT enabled=0 AS 'held!: bool' FROM runtime_policy WHERE recipient=? AND binding_version=?",binding.id,binding.binding_version).fetch_optional(&mut **tx).await?.unwrap_or(false)
         || !Store::validate_attention_tx(&mut tx, binding, &batch).await?
     {
         tx.commit().await?;

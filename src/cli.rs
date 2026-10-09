@@ -217,11 +217,26 @@ enum Mail {
         #[arg(long)]
         note: String,
     },
-    /// Withdraw a request you sent. Does not accept or close its task.
+    /// Withdraw an ordinary outgoing request; typed results require writer disposition.
     Withdraw { id: i64 },
 }
 #[derive(Subcommand)]
 enum Task {
+    /// Submit the current owner's result; atomically request its writer's decision.
+    Report {
+        id: String,
+        /// JSON result: version, key, summary, revision, evidence and body.
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Page task-result metadata; private result bodies remain separately authorized.
+    Reports {
+        id: String,
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+    },
+    /// Read a result as its submitter or the task's current writer.
+    Result { id: i64 },
     /// Report progress for the observed task revision without changing task state.
     Checkpoint {
         id: String,
@@ -337,6 +352,11 @@ enum Task {
 }
 #[derive(Subcommand)]
 enum Attention {
+    /// Inspect all group bindings of this verified session without claiming receipts.
+    Session {
+        #[arg(long, default_value = "")]
+        after_group: String,
+    },
     /// Inspect current reasons without recording delivery or retrieval.
     Snapshot,
     /// Confirm that the current runtime consumed this exact claimed batch.
@@ -524,9 +544,9 @@ enum Runtime {
         #[command(subcommand)]
         endpoint: Endpoint,
     },
-    /// Disable delivery and automatic reattachment until explicitly enabled.
+    /// Disable this binding's delivery and native reattachment until explicitly enabled.
     Detach { name: String },
-    /// Permit automatic attachment again; resume Claude to register its inbox.
+    /// Enable this binding's delivery; resume a native client or verify Herdr consent.
     Enable { name: String },
     /// Pause this group's delivery without stopping the service or blocking mail.
     Pause,
@@ -541,6 +561,9 @@ enum Runtime {
     HerdrPolicy {
         #[arg(value_enum)]
         policy: HerdrPolicy,
+        /// Operator target; omitted means the authenticated calling agent.
+        #[arg(long)]
+        agent: Option<String>,
     },
 }
 #[derive(Subcommand)]
@@ -679,10 +702,8 @@ impl Cli {
                 grouped_help(
                     c,
                     &[
-                        (
-                            "Native clients",
-                            &["configure", "attach", "detach", "enable"],
-                        ),
+                        ("Native clients", &["configure", "attach"]),
+                        ("Binding delivery", &["detach", "enable"]),
                         ("Group delivery", &["pause", "resume"]),
                         ("Herdr", &["herdr", "herdr-policy"]),
                     ],
@@ -774,9 +795,15 @@ impl Cli {
                     | Action::Adapter(_)
                     | Action::Status { .. }
             );
-            let selected = store
-                .select_group(self.group.as_deref(), self.session.as_ref(), agent)
-                .await?;
+            let selected = if matches!(&command, Action::Attention(Attention::Session { .. })) {
+                store
+                    .select_session_group(self.group.as_deref(), self.session.as_ref())
+                    .await?
+            } else {
+                store
+                    .select_group(self.group.as_deref(), self.session.as_ref(), agent)
+                    .await?
+            };
             store.close().await;
             selected
         } else {
@@ -837,6 +864,9 @@ impl Cli {
             },
             Action::Service(s) => Command::Service(s),
             Action::Attention(attention) => match attention {
+                Attention::Session { after_group } => {
+                    Command::SessionAttention { group, after_group }
+                }
                 Attention::Snapshot => Command::AttentionSnapshot { group },
                 Attention::Acknowledge { token } => Command::AttentionAcknowledge { group, token },
                 Attention::Checkpoint { id, key, file } => Command::Checkpoint {
@@ -1021,6 +1051,13 @@ impl Cli {
             },
             Action::Task(task) => {
                 Command::Work(match task {
+                    Task::Report { id, file } => WorkCommand::Report {
+                        group,
+                        id,
+                        report: serde_json::from_str(&read_body(&file)?)?,
+                    },
+                    Task::Reports { id, after } => WorkCommand::Reports { group, id, after },
+                    Task::Result { id } => WorkCommand::Result { group, id },
                     Task::Checkpoint {
                         id,
                         version,
@@ -1169,8 +1206,9 @@ impl Cli {
                     install_service: false,
                     follow_through: None,
                 },
-                Runtime::HerdrPolicy { policy } => Command::PromptMode {
+                Runtime::HerdrPolicy { policy, agent } => Command::PromptMode {
                     group,
+                    agent,
                     enable_unguarded: matches!(policy, HerdrPolicy::Unguarded),
                     disable: matches!(policy, HerdrPolicy::Notify),
                 },

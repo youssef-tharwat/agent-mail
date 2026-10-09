@@ -1,6 +1,6 @@
 id = "youssef-tharwat.agent-mail"
 name = "Agent Mail"
-version = "0.14.4"
+version = "0.15.0"
 min_herdr_version = "0.9.1"
 description = "Local durable tasks and messages for coding agents"
 platforms = ["macos", "linux"]

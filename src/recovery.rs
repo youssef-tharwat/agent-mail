@@ -83,8 +83,32 @@ impl Store {
             }
         }
         let mut value = json!({"group":group,"artifacts":artifact_refs,"artifacts_more":artifacts_more,"records":record_refs,"records_more":records_more,"followups":followups,"checkpoints":checkpoints,"checkpoints_more":false,"checkpoint_help":"Use task/mail checkpoint when yielding with unfinished work; show fetches full metadata; attention list pages pending follow-ups", "work":works,"mail":mails,"work_more":work.len()>works.len(),"mail_more":mail.len()>mails.len(),"next_work_after":next_work,"next_mail_after":next_mail,"stale_peers":stale_peers,"outbox_pending":outbox_pending,"outbox_oldest":outbox_oldest});
+        let bindings = self.session_mailboxes(actor).await?;
+        if bindings.len() > 1 {
+            value["session_groups"] = json!(
+                bindings
+                    .iter()
+                    .take(8)
+                    .map(|a| a.group_name.as_str())
+                    .collect::<Vec<_>>()
+            );
+            value["session_groups_more"] = json!(bindings.len() > 8);
+            value["session_attention"] =
+                json!(format!("agent-mail --group {group} attention session"));
+        }
         // Account for metadata too. Do not receipt any record trimmed from the response.
         while serde_json::to_vec(&value)?.len() > 4096 {
+            if value["session_groups"]
+                .as_array_mut()
+                .is_some_and(|groups| groups.len() > 1)
+            {
+                value["session_groups"]
+                    .as_array_mut()
+                    .expect("session group array")
+                    .pop();
+                value["session_groups_more"] = json!(true);
+                continue;
+            }
             if value["artifacts"]
                 .as_array_mut()
                 .expect("artifact array")

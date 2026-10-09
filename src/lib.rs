@@ -46,12 +46,16 @@ pub mod records;
 pub mod relationships;
 pub mod relay;
 pub mod service;
+/// Verified session bindings and shared Herdr delivery consent.
+pub mod sessions;
 /// Group-scoped diagnostics and explicit installation overview.
 pub mod status;
 pub mod store;
 pub mod supervision;
 /// Writer-owned task dependency contracts and bounded subtask inspection.
 pub mod task_graph;
+/// Atomic owner results and mandatory task-writer dispositions.
+pub mod task_reports;
 /// End-to-end delivery verification, separate from business decisions.
 pub mod verification;
 pub mod work;

@@ -16,6 +16,7 @@ use serde_json::json;
 const SCOPE_LIMIT: usize = 1024;
 const ACTION_LIMIT: usize = 512;
 const EVIDENCE_LIMIT: usize = 16;
+pub(crate) const REVISION_LIMIT: usize = 128;
 
 /// Initial work fields before versioning and actor metadata are assigned.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,7 +117,7 @@ pub struct WorkItem {
     pub scope: String,
     /// Participant responsible for the assignment.
     pub owner: String,
-    /// Participant that originally created the work record.
+    /// Current decision writer, initially the creator; explicit transfer changes authority.
     pub writer: String,
     /// Stored business state; it does not imply transport delivery.
     pub state: TaskState,
@@ -216,7 +217,7 @@ impl TryFrom<WorkRow> for WorkItem {
     }
 }
 
-fn validate_evidence(evidence: &[String]) -> Result<()> {
+pub(crate) fn validate_evidence(evidence: &[String]) -> Result<()> {
     ensure!(
         evidence.len() <= EVIDENCE_LIMIT,
         "too many evidence references"
@@ -240,7 +241,7 @@ fn validate_fields(item: &WorkItem) -> Result<()> {
         "next action is required"
     );
     if let Some(revision) = &item.accepted_revision {
-        bounded(revision, 128, "accepted revision")?;
+        bounded(revision, REVISION_LIMIT, "accepted revision")?;
         ensure!(!revision.trim().is_empty(), "accepted revision is empty");
     }
     if let Some(deadline) = item.deadline {
@@ -1021,6 +1022,18 @@ impl Store {
         }
         let new_id:i64=sqlx::query_scalar("SELECT id FROM mailboxes WHERE group_name=? AND name=? AND binding_version=? AND agent_state='registered' AND remote_machine IS NULL").bind(group).bind(&transfer.new_writer).bind(transfer.new_binding_version).fetch_optional(&mut *tx).await?.context("destination must be a current registered local mailbox on the home machine; generation may be stale or retired")?;
         let prior_followup=sqlx::query("SELECT version,checkpoint,stage,next_check,retrieved_at,retrieved_binding,dependency_ready_at FROM followups WHERE group_name=? AND task=?").bind(group).bind(id).fetch_optional(&mut *tx).await?;
+        let reporting_writer = Self::mailbox_tx(&mut tx, group, &item.writer).await?;
+        Self::transfer_reports_tx(
+            &mut tx,
+            &reporting_writer,
+            id,
+            &transfer.new_writer,
+            item.version
+                .checked_add(1)
+                .context("task version overflow")?,
+            now,
+        )
+        .await?;
         item.writer = transfer.new_writer.clone();
         item.version = item
             .version
@@ -1048,7 +1061,7 @@ impl Store {
             .bind(id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("UPDATE attention_occurrences SET recipient=? WHERE stage=3 AND followup IN (SELECT id FROM followups WHERE group_name=? AND task=?)").bind(new_id).bind(group).bind(id).execute(&mut *tx).await?;
+        crate::followup::transfer_task_escalation_tx(&mut tx, group, id, new_id, now).await?;
         relay::enqueue_snapshot(&mut tx, &item, None, now).await?;
         tx.commit().await?;
         crate::stream::hint(self.root()).await;

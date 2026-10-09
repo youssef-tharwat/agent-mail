@@ -12,6 +12,56 @@ struct Fixture {
 }
 
 #[test]
+fn task_reports_use_the_cli_and_cannot_be_published_as_quiet_notices() -> Result<()> {
+    let f = Fixture::new()?;
+    f.task("task")?;
+    let report = json!({"version":1,"key":"result-1","summary":"Review this revision","revision":"abc123","evidence":["ci/run/42"],"body":"Ready for your decision"});
+    let first = f.call(
+        Some(&f.owner),
+        &["task", "report", "task", "--file", "-"],
+        Some(report.clone()),
+        false,
+    )?;
+    let repeated = f.call(
+        Some(&f.owner),
+        &["task", "report", "task", "--file", "-"],
+        Some(report.clone()),
+        false,
+    )?;
+    assert_eq!(first["id"], repeated["id"]);
+    assert_eq!(first["persisted"], true);
+    assert_eq!(first["disposition"], "pending");
+    assert_eq!(
+        first["delivery"][0]["ready"], false,
+        "saving a result does not verify delivery"
+    );
+    let view = f.call(
+        Some(&f.writer),
+        &["task", "result", &first["id"].to_string()],
+        None,
+        false,
+    )?;
+    assert_eq!(view["report"]["revision"], "abc123");
+    let task = f.call(Some(&f.writer), &["task", "show", "task"], None, false)?;
+    assert_eq!(task["state"], "open");
+    assert_eq!(task["reports"]["items"].as_array().unwrap().len(), 1);
+    let mut quiet = report;
+    quiet["intent"] = "notice".into();
+    f.call(
+        Some(&f.owner),
+        &["task", "report", "task", "--file", "-"],
+        Some(quiet),
+        true,
+    )?;
+    let attention = f.call(Some(&f.writer), &["attention", "session"], None, false)?;
+    assert_eq!(
+        attention["total_bindings"], 1,
+        "a standalone credential remains scoped to its own address"
+    );
+    Ok(())
+}
+
+#[test]
 fn subtasks_and_dependency_plans_use_the_public_cli() -> Result<()> {
     let f = Fixture::new()?;
     f.task("parent")?;

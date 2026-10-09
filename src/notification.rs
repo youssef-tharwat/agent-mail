@@ -56,6 +56,43 @@ pub struct Batch {
     pub attention: Snapshot,
 }
 
+struct ReservationStatus {
+    token: String,
+    observed: bool,
+    held: bool,
+}
+
+async fn reservation_status(
+    tx: &mut Transaction<'_, Sqlite>,
+    actor: &Mailbox,
+    snapshot: &Snapshot,
+    time: i64,
+) -> Result<Option<ReservationStatus>> {
+    let old = sqlx::query!(
+        "SELECT binding_version,token,expires,items FROM attention_dispatch WHERE recipient=?",
+        actor.id
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(old) = old else { return Ok(None) };
+    let saved: Snapshot = serde_json::from_str(&old.items)?;
+    let valid =
+        old.binding_version == actor.binding_version && valid_items(tx, actor, &saved).await?;
+    let mut all_seen = true;
+    for item in &saved.items {
+        all_seen &= observed(tx, actor, item.event).await?;
+    }
+    let cancellation = snapshot
+        .items
+        .iter()
+        .any(|item| item.reason == AttentionReason::StopWork && !saved.items.contains(item));
+    Ok(Some(ReservationStatus {
+        token: old.token,
+        observed: valid && all_seen,
+        held: valid && !all_seen && !cancellation && old.expires > time,
+    }))
+}
+
 async fn current(tx: &mut Transaction<'_, Sqlite>, actor: &Mailbox) -> Result<Snapshot> {
     let mut items = select_items(tx, actor, None).await?;
     let more = items.len() > PAGE;
@@ -167,6 +204,26 @@ impl Store {
         Ok(items)
     }
 
+    pub(crate) async fn claimable_attention_candidates(
+        &self,
+        actor: &Mailbox,
+        time: i64,
+    ) -> Result<Vec<Item>> {
+        let mut tx = self.pool().begin().await?;
+        Self::check_actor(&mut tx, actor).await?;
+        let snapshot = current(&mut tx, actor).await?;
+        let held = reservation_status(&mut tx, actor, &snapshot, time)
+            .await?
+            .is_some_and(|reservation| reservation.held);
+        let items = if held {
+            Vec::new()
+        } else {
+            select_items(&mut tx, actor, Some(time)).await?
+        };
+        tx.commit().await?;
+        Ok(items)
+    }
+
     /// Reserve one attention batch across competing runtime delivery paths.
     /// Existing reservations wait for bounded expiry, including after a restart.
     /// A newly valid cancellation supersedes an ordinary outstanding batch.
@@ -186,38 +243,21 @@ impl Store {
         )
         .fetch_one(&mut *tx)
         .await?;
-        if policy.paused != 0 || (consumer == DeliveryConsumer::Herdr && policy.auto_prompt == 0) {
+        let runtime_held = sqlx::query_scalar!("SELECT enabled=0 AS 'held!: bool' FROM runtime_policy WHERE recipient=? AND binding_version=?",actor.id,actor.binding_version).fetch_optional(&mut *tx).await?.unwrap_or(false);
+        if policy.paused != 0
+            || runtime_held
+            || (consumer == DeliveryConsumer::Herdr
+                && !Self::herdr_policy_tx(&mut tx, actor).await?)
+        {
             tx.commit().await?;
             return Ok(None);
         }
         let snapshot = current(&mut tx, actor).await?;
-        let old = sqlx::query!(
-            "SELECT binding_version,token,expires,items FROM attention_dispatch WHERE recipient=?",
-            actor.id
-        )
-        .fetch_optional(&mut *tx)
-        .await?;
-        if let Some(old) = old {
-            let saved: Snapshot = serde_json::from_str(&old.items)?;
-            let valid = old.binding_version == actor.binding_version
-                && valid_items(&mut tx, actor, &saved).await?;
-            let mut all_seen = true;
-            for item in &saved.items {
-                all_seen &= observed(&mut tx, actor, item.event).await?;
+        if let Some(reservation) = reservation_status(&mut tx, actor, &snapshot, time).await? {
+            if reservation.observed {
+                sqlx::query!("INSERT OR IGNORE INTO attention_batch_receipts(token,recipient,binding_version) VALUES(?,?,?)",reservation.token,actor.id,actor.binding_version).execute(&mut *tx).await?;
             }
-            if valid && all_seen {
-                sqlx::query!("INSERT OR IGNORE INTO attention_batch_receipts(token,recipient,binding_version) VALUES(?,?,?)",old.token,actor.id,actor.binding_version).execute(&mut *tx).await?;
-            }
-            let cancellation = snapshot
-                .items
-                .iter()
-                .any(|i| i.reason == AttentionReason::StopWork && !saved.items.contains(i));
-            if old.binding_version == actor.binding_version
-                && valid
-                && !all_seen
-                && !cancellation
-                && old.expires > time
-            {
+            if reservation.held {
                 tx.commit().await?;
                 return Ok(None);
             }
@@ -361,8 +401,8 @@ impl Store {
             // Herdr has a small terminal prompt budget. Exactly this one source
             // is reserved; fetching it records its scoped retrieval receipt.
             return Ok(format!(
-                "Agent Mail changes: {category} {}; fetch {command} show; act or checkpoint. More: agent-mail context.",
-                item.subject
+                "Agent Mail changes: {category} {}; run agent-mail --group {} {command} show {}; act or checkpoint. More: agent-mail attention session.",
+                item.subject, batch.attention.group, item.subject
             ));
         }
         let changes = crate::watch::Changes::collect(

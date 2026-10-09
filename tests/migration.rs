@@ -8,6 +8,14 @@ use anyhow::Result;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::fs;
 
+fn current_schema() -> i64 {
+    sqlx::migrate!("./migrations")
+        .iter()
+        .map(|migration| migration.version)
+        .max()
+        .expect("embedded schema migrations")
+}
+
 #[tokio::test]
 async fn version_twenty_six_upgrades_dependency_facts_without_rewriting_business_state()
 -> Result<()> {
@@ -430,7 +438,7 @@ async fn version_twenty_four_preserves_requests_and_budgets_when_schedules_merge
         sqlx::query_scalar::<_, i64>("PRAGMA user_version")
             .fetch_one(&pool)
             .await?,
-        27
+        current_schema()
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM active_attention")
@@ -669,7 +677,7 @@ async fn version_twenty_two_adds_wake_indexes_without_changing_events_or_receipt
         sqlx::query_scalar::<_, i64>("PRAGMA user_version")
             .fetch_one(&pool)
             .await?,
-        27
+        current_schema()
     );
     assert!(
         sqlx::query("PRAGMA foreign_key_check")
@@ -718,7 +726,7 @@ async fn existing_version_four_state_upgrades_to_opt_in_sync() -> Result<()> {
     let version = sqlx::query!("PRAGMA user_version")
         .fetch_one(&support::pool(&store).await?)
         .await?;
-    assert_eq!(version.user_version, Some(27));
+    assert_eq!(version.user_version, Some(current_schema()));
     let peer = uuid::Uuid::new_v4();
     store.add_peer(peer, "test-host").await?;
     assert!(!store.peers_status().await?[0].auto_sync);
@@ -1057,7 +1065,7 @@ async fn version_sixteen_upgrades_without_changing_business_or_legacy_budgets() 
             .fetch_one(&pool)
             .await?
             .user_version,
-        Some(27)
+        Some(current_schema())
     );
     Ok(())
 }
@@ -1116,7 +1124,7 @@ async fn automatic_open_never_initializes_missing_state_or_downgrades() -> Resul
     let pool = SqlitePoolOptions::new()
         .connect_with(SqliteConnectOptions::new().filename(root.join("mail.db")))
         .await?;
-    sqlx::query!("PRAGMA user_version=28")
+    sqlx::query(&format!("PRAGMA user_version={}", current_schema() + 1))
         .execute(&pool)
         .await?;
     pool.close().await;

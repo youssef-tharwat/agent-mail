@@ -19,7 +19,7 @@ stateDiagram-v2
 ```
 
 The task writer records each transition; the assigned owner does the work and
-submits results through mail.
+submits a typed result that atomically requests the writer's decision.
 
 ## Quick start
 
@@ -57,9 +57,12 @@ agent-mail task create api-review "Review the API changes" --owner worker
 The worker receives a notification and reports back:
 
 ```sh
-agent-mail mail send coordinator "API review complete" \
-  --task api-review --version 1 --key api-review-result --body-file reviews/api.md
+agent-mail task report api-review --file reviews/result.json
 ```
+
+The result file contains `version`, `key`, `summary`, `revision`, `evidence`, and
+`body`. A result always creates a pending writer obligation and cannot be sent as
+a quiet notice. [Result handoffs and shared sessions](docs/RESULT_HANDOFFS.md).
 
 The coordinator records the decision. A reply alone leaves the task pending.
 Every send requires a task and observed version, an existing conversation, a
@@ -88,6 +91,7 @@ alerts require a configured notification route.
 ```sh
 agent-mail context                  # Recover assignments and pending requests
 agent-mail attention snapshot       # Inspect current reasons for attention
+agent-mail attention session        # Inspect this session's verified group bindings
 agent-mail watch --attention         # Observe attention without claiming delivery
 agent-mail mail wait 42 --timeout 5m # Wait for a reply or settlement
 agent-mail status                   # Inspect delivery health

@@ -47,6 +47,128 @@ struct Fixture {
     b: Mailbox,
 }
 
+#[tokio::test]
+async fn one_session_routes_the_oldest_attention_across_groups_with_explicit_fetch_scope()
+-> Result<()> {
+    let f = Fixture::new().await?;
+    let shared = f.host.lock().await.agents[1].clone();
+    f.store.enroll("intake", Some(&f.socket)).await?;
+    f.store
+        .bind("intake", "coordinator", &shared, false)
+        .await?;
+    f.store.register("intake", "sender", false).await?;
+    let sender = f.store.mailbox("intake", "sender").await?;
+    let coordinator = f.store.mailbox("intake", "coordinator").await?;
+    let mut publication = message("intake-first");
+    publication.recipients = vec!["coordinator".into()];
+    let first = f.store.publish(&sender, publication, 1000).await?;
+    let later = f.send("main-later").await?;
+    service::tick(&f.store, 1000).await?;
+    let prompts = f.host.lock().await.prompts.clone();
+    assert_eq!(
+        prompts.len(),
+        1,
+        "one endpoint gets one selected attention wake per scan"
+    );
+    assert!(prompts[0].contains(&format!("--group intake mail show {first}")));
+    assert!(!prompts[0].contains(&format!("--group g mail show {later}")));
+    f.store.message(&coordinator, first).await?;
+    service::tick(&f.store, 1001).await?;
+    let prompts = f.host.lock().await.prompts.clone();
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[1].contains(&format!("--group g mail show {later}")));
+    assert_eq!(
+        f.store.message(&coordinator, first).await?.state,
+        agent_mail::states::MessageState::Pending
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_group_with_an_unseen_lease_and_new_attention_cannot_starve_another_group() -> Result<()>
+{
+    let f = Fixture::new().await?;
+    let leased = f.send("leased-main").await?;
+    let batch = f
+        .store
+        .claim_attention(&f.b, agent_mail::names::DeliveryConsumer::Herdr, 1000)
+        .await?
+        .unwrap();
+    let fresh = f.send("fresh-main").await?;
+    let shared = f.host.lock().await.agents[1].clone();
+    f.store.enroll("intake", Some(&f.socket)).await?;
+    f.store
+        .bind("intake", "coordinator", &shared, false)
+        .await?;
+    f.store.register("intake", "sender", false).await?;
+    let sender = f.store.mailbox("intake", "sender").await?;
+    let mut request = message("intake-later");
+    request.recipients = vec!["coordinator".into()];
+    let other = f.store.publish(&sender, request, 1001).await?;
+    service::tick(&f.store, 1001).await?;
+    let prompts = f.host.lock().await.prompts.clone();
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].contains(&format!("--group intake mail show {other}")));
+    assert!(
+        f.store
+            .claim_attention(&f.b, agent_mail::names::DeliveryConsumer::Herdr, 1002)
+            .await?
+            .is_none()
+    );
+    f.store.message(&f.b, leased).await?;
+    service::tick(&f.store, 1002).await?;
+    let prompts = f.host.lock().await.prompts.clone();
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[1].contains(&format!("--group g mail show {fresh}")));
+    f.store.acknowledge_attention(&f.b, &batch.token).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn long_group_and_task_names_do_not_drop_attention_or_spend_an_unsent_check() -> Result<()> {
+    let f = Fixture::new().await?;
+    let group = "g".repeat(48);
+    let task = "t".repeat(48);
+    let shared = f.host.lock().await.agents[1].clone();
+    f.store.enroll(&group, Some(&f.socket)).await?;
+    f.store.bind(&group, "owner", &shared, false).await?;
+    f.store.register(&group, "writer", false).await?;
+    let owner = f.store.mailbox(&group, "owner").await?;
+    let writer = f.store.mailbox(&group, "writer").await?;
+    f.store
+        .work_create(
+            &writer,
+            WorkDraft {
+                id: task.clone(),
+                scope: "Long identifiers still require delivery".into(),
+                owner: "owner".into(),
+                state: agent_mail::states::TaskState::Active,
+                next_action: "Review assignment".into(),
+                deadline: None,
+                evidence: vec![],
+            },
+            1000,
+        )
+        .await?;
+    service::tick(&f.store, 1000).await?;
+    let prompts = f.host.lock().await.prompts.clone();
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].contains(&format!("--group {group} task show {task}")));
+    assert!(prompts[0].len() <= 480);
+    assert!(!prompts[0].contains("Agent Mail delivery check"));
+    let pool = support::pool(&f.store).await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(SUM(attempts),0) FROM delivery_probes WHERE recipient=?"
+        )
+        .bind(owner.id)
+        .fetch_one(&pool)
+        .await?,
+        0
+    );
+    Ok(())
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.server.abort();
@@ -163,9 +285,9 @@ impl Fixture {
                 1000,
             )
             .await?;
-        initial.set_auto_prompt("g", true).await?;
         initial.bind("g", "a", &agents[0], false).await?;
         initial.bind("g", "b", &agents[1], false).await?;
+        initial.set_auto_prompt("g", true).await?;
         initial.close().await;
         let store = Store::open(&root, false).await?;
         let a = store.mailbox("g", "a").await?;
@@ -330,6 +452,7 @@ async fn verification_retains_health_and_dispatch_errors_without_stopping_other_
                 .bind("g", &format!("lane-{index}"), &live, false)
                 .await?;
         }
+        f.store.set_auto_prompt("g", true).await?;
         {
             let mut host = f.host.lock().await;
             host.invalid_agent_response = health_error;
@@ -602,7 +725,7 @@ async fn bursts_batch_and_retry_budget_survives_restarts() -> Result<()> {
         assert!(notice["new_mail"].as_array().unwrap().len() <= 5);
         assert_eq!(notice["more"], true);
     } else {
-        assert!(prompt.contains("agent-mail context"));
+        assert!(prompt.contains("agent-mail attention session"));
     }
     agent_mail::verification::reconcile(&f.store, 1000).await?;
     // The other registered lane has no pending notification, so it receives its

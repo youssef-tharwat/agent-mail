@@ -726,7 +726,11 @@ async fn validate_wait(
                 );
                 ensure!(!ids.contains(&task.id), "duplicate prerequisite task");
                 if let Some(revision) = &task.accepted_revision {
-                    bounded(revision, 128, "prerequisite revision")?;
+                    bounded(
+                        revision,
+                        crate::work::REVISION_LIMIT,
+                        "prerequisite revision",
+                    )?;
                     ensure!(
                         !revision.trim().is_empty(),
                         "prerequisite revision required"
@@ -894,6 +898,9 @@ pub(crate) async fn occurrence_current(
     if escalation {
         return Ok(true);
     }
+    if task_held_tx(tx, &plan.group_name, plan.task.as_deref()).await? {
+        return Ok(false);
+    }
     if crate::task_graph::readiness_tx(tx, &plan.group_name, plan.task.as_deref())
         .await?
         .is_some_and(|r| !r.ready)
@@ -908,6 +915,14 @@ pub(crate) async fn occurrence_current(
     } else {
         Ok(true)
     }
+}
+
+async fn task_held_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    group: &str,
+    task: Option<&str>,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar!("SELECT EXISTS(SELECT 1 FROM work_items w WHERE w.group_name=? AND w.id=? AND (w.state IN ('blocked','review') OR EXISTS(SELECT 1 FROM task_reports r JOIN deliveries d ON d.message=r.decision_message JOIN mailboxes b ON b.id=r.reporter WHERE r.group_name=w.group_name AND r.work_id=w.id AND r.authority_version=w.version AND b.name=w.owner AND d.state='pending'))) AS 'held!: bool'",group,task).fetch_one(&mut **tx).await?)
 }
 
 async fn publish_dependency_ready(
@@ -946,6 +961,51 @@ async fn advance_attention(
     // Preserve the hard boundary and the separate recovery interval.
     sqlx::query("UPDATE followups SET stage=?,next_check=MIN(escalate_at,?+(SELECT interval_seconds FROM followup_policy WHERE group_name=?)) WHERE id=?")
         .bind(stage).bind(time).bind(&p.group_name).bind(p.id).execute(&mut **tx).await?;
+    Ok(())
+}
+
+// A different writer needs fresh escalation attention even if it previously
+// held this task and receipted its old event. Keep the historical occurrence,
+// checkpoint, supervision boundary and operator budget; only its generation and
+// addressed recipient change for the current authority.
+pub(crate) async fn transfer_task_escalation_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    group: &str,
+    task: &str,
+    recipient: i64,
+    time: i64,
+) -> Result<()> {
+    let prior = sqlx::query!(
+        "SELECT o.id,o.followup,o.plan_version,o.recipient,f.recipient AS task_recipient FROM attention_occurrences o JOIN followups f ON f.id=o.followup WHERE f.group_name=? AND f.task=? AND f.stage=3 AND o.stage=3 AND o.plan_version=f.version",
+        group,task
+    ).fetch_optional(&mut **tx).await?;
+    let Some(prior) = prior else { return Ok(()) };
+    if prior.recipient == recipient {
+        return Ok(());
+    }
+    let version = prior
+        .plan_version
+        .checked_add(1)
+        .context("follow-up version overflow")?;
+    sqlx::query!(
+        "UPDATE followups SET version=? WHERE id=?",
+        version,
+        prior.followup
+    )
+    .execute(&mut **tx)
+    .await?;
+    let next = sqlx::query!(
+        "INSERT INTO attention_occurrences(followup,plan_version,stage,reason,recipient,created,operator_after,operator_attempts,operator_next,operator_state,operator_detail) SELECT followup,?,stage,reason,?,created,operator_after,operator_attempts,operator_next,operator_state,operator_detail FROM attention_occurrences WHERE id=?",
+        version,recipient,prior.id
+    ).execute(&mut **tx).await?.last_insert_rowid();
+    // Self-supervision follows the existing operator route, not a self-reminder.
+    if recipient != prior.task_recipient {
+        let subject = next.to_string();
+        sqlx::query!(
+            "INSERT INTO coordination_events(recipient,kind,subject,version,created) VALUES(?,'attention_due',?,?,?)",
+            recipient,subject,version,time
+        ).execute(&mut **tx).await?;
+    }
     Ok(())
 }
 
@@ -1029,7 +1089,7 @@ pub async fn reconcile(store: &Store, time: i64) -> Result<()> {
                 .execute(&mut *tx)
                 .await?;
         }
-        let held:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM work_items WHERE group_name=? AND id=? AND state IN ('blocked','review'))").bind(&p.group_name).bind(&p.task).fetch_one(&mut *tx).await?;
+        let held = task_held_tx(&mut tx, &p.group_name, p.task.as_deref()).await?;
         if p.stage == 3 {
             // A changed prerequisite creates a new generation without extending
             // the boundary or dropping the writer's outstanding escalation.

@@ -128,7 +128,7 @@ pub async fn inspect(
     report.add(
         "group",
         Level::Pass,
-        json!({"name":group,"auto_prompt":config.auto_prompt}),
+        json!({"name":group,"herdr_prompt_scope":"session"}),
         None,
     );
     if crate::service::running(root) {
@@ -177,9 +177,36 @@ pub async fn inspect(
             Ok(false) => report.add("herdr_plugin", Level::Fail, "plugin_disabled", Some("Run herdr plugin enable youssef-tharwat.agent-mail in the intended Herdr session")),
             Err(_) => report.add("herdr_plugin", Level::Fail, "Cannot verify Mail plugin enablement", Some("Verify the configured Herdr socket and plugin installation")),
         }
-        report.add("herdr_delivery", if config.paused == 0 && config.auto_prompt != 0 { Level::Pass } else { Level::Fail },
-            json!({"paused":config.paused != 0,"auto_prompt":config.auto_prompt != 0}),
-            if config.paused == 0 && config.auto_prompt != 0 { None } else { Some("Resume this group and configure its Herdr prompt policy before relying on automatic delivery") });
+        match (
+            store.herdr_prompt_enabled(&actor).await,
+            store.runtime_enabled(&actor).await,
+        ) {
+            (Ok(prompting), Ok(enabled)) => {
+                let ready = config.paused == 0 && enabled && prompting;
+                report.add("herdr_delivery",if ready {Level::Pass}else{Level::Fail},json!({"scope":"herdr_session","paused":config.paused!=0,"runtime_enabled":enabled,"auto_prompt":prompting,"legacy_group_default":config.auto_prompt!=0}),if ready {None}else{Some("Inspect the group pause, agent opt-out and exact session's Herdr consent before relying on automatic delivery")});
+            }
+            (Err(_), _) => report.add(
+                "herdr_delivery",
+                Level::Fail,
+                "Cannot inspect the current session's delivery policy",
+                Some("Inspect database health and the current agent binding"),
+            ),
+            (_, Err(_)) => report.add(
+                "herdr_delivery",
+                Level::Fail,
+                "Cannot inspect the current binding's delivery preference",
+                Some("Inspect database health and the current agent binding"),
+            ),
+        }
+        match store.session_attention(&actor, "").await {
+            Ok(session) => report.add("session_bindings", Level::Pass, session, None),
+            Err(_) => report.add(
+                "session_bindings",
+                Level::Fail,
+                "Cannot inspect session group coverage",
+                Some("Verify the current binding and database health"),
+            ),
+        }
     }
     if actor.binding.herdr().is_some() {
         match sqlx::query!("SELECT b.attempts AS 'attempts!: i64',b.next_wake AS 'next_wake!: i64',b.wake_attempted AS 'wake_attempted!: i64',(SELECT MAX(e.id) FROM herdr_wake_events e WHERE e.recipient=b.id) AS 'latest?: i64' FROM mailboxes b WHERE b.id=? AND b.binding_version=?",actor.id,actor.binding_version).fetch_one(store.pool()).await {
@@ -277,7 +304,7 @@ pub async fn inspect(
                 Some(socket) => crate::herdr::agent(Path::new(&socket), &binding.pane).await,
                 None => Err(anyhow::anyhow!("missing socket")),
             };
-            match live {Ok(live) if live.matches(&actor)=>report.add("endpoint",if live.ready(){Level::Pass}else{Level::Warning},json!({"runtime":"herdr","state":live.agent_status,"ready":live.ready(),"ineligible_reason":live.readiness_reason(),"interactive_ready":live.interactive_ready,"auto_prompt":config.auto_prompt}),None),_=>report.add("endpoint",Level::Fail,"Herdr identity is unavailable or changed",Some("Verify the pane and explicitly rebind its current session"))}
+            match live {Ok(live) if live.matches(&actor)=>report.add("endpoint",if live.ready(){Level::Pass}else{Level::Warning},json!({"runtime":"herdr","state":live.agent_status,"ready":live.ready(),"ineligible_reason":live.readiness_reason(),"interactive_ready":live.interactive_ready,"auto_prompt":store.herdr_prompt_enabled(&actor).await.ok()}),None),_=>report.add("endpoint",Level::Fail,"Herdr identity is unavailable or changed",Some("Verify the pane and explicitly rebind its current session"))}
         }
         Ok(None) => report.add(
             "endpoint",
